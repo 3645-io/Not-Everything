@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0: a new look, search as you type (not released yet)
+## v0.3.0: a new look, search as you type (November 2026)
 
 The search window and Settings are redrawn in the new 3645 design, results follow each key you type, and full-path search is ten times faster. The first release published from this repository. Signed and notarized. Apple silicon only, macOS 13 or later.
 
