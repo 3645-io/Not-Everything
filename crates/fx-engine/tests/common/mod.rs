@@ -5,7 +5,8 @@
 //!   the "disk" while the engine's writer thread reads it.
 //! - [`FakeSource`]: an `fx_fs::ChangeSource` fed batch by batch from a test.
 //!   Its cursor is `ResumeCursor::FsEvents` whose `event_id` counts the
-//!   non-empty batches handed out.
+//!   non-empty batches handed out (from 0, or from the event ID given to
+//!   `FakeSource::starting_at`).
 //!
 //! Engine API these tests rely on:
 //!
@@ -327,12 +328,19 @@ pub struct FakeSource {
 impl FakeSource {
     /// A source whose `start` returns `outcome`.
     pub fn new(outcome: StartOutcome) -> FakeSource {
+        FakeSource::starting_at(outcome, 0)
+    }
+
+    /// A source whose `start` returns `outcome` and whose cursor starts at
+    /// `event_id`, like a source resumed from a cursor an earlier process
+    /// saved: its next non-empty batch is event `event_id + 1`.
+    pub fn starting_at(outcome: StartOutcome, event_id: u64) -> FakeSource {
         FakeSource {
             inner: Arc::new(Mutex::new(SourceState {
                 queue: VecDeque::new(),
                 outcome,
                 started_from: None,
-                event_id: 0,
+                event_id,
                 polls: 0,
             })),
         }
@@ -415,7 +423,12 @@ pub fn start(tree: &FakeTree, source: &FakeSource, index: Index, config: EngineC
 
 /// Rebuilds every live entry of a published snapshot as an `Entry`, by key.
 pub fn snapshot_entries(snap: &EngineSnapshot) -> HashMap<FileKey, Entry> {
-    let idx: &fx_index::Snapshot = snap.index();
+    index_entries(snap.index())
+}
+
+/// Rebuilds every live entry of an index snapshot (published, or loaded
+/// from a store) as an `Entry`, by key.
+pub fn index_entries(idx: &fx_index::Snapshot) -> HashMap<FileKey, Entry> {
     let ids: Vec<EntryId> = idx.live_ids().collect();
     ids.into_iter()
         .map(|id| {
