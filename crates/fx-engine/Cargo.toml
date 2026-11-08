@@ -28,6 +28,9 @@ libc = "0.2.191"
 # generator for the benchmarks and the gate tests. No cycle: fx-bench does
 # not depend on fx-engine.
 fx-bench = { path = "../fx-bench" }
+# Workspace crate (std only); the child processes of the `kill -9` crash
+# tests.
+fx-testkit = { path = "../fx-testkit" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Workspace crate; the real FSEvents source, path stat and enumerator for

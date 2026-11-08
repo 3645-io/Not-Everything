@@ -1,6 +1,6 @@
 [package]
 name = "fx-testkit"
-description = "Workspace policy tests."
+description = "Workspace policy tests and test helpers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

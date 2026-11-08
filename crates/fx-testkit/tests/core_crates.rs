@@ -178,6 +178,13 @@ const CORE_DEPENDENCY_ALLOWLIST: &[(&str, &[(&str, DepKind)])] = &[
             ("fx-bench", DepKind::Dev),
             // First-result substring search in tests and the load benchmark.
             ("fx-query", DepKind::Dev),
+            // MIT OR Apache-2.0 (already locked through memmap2); `kill(pid,
+            // 0)`, so a leftover temp file of a writer that no longer runs is
+            // removed at the next start.
+            ("libc", DepKind::Normal),
+            // Workspace crate (std only); the child processes of the
+            // `kill -9` crash tests.
+            ("fx-testkit", DepKind::Dev),
         ],
     ),
     // fx-model and fx-channel are std-only and
@@ -237,6 +244,9 @@ const CORE_DEPENDENCY_ALLOWLIST: &[(&str, &[(&str, DepKind)])] = &[
             ("libc", DepKind::Normal),
             // Synthetic trees for tests and benchmarks.
             ("fx-bench", DepKind::Dev),
+            // Workspace crate (std only); the child processes of the
+            // `kill -9` crash tests.
+            ("fx-testkit", DepKind::Dev),
             // macOS-only target dev-dependency; real FSEvents for the
             // end-to-end tests and the freshness example.
             ("fx-fs-macos", DepKind::MacosDev),

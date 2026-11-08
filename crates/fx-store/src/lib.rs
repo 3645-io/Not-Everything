@@ -58,3 +58,5 @@ pub use writer::{
     PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, SaveInput, create_private_dir, make_dir_private,
     temp_name_prefix, write_checkpoint,
 };
+#[doc(hidden)]
+pub use writer::{WriteStage, write_checkpoint_with_stages};

@@ -88,8 +88,9 @@ impl Opened {
 /// Steps:
 ///
 /// 1. [`cleanup_stale_temps`] for `path`: removes this checkpoint's own
-///    leftover temp files older than [`STALE_TEMP_MIN_AGE`] (best effort:
-///    a failure there never blocks startup).
+///    leftover temp files, those of a writer that no longer runs at once
+///    and others once older than [`STALE_TEMP_MIN_AGE`] (best effort: a
+///    failure there never blocks startup).
 /// 2. [`MappedIndex::open`], plus [`MappedIndex::verify_checksums`] with
 ///    [`VerifyMode::Full`]. On success returns [`Opened::Loaded`], whatever
 ///    the clean-shutdown flag says.
@@ -168,16 +169,17 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// How old (by modification time) a temp file must be before
-/// [`cleanup_stale_temps`] removes it: 10 minutes.
+/// How old (by modification time) a temp file of a process that may still
+/// be running must be before [`cleanup_stale_temps`] removes it: 10
+/// minutes.
 ///
-/// fx-store cannot cheaply ask whether the process that created a temp
-/// file is still running (it has no direct libc dependency for
-/// `kill(pid, 0)`), so a temp file modified within this window is assumed
-/// to belong to a checkpoint that some process is still writing, and is
-/// kept. A checkpoint write takes seconds even at millions of entries, so
-/// ten minutes leaves a wide margin; an older temp file is a leftover of an
-/// interrupted write. A young leftover is removed by a later start.
+/// A temp file whose process no longer runs is removed whatever its age
+/// (on Unix). The age rule covers the rest: a process ID that an unrelated
+/// process has taken over since, and systems where fx-store cannot ask.
+/// A temp file modified within this window is assumed to belong to a
+/// checkpoint that its process is still writing, and is kept. A checkpoint
+/// write takes seconds even at millions of entries, so ten minutes leaves a
+/// wide margin; an older temp file is a leftover of an interrupted write.
 pub const STALE_TEMP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// Removes leftover temp files of interrupted checkpoints of `target` (the
@@ -190,10 +192,12 @@ pub const STALE_TEMP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 /// files of other checkpoints in the same directory, and everything else
 /// (including directories and symlinks), are kept.
 ///
-/// Temp files that may belong to a running writer are skipped: those
-/// carrying this process's ID, and those modified less than
-/// [`STALE_TEMP_MIN_AGE`] ago (or whose modification time cannot be read
-/// or lies in the future).
+/// A temp file whose process no longer runs is removed at once: its
+/// writer was killed, crashed or quit during a checkpoint, and can never
+/// finish it. Temp files that may belong to a running writer are skipped:
+/// those carrying this process's ID, and, while a process with their ID
+/// runs, those modified less than [`STALE_TEMP_MIN_AGE`] ago (or whose
+/// modification time cannot be read or lies in the future).
 ///
 /// A file that disappears while cleaning is not an error. Other I/O errors
 /// (reading the directory, reading a file's metadata, removing a file) are
@@ -204,7 +208,7 @@ pub fn cleanup_stale_temps(target: impl AsRef<Path>) -> io::Result<usize> {
 
 /// [`cleanup_stale_temps`] with a custom minimum age instead of
 /// [`STALE_TEMP_MIN_AGE`]. `Duration::ZERO` removes matching temp files
-/// of other processes whatever their age. Meant for tests.
+/// of other processes whatever their age, running or not. Meant for tests.
 #[doc(hidden)]
 pub fn cleanup_stale_temps_older_than(
     target: impl AsRef<Path>,
@@ -236,7 +240,7 @@ pub fn cleanup_stale_temps_older_than(
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        if !metadata.is_file() || !old_enough(&metadata, now, min_age) {
+        if !metadata.is_file() || !(writer_gone(pid) || old_enough(&metadata, now, min_age)) {
             continue;
         }
         match fs::remove_file(entry.path()) {
@@ -246,6 +250,35 @@ pub fn cleanup_stale_temps_older_than(
         }
     }
     Ok(removed)
+}
+
+/// Whether no running process has the ID `pid`, so a temp file named with
+/// it belongs to a writer that can no longer finish it.
+///
+/// `kill(pid, 0)` sends no signal; it fails with `ESRCH` only when no
+/// process has that ID. Every other answer counts as running: success, and
+/// `EPERM` (a process of another user). So does an ID `kill` would read as
+/// a process group (0, or one above `pid_t`'s range). An ID reused by an
+/// unrelated process keeps the file until it is [`STALE_TEMP_MIN_AGE`]
+/// old, which only delays its removal.
+#[cfg(unix)]
+fn writer_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 checks the process ID and sends nothing;
+    // it reads no memory of ours.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Elsewhere fx-store cannot ask; the age rule decides alone.
+#[cfg(not(unix))]
+fn writer_gone(_pid: u32) -> bool {
+    false
 }
 
 /// Whether a file with `metadata` was last modified at least `min_age`
