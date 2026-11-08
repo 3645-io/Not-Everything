@@ -20,6 +20,9 @@ memmap2 = { version = "0.9", default-features = false }
 [dev-dependencies]
 fx-bench = { path = "../fx-bench" }
 fx-query = { path = "../fx-query" }
+# Workspace crate (std only); the child processes of the `kill -9` crash
+# tests.
+fx-testkit = { path = "../fx-testkit" }
 
 [lints]
 workspace = true

@@ -127,6 +127,7 @@ dependencies = [
  "fx-query",
  "fx-sort",
  "fx-store",
+ "fx-testkit",
  "libc",
 ]
 
@@ -202,6 +203,7 @@ dependencies = [
  "fx-index",
  "fx-model",
  "fx-query",
+ "fx-testkit",
  "memmap2",
 ]
 
