@@ -399,3 +399,189 @@ fn app_name_and_bundle_id_are_the_owner_s_choice() {
     assert_eq!(APP_BUNDLE_ID, id);
     assert_eq!(APP_FOLDER, name, "the data folder is named after the app");
 }
+
+// ------------------------------------------------------- shortcut recorder
+//
+// Run 2.10: the "Show the search window" row records a new shortcut, after
+// the canvas's shortcut recorder board (its nine states, light and dark).
+//
+// - `hotkey_row(spec, default, recording, error) -> HotkeyRow`: what the
+//   row shows at rest (the caps, the caption or the reason a change was
+//   refused in `danger-ink`, and "Use Default (…)" while the shortcut isn't
+//   the default) and while recording (the held modifiers' caps, the
+//   recording caption, no reset link).
+// - `layout`: the recorder's box (`.rec`), which reaches 4 past the caps
+//   on each side and 5 above and below, so at rest the row lays out as
+//   before; while recording it is at least 144 wide. Measured on the board
+//   at its 1440-point width, where each card is the Settings sheet's 608.
+
+use fx_ui_macos::hotkey::{HotkeySpec, Modifiers, Refusal};
+use fx_ui_macos::settings_view::{
+    HOTKEY_CAPTION, HOTKEY_LABEL, HOTKEY_RECORDING_CAPTION, HOTKEY_RECORDING_HINT, HotkeyRow,
+    hotkey_reset_title, hotkey_row,
+};
+
+fn hk(s: &str) -> HotkeySpec {
+    HotkeySpec::parse(s).expect("a valid hotkey")
+}
+
+#[test]
+fn recorder_copy_matches_the_board() {
+    assert_eq!(HOTKEY_LABEL, "Show the search window");
+    assert_eq!(HOTKEY_CAPTION, "Press this shortcut in any app.");
+    assert_eq!(
+        HOTKEY_RECORDING_CAPTION,
+        "Type the new shortcut. Esc cancels."
+    );
+    assert_eq!(HOTKEY_RECORDING_HINT, "Type shortcut");
+    assert_eq!(
+        hotkey_reset_title(hk("option+space")),
+        "Use Default (\u{2325}Space)"
+    );
+    // The Preview app's default, in Apple's modifier order.
+    assert_eq!(
+        hotkey_reset_title(hk("shift+option+space")),
+        "Use Default (\u{2325}\u{21e7}Space)"
+    );
+}
+
+#[test]
+fn the_row_at_rest_shows_the_caps_and_the_caption() {
+    let default = hk("option+space");
+    assert_eq!(
+        hotkey_row(default, default, None, None),
+        HotkeyRow {
+            caption: HOTKEY_CAPTION.to_string(),
+            error: false,
+            recording: false,
+            caps: vec!["\u{2325}", "Space"],
+            reset: None,
+            spoken: "Show the search window: Option Space".to_string(),
+        }
+    );
+}
+
+#[test]
+fn another_shortcut_offers_the_default() {
+    let row = hotkey_row(hk("control+option+k"), hk("option+space"), None, None);
+    assert_eq!(row.caps, ["\u{2303}", "\u{2325}", "K"]);
+    assert_eq!(row.reset.as_deref(), Some("Use Default (\u{2325}Space)"));
+    assert_eq!(row.spoken, "Show the search window: Control Option K");
+    assert!(!row.error);
+}
+
+#[test]
+fn recording_shows_the_held_modifiers() {
+    let default = hk("option+space");
+    let none = Modifiers::default();
+    let row = hotkey_row(hk("control+option+k"), default, Some(none), None);
+    assert_eq!(
+        row,
+        HotkeyRow {
+            caption: HOTKEY_RECORDING_CAPTION.to_string(),
+            error: false,
+            recording: true,
+            caps: vec![],
+            reset: None,
+            spoken: "Show the search window: recording".to_string(),
+        }
+    );
+    let held = Modifiers {
+        cmd: false,
+        shift: false,
+        option: true,
+        control: true,
+    };
+    let row = hotkey_row(default, default, Some(held), None);
+    assert_eq!(row.caps, ["\u{2303}", "\u{2325}"]);
+    assert!(row.recording);
+}
+
+#[test]
+fn a_refusal_replaces_the_caption_in_danger_ink() {
+    let default = hk("option+space");
+    let refusal = Refusal::UsedByApps(hk("cmd+q"));
+    let row = hotkey_row(default, default, None, Some(&refusal));
+    assert_eq!(row.caption, refusal.to_string());
+    assert!(row.error);
+    assert_eq!(row.caps, ["\u{2325}", "Space"]);
+    // While recording the recording caption shows instead.
+    let row = hotkey_row(default, default, Some(Modifiers::default()), Some(&refusal));
+    assert_eq!(row.caption, HOTKEY_RECORDING_CAPTION);
+    assert!(!row.error);
+    // A failed launch is shown the same way.
+    let launch = Refusal::NotAcceptedAtLaunch(default);
+    let row = hotkey_row(default, default, None, Some(&launch));
+    assert_eq!(row.caption, launch.to_string());
+    assert!(row.error);
+}
+
+#[test]
+fn the_recorder_at_rest_lays_out_as_the_caps() {
+    // ⌥ and Space: labels 11.98 and 37.22 wide, caps 23.98 and 49.22.
+    let caps = layout::key_caps_width(&[11.98, 37.22]);
+    assert!((caps - 76.2).abs() < 1e-9);
+    assert_eq!(layout::recorder_size(caps, false), (caps, 22.0));
+    let mut sheet = Sheet::new(640.0);
+    let mut card = sheet.card();
+    card.title();
+    let row = card.row(layout::text_block_height(18.0), (caps, 22.0));
+    assert_eq!(row.control, frame(608.0 - caps, 70.0, caps, 22.0));
+    // The box reaches 4 past the caps on each side and 5 above and below.
+    assert_eq!(layout::RECORDER_REACH, [5.0, 4.0]);
+    assert_eq!(layout::RECORDER_HEIGHT, 32.0);
+    let bx = layout::recorder_box(row.control);
+    assert_eq!(bx, frame(608.0 - caps - 4.0, 65.0, caps + 8.0, 32.0));
+    // The caps sit where they always did: right-aligned, centred.
+    assert_eq!(
+        layout::recorder_content(bx, (caps, 22.0), false),
+        row.control
+    );
+}
+
+#[test]
+fn the_recording_box_is_at_least_144_wide() {
+    assert_eq!(layout::RECORDING_MIN_WIDTH, 144.0);
+    // "Type shortcut": text 83.94 wide, 4 of padding each side.
+    let hint = layout::recorder_hint_width(83.94);
+    assert!((hint - 91.94).abs() < 1e-9);
+    // Its footprint in the row: the box less the 4 it reaches on each side.
+    assert_eq!(layout::recorder_size(hint, true), (136.0, 22.0));
+    let mut sheet = Sheet::new(640.0);
+    let mut card = sheet.card();
+    card.title();
+    let row = card.row(layout::text_block_height(18.0), (136.0, 22.0));
+    let bx = layout::recorder_box(row.control);
+    assert_eq!(bx, frame(468.0, 65.0, 144.0, 32.0));
+    // The hint ends inside the 2-point rim and 6 of padding, centred on
+    // its 18-point line.
+    let content = layout::recorder_content(bx, (hint, 18.0), true);
+    assert!((content.x - (612.0 - 8.0 - 91.94)).abs() < 1e-9);
+    assert_eq!((content.y, content.height), (72.0, 18.0));
+    // Two held caps (⌃ 22.89 and ⌥ 23.98) end at the same place.
+    let held = 22.89 + 3.0 + 23.98;
+    let content = layout::recorder_content(bx, (held, 22.0), true);
+    assert!((content.right() - 604.0).abs() < 1e-9);
+    assert_eq!(content.y, 70.0);
+    // Wider content grows the box past 144: content plus rim and padding.
+    assert_eq!(layout::recorder_size(200.0, true), (208.0, 22.0));
+}
+
+#[test]
+fn the_reset_link_sits_under_the_caption() {
+    // The 18-point link 2 below the caption, on the row's 21-point line.
+    assert_eq!(layout::hotkey_text_height(18.0, false), 42.0);
+    assert_eq!(layout::hotkey_text_height(18.0, true), 63.0);
+    assert_eq!(layout::hotkey_text_height(36.0, true), 81.0);
+    let text = frame(32.0, 60.0, 400.0, 63.0);
+    assert_eq!(
+        layout::reset_link(text, 18.0, 142.33),
+        frame(32.0, 104.0, 142.33, 18.0)
+    );
+    // The caps centre on the taller text, as on the board (31.5 down).
+    let mut sheet = Sheet::new(640.0);
+    let mut card = sheet.card();
+    card.title();
+    let row = card.row(63.0, (76.0, 22.0));
+    assert_eq!(layout::recorder_box(row.control).y, 60.0 + 20.5 - 5.0);
+}

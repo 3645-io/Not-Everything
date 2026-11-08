@@ -10,6 +10,14 @@
 //! contents up to the screen's height (then the sheet scrolls), and can be
 //! made shorter.
 //!
+//! The General card's key caps record a new summon hotkey (the shortcut
+//! recorder board): a click, or Space or Return with the focus on them,
+//! starts recording ([`crate::shortcut_recorder`]); the shortcut typed is
+//! registered in place of the old one ([`crate::hotkey_slot`]), saved, and
+//! shown on the menu-bar menu, or refused with the reason in the row's
+//! caption while the old one keeps working. "Use Default" puts the app's
+//! default back.
+//!
 //! Every change applies and is saved at once; there is no OK button. The
 //! window is built the first time it is shown and only hidden when closed;
 //! closing it releases the six icon images it decoded (only the current
@@ -31,10 +39,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSAccessibilityImageRole, NSAccessibilityRadioGroupRole, NSAppearance,
-    NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType, NSImage,
-    NSScreen, NSScrollView, NSTextAlignment, NSTitlebarSeparatorStyle, NSView, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSAccessibility, NSAccessibilityRadioGroupRole, NSAppearance, NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua, NSApplication, NSBackingStoreType, NSBeep, NSImage, NSScreen,
+    NSScrollView, NSTextAlignment, NSTitlebarSeparatorStyle, NSView, NSWindow, NSWindowButton,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSData, NSEdgeInsets, NSKeyValueObservingOptions,
@@ -47,7 +55,8 @@ use super::resident::activate;
 use super::ribbon::with_ribbon;
 use super::settings_controls::{
     ChoiceControl, ChoiceLooks, FlippedView, Look, PushControl, PushLooks, SettingsTarget,
-    SurfaceView, SwitchControl, SwitchLooks, TextView, keep_unclipped, ns_color, ns_rect,
+    SheetView, ShortcutControl, ShortcutLooks, SurfaceView, SwitchControl, SwitchLooks, TextView,
+    keep_unclipped, ns_color, ns_rect,
 };
 use super::surfaces::SurfaceCache;
 use crate::APP_NAME;
@@ -56,16 +65,18 @@ use crate::appearance::AppearanceMode;
 use crate::appkit::login_item::{self, LoginItemStatus};
 use crate::build_info::BuildInfo;
 use crate::dock_ribbon::{DockTile, dock_tile};
-use crate::key_caps::{key_caps, spoken};
+use crate::hotkey::{HotkeySpec, Modifiers, Refusal};
+use crate::hotkey_slot::{Applied, apply};
 use crate::settings::Settings;
 use crate::settings_view::layout::{self, Frame, Sheet, TopBar};
 use crate::settings_view::{
-    APPEARANCE_NOTE, HOTKEY_CAPTION, HOTKEY_LABEL, ICON_LABEL, LOGIN_LABEL, LoginState, SECTIONS,
-    TITLE, YOUR_FILES_FIRST_LABEL, access_row, appearance_segments, footnote, icon_note,
-    icon_tiles, login_row, your_files_first_row,
+    APPEARANCE_NOTE, HOTKEY_LABEL, HOTKEY_RECORDING_HINT, HotkeyRow, ICON_LABEL, LOGIN_LABEL,
+    LoginState, SECTIONS, TITLE, YOUR_FILES_FIRST_LABEL, access_row, appearance_segments, footnote,
+    hotkey_reset_title, hotkey_row, icon_note, icon_tiles, login_row, your_files_first_row,
 };
+use crate::shortcut_recorder::{Input, Output};
 use crate::surface::Surface;
-use crate::theme::{RADIUS_SM, Rgba, Theme, Token, metrics, styles};
+use crate::theme::{RADIUS_MD, RADIUS_SM, Rgba, Theme, Token, metrics, styles};
 
 /// The window's width: the sheet's widest.
 const WIDTH: f64 = metrics::SETTINGS_WIDTH;
@@ -85,6 +96,10 @@ fn appearance_key() -> &'static NSString {
 /// What the window shows: the settings and the states it follows.
 struct ViewState {
     settings: Settings,
+    /// The modifiers held while the caps record; `None` at rest.
+    recording: Option<Modifiers>,
+    /// Why the summon hotkey isn't the one last picked, or isn't working.
+    hotkey_error: Option<Refusal>,
     login: LoginState,
     login_error: Option<String>,
     access: AccessState,
@@ -183,12 +198,17 @@ struct Ui {
     top_bar: Retained<SurfaceView>,
     title: Retained<TextView>,
     scroll: Retained<NSScrollView>,
-    sheet: Retained<FlippedView>,
+    sheet: Retained<SheetView>,
     cards: Vec<Retained<SurfaceView>>,
     card_titles: Vec<Retained<TextView>>,
     hotkey: RowText,
-    keys: Retained<FlippedView>,
+    /// The summon hotkey's caps, which record a new one; the caps and the
+    /// hint are its subviews.
+    recorder: Retained<ShortcutControl>,
     caps: RefCell<Vec<Cap>>,
+    hint: Retained<TextView>,
+    reset: Retained<PushControl>,
+    reset_label: Retained<TextView>,
     login: RowText,
     login_divider: Retained<SurfaceView>,
     login_switch: Retained<SwitchControl>,
@@ -259,7 +279,7 @@ impl SettingsUi {
             bottom: 0.0,
             right: 0.0,
         });
-        let sheet = FlippedView::new(mtm);
+        let sheet = SheetView::new(mtm);
         scroll.setDocumentView(Some(&sheet));
         root.addSubview(&scroll);
         let top_bar = SurfaceView::new(mtm);
@@ -286,11 +306,24 @@ impl SettingsUi {
 
         // General.
         let hotkey = RowText::new(mtm, &sheet);
-        let keys = FlippedView::new(mtm);
-        keys.setAccessibilityElement(true);
-        // SAFETY: the role is an immutable framework constant.
-        keys.setAccessibilityRole(Some(unsafe { NSAccessibilityImageRole }));
-        sheet.addSubview(&keys);
+        let recorder = ShortcutControl::new(mtm, &target, SettingsTarget::shortcut_action());
+        sheet.addSubview(&recorder);
+        sheet.set_recorder(&recorder);
+        let hint = TextView::new(mtm, false);
+        recorder.addSubview(&hint);
+        // "Use Default" has no surface: a link-style button (`.linkbtn`).
+        let reset_surface = SurfaceView::new(mtm);
+        sheet.addSubview(&reset_surface);
+        let reset = PushControl::new(
+            mtm,
+            &hotkey_reset_title(HotkeySpec::default()),
+            reset_surface,
+            t,
+            SettingsTarget::reset_action(),
+        );
+        let reset_label = TextView::new(mtm, false);
+        reset.addSubview(&reset_label);
+        sheet.addSubview(&reset);
         let login_divider = SurfaceView::new(mtm);
         sheet.addSubview(&login_divider);
         let login = RowText::new(mtm, &sheet);
@@ -402,7 +435,8 @@ impl SettingsUi {
         let footnote = TextView::new(mtm, true);
         sheet.addSubview(&footnote);
 
-        for view in [&*root, &*sheet, &*keys, &*segments_group, &*icons_group] {
+        let unclipped: [&NSView; 4] = [&root, &sheet, &segments_group, &icons_group];
+        for view in unclipped {
             keep_unclipped(view);
         }
 
@@ -419,8 +453,11 @@ impl SettingsUi {
             cards,
             card_titles,
             hotkey,
-            keys,
+            recorder,
             caps: RefCell::new(Vec::new()),
+            hint,
+            reset,
+            reset_label,
             login,
             login_divider,
             login_switch,
@@ -479,6 +516,7 @@ impl SettingsUi {
             pick.image.set_look(Look::None);
             pick.button.reset_hover();
         }
+        ui.recorder.reset_hover();
     }
 }
 
@@ -523,7 +561,19 @@ impl Ui {
         for (title, text) in self.card_titles.iter().zip(SECTIONS) {
             title.set(text, &styles::SECTION_TITLE, c(Token::Muted), left);
         }
-        self.hotkey.set(theme, HOTKEY_LABEL, HOTKEY_CAPTION, false);
+        let hotkey = self.hotkey_row(state);
+        self.hotkey
+            .set(theme, HOTKEY_LABEL, &hotkey.caption, hotkey.error);
+        self.hint.set(
+            HOTKEY_RECORDING_HINT,
+            &styles::RECORDER_HINT,
+            c(Token::Muted),
+            left,
+        );
+        if let Some(title) = &hotkey.reset {
+            self.reset_label
+                .set(title, &styles::LINK_BUTTON, c(Token::GreenInk), left);
+        }
         let login = login_row(APP_NAME, state.login, state.login_error.as_deref());
         self.login
             .set(theme, LOGIN_LABEL, &login.caption, login.error);
@@ -573,9 +623,7 @@ impl Ui {
             c(Token::Muted),
             center,
         );
-        let caps = key_caps(state.settings.hotkey);
-        self.keys
-            .setAccessibilityLabel(Some(&NSString::from_str(&spoken(state.settings.hotkey))));
+        let caps = hotkey.caps;
         let mut views = self.caps.borrow_mut();
         if views.len() != caps.len() {
             for cap in views.drain(..) {
@@ -584,14 +632,14 @@ impl Ui {
             }
             for _ in &caps {
                 let surface = SurfaceView::new(self.mtm);
-                self.keys.addSubview(&surface);
+                self.recorder.addSubview(&surface);
                 views.push(Cap {
                     surface,
                     label: TextView::new(self.mtm, false),
                 });
             }
             for cap in views.iter() {
-                self.keys.addSubview(&cap.label);
+                self.recorder.addSubview(&cap.label);
             }
         }
         for (cap, text) in views.iter().zip(&caps) {
@@ -608,36 +656,11 @@ impl Ui {
         self.bar.set(bar);
         let mut sheet = Sheet::new(WIDTH);
 
-        // General: the hotkey's caps and Launch at Login.
+        // General: the hotkey's recorder and Launch at Login.
         let mut card = sheet.card();
         self.card_titles[0].place(card.title());
         let (cx, cw) = card.content();
-        let caps = self.caps.borrow();
-        let widths: Vec<f64> = caps.iter().map(|c| c.label.width()).collect();
-        let keys_width = layout::key_caps_width(&widths);
-        let caption = self.hotkey.caption_height(cw, keys_width);
-        let row = card.row(
-            layout::text_block_height(caption),
-            (keys_width, metrics::KEY_HEIGHT),
-        );
-        self.hotkey.place(row.text, caption, 0.0);
-        let (group, frames) = layout::key_caps(row.control.right(), row.control.y, &widths);
-        self.keys.setFrame(ns_rect(group));
-        for (cap, frame) in caps.iter().zip(frames) {
-            let local = relative(frame, group);
-            cap.surface.set(
-                local,
-                self.look(Surface::Key, theme, (frame.width, frame.height)),
-            );
-            let line = styles::KEY_CAP.line_height;
-            cap.label.place(Frame::new(
-                local.x,
-                local.y + (local.height - line) / 2.0,
-                local.width,
-                line,
-            ));
-        }
-        drop(caps);
+        self.layout_hotkey(state, &mut card, cw, focus);
         let login = login_row(APP_NAME, state.login, state.login_error.as_deref());
         let (sw, sh) = layout::SWITCH_SIZE;
         let caption = self.login.caption_height(cw, sw);
@@ -790,6 +813,7 @@ impl Ui {
                 rest: self.look(rest, theme, (bw, bh)),
                 down: self.look(down, theme, (bw, bh)),
                 focus,
+                radius: None,
             },
         );
         self.access_button_label
@@ -812,6 +836,104 @@ impl Ui {
             title,
             styles::WINDOW_TITLE.line_height,
         ));
+    }
+
+    /// The summon hotkey row for `state`.
+    fn hotkey_row(&self, state: &ViewState) -> HotkeyRow {
+        hotkey_row(
+            state.settings.hotkey,
+            HotkeySpec::default(),
+            state.recording,
+            state.hotkey_error.as_ref(),
+        )
+    }
+
+    /// Places the summon hotkey row, the first of the General `card`
+    /// (content `cw` wide): its text and reset link, and the recorder with
+    /// its caps or hint (the shortcut recorder board).
+    fn layout_hotkey(
+        &self,
+        state: &ViewState,
+        card: &mut layout::Card,
+        cw: f64,
+        focus: Option<Rgba>,
+    ) {
+        let theme = state.theme;
+        let row_state = self.hotkey_row(state);
+        let recording = row_state.recording;
+        let caps = self.caps.borrow();
+        let widths: Vec<f64> = caps.iter().map(|c| c.label.width()).collect();
+        let show_hint = recording && caps.is_empty();
+        let content = if show_hint {
+            (
+                layout::recorder_hint_width(self.hint.width()),
+                styles::RECORDER_HINT.line_height,
+            )
+        } else {
+            (layout::key_caps_width(&widths), metrics::KEY_HEIGHT)
+        };
+        let control = layout::recorder_size(content.0, recording);
+        let caption = self.hotkey.caption_height(cw, control.0);
+        let reset = row_state.reset.is_some();
+        let row = card.row(layout::hotkey_text_height(caption, reset), control);
+        self.hotkey.place(row.text, caption, 0.0);
+
+        let bx = layout::recorder_box(row.control);
+        self.recorder.setFrame(ns_rect(bx));
+        let inside = relative(layout::recorder_content(bx, content, recording), bx);
+        self.hint.setHidden(!show_hint);
+        if show_hint {
+            let pad = layout::RECORDER_HINT_PADDING_X;
+            self.hint.place(Frame::new(
+                inside.x + pad,
+                inside.y,
+                inside.width - 2.0 * pad,
+                inside.height,
+            ));
+        }
+        let (_, frames) = layout::key_caps(inside.right(), inside.y, &widths);
+        for (cap, frame) in caps.iter().zip(frames) {
+            cap.surface.set(
+                frame,
+                self.look(Surface::Key, theme, (frame.width, frame.height)),
+            );
+            let line = styles::KEY_CAP.line_height;
+            cap.label.place(Frame::new(
+                frame.x,
+                frame.y + (frame.height - line) / 2.0,
+                frame.width,
+                line,
+            ));
+        }
+        drop(caps);
+        let size = (bx.width, bx.height);
+        self.recorder.set(
+            recording,
+            ShortcutLooks {
+                hover: self.look(Surface::RecorderHover, theme, size),
+                recording: self.look(Surface::Recording, theme, size),
+                radius: RADIUS_MD,
+                focus,
+            },
+            &row_state.spoken,
+        );
+
+        self.reset.setHidden(!reset);
+        if reset {
+            let width = self.reset_label.width();
+            let link = layout::reset_link(row.text, caption, width);
+            self.reset.set(
+                link,
+                PushLooks {
+                    rest: Look::None,
+                    down: Look::None,
+                    focus,
+                    radius: Some(0.0),
+                },
+            );
+            self.reset_label
+                .place(Frame::new(0.0, 0.0, width, link.height));
+        }
     }
 
     /// Shows card `n` at `frame`.
@@ -1030,6 +1152,8 @@ impl WinController {
         let dark = is_dark(MainThreadMarker::from(self));
         self.with_resident(|r| ViewState {
             settings: r.settings,
+            recording: r.recorder.is_recording().then(|| r.recorder.held()),
+            hotkey_error: r.hotkey_error,
             login: login_state(r.login),
             login_error: r.login_error.clone(),
             access: r.access(),
@@ -1128,6 +1252,71 @@ impl WinController {
             r.save_settings();
         });
         self.refresh_look();
+    }
+
+    /// What the summon hotkey's caps did (a click, a key, the focus
+    /// leaving), or the registered shortcut pressed while they record.
+    pub(crate) fn shortcut_input(&self, input: Input) {
+        let Some(output) = self.with_resident(|r| r.recorder.handle(input)) else {
+            return;
+        };
+        match output {
+            Output::Nothing => return,
+            Output::Beep => {
+                NSBeep();
+                return;
+            }
+            Output::Started | Output::Held(_) | Output::Cancelled => {}
+            Output::Unchanged => {
+                self.with_resident(|r| r.hotkey_error = None);
+            }
+            Output::Picked(spec) => {
+                self.change_hotkey(spec);
+                return;
+            }
+            Output::Refused(refusal) => {
+                self.with_resident(|r| r.hotkey_error = Some(refusal));
+            }
+        }
+        self.refresh_settings();
+    }
+
+    /// Registers `spec` as the summon hotkey in place of the current one,
+    /// saves it and shows it on the menu-bar menu; a shortcut the rules or
+    /// macOS refuse leaves the current one working and the reason in the
+    /// Settings row.
+    fn change_hotkey(&self, spec: HotkeySpec) {
+        let changed = self.with_resident(|r| {
+            let result = match r.hotkey.as_mut() {
+                Some(slot) => apply(slot, spec),
+                None => Err(Refusal::NotAccepted(spec)),
+            };
+            match result {
+                Ok(applied) => {
+                    r.hotkey_error = None;
+                    let save = applied == Applied::Changed || r.settings.hotkey != spec;
+                    if save {
+                        r.settings.hotkey = spec;
+                        r.save_settings();
+                    }
+                    save
+                }
+                Err(refusal) => {
+                    eprintln!("{APP_NAME}: shortcut {spec} refused: {refusal}");
+                    r.hotkey_error = Some(refusal);
+                    false
+                }
+            }
+        });
+        if changed == Some(true) {
+            self.rebuild_menu();
+        }
+        self.refresh_settings();
+    }
+
+    /// "Use Default": the app's default summon hotkey.
+    pub(crate) fn reset_hotkey(&self) {
+        self.change_hotkey(HotkeySpec::default());
     }
 }
 

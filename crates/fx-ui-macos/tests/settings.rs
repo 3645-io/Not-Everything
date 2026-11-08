@@ -521,3 +521,77 @@ fn settings_path_is_in_the_app_folder() {
             .join("settings")
     );
 }
+
+// ------------------------------------------------------- shortcut recorder
+
+/// Every shortcut the Settings recorder can pick (any of the 49 keys with
+/// any of the 15 modifier sets) is saved as the `hotkey=` line and read
+/// back unchanged, in a file with the other settings around it.
+#[test]
+fn every_recordable_shortcut_round_trips_through_the_file() {
+    use fx_ui_macos::hotkey::{Key, Modifiers};
+    let dir = TempDir::new("recorded");
+    let path = dir.path.join("settings");
+    let mut count = 0;
+    for bits in 1u8..16 {
+        let modifiers = Modifiers {
+            cmd: bits & 1 != 0,
+            shift: bits & 2 != 0,
+            option: bits & 4 != 0,
+            control: bits & 8 != 0,
+        };
+        for key in Key::all() {
+            let spec = HotkeySpec { modifiers, key };
+            let mut settings = custom();
+            settings.hotkey = spec;
+            let loaded = Settings::parse(&settings.to_text());
+            assert_eq!(loaded, settings, "{spec}");
+            count += 1;
+        }
+    }
+    assert_eq!(count, 15 * 49);
+    // And through a real save and load.
+    let mut settings = custom();
+    settings.hotkey = hk("control+option+k");
+    settings.save(&path).unwrap();
+    assert_eq!(
+        Settings::load(&path).unwrap().hotkey,
+        hk("control+option+k")
+    );
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.lines().any(|l| l == "hotkey=option+control+k"),
+        "{text}"
+    );
+}
+
+/// A settings file as 0.3.0 wrote it, for the Preview app and for the
+/// release app with a shortcut edited by hand, keeps its shortcut.
+#[test]
+fn a_0_3_0_file_keeps_its_shortcut() {
+    let preview = "hotkey=shift+option+space\nlaunch_at_login=false\n\
+                   fda_onboarding_dismissed=true\nappearance=system\napp_icon=match-row\n\
+                   your_files_first=true\nsort=name:ascending\nmatch_case=false\n\
+                   match_path=false\nregex=false\nindex_size=1920000\n";
+    assert_eq!(Settings::parse(preview).hotkey, hk("shift+option+space"));
+    let edited = preview.replace("hotkey=shift+option+space", "hotkey=Ctrl+Alt+K");
+    assert_eq!(Settings::parse(&edited).hotkey, hk("control+option+k"));
+}
+
+/// The release app and the Preview app keep separate files, so a shortcut
+/// picked in one never changes the other's.
+#[test]
+fn each_app_s_shortcut_is_its_own() {
+    let home = PathBuf::from("/Users/me");
+    let path = settings_path(&home);
+    let other = if path.to_string_lossy().contains("Not-Everything Preview") {
+        home.join("Library/Application Support/Not-Everything/settings")
+    } else {
+        home.join("Library/Application Support/Not-Everything Preview/settings")
+    };
+    assert_ne!(path, other);
+    assert_ne!(
+        Settings::defaults_for(Channel::Release).hotkey,
+        Settings::defaults_for(Channel::Rc).hotkey
+    );
+}

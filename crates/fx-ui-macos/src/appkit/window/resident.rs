@@ -32,12 +32,14 @@ use super::settings_window::SettingsUi;
 use crate::APP_NAME;
 use crate::actions::{HideMode, hide_mode};
 use crate::appkit::login_item::{self, LoginItemStatus};
-use crate::appkit::summon::SummonHotkey;
+use crate::appkit::summon::{GlobalRegistrar, SummonHotkey, poll_pressed};
 use crate::build_info::BuildInfo;
-use crate::hotkey::{HotkeySpec, Key};
+use crate::hotkey::{HotkeySpec, Key, Refusal};
+use crate::hotkey_slot::HotkeySlot;
 use crate::menu::{MenuAction, MenuItem, MenuState, build_menu};
 use crate::onboarding::{IndexScope, Onboarding, OnboardingEvent, OnboardingOutput, ScopeNote};
 use crate::settings::Settings;
+use crate::shortcut_recorder::{Input, Recorder};
 use crate::source::ResultsSource;
 use crate::switchable::SwitchableSource;
 
@@ -85,7 +87,15 @@ pub(crate) struct ResidentState {
     launch_output: OnboardingOutput,
     want_hotkey: bool,
     probe: FdaProbe,
-    hotkey: Option<SummonHotkey>,
+    /// The registered summon hotkey; `None` when the app doesn't register
+    /// one or `global-hotkey`'s manager could not start.
+    pub(super) hotkey: Option<SummonHotkey>,
+    /// Why the summon hotkey isn't the one last picked, or isn't working:
+    /// a refused change, or a failed registration at launch. The Settings
+    /// row shows it until a change succeeds.
+    pub(super) hotkey_error: Option<Refusal>,
+    /// The Settings row's shortcut recorder.
+    pub(super) recorder: Recorder,
     status_item: Option<Retained<NSStatusItem>>,
     pub(super) login: LoginItemStatus,
     /// Why the last change of Launch at Login was refused, until the next
@@ -135,6 +145,8 @@ impl ResidentState {
             want_hotkey: config.hotkey,
             probe: FdaProbe::new(),
             hotkey: None,
+            hotkey_error: None,
+            recorder: Recorder::default(),
             status_item: None,
             login: LoginItemStatus::Unavailable,
             login_error: None,
@@ -224,29 +236,7 @@ impl WinController {
         self.start_look();
 
         if want_hotkey {
-            let spec = self
-                .with_resident(|r| r.settings.hotkey)
-                .unwrap_or_default();
-            match SummonHotkey::register(&spec) {
-                Ok(hk) => {
-                    self.with_resident(|r| r.hotkey = Some(hk));
-                    let target: &AnyObject = self.as_ref();
-                    // SAFETY: `hotkeyTick:` is implemented as
-                    // `-(void)hotkeyTick:(NSTimer *)timer`; the run loop
-                    // retains the repeating timer, which retains its target.
-                    let timer = unsafe {
-                        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                            HOTKEY_POLL.as_secs_f64(),
-                            target,
-                            sel!(hotkeyTick:),
-                            None,
-                            true,
-                        )
-                    };
-                    timer.setTolerance(HOTKEY_POLL.as_secs_f64() / 2.0);
-                }
-                Err(e) => eprintln!("{APP_NAME}: global hotkey not available: {e}"),
-            }
+            self.start_hotkey();
         }
 
         let status_bar = NSStatusBar::systemStatusBar();
@@ -270,6 +260,49 @@ impl WinController {
         if let Some(out) = self.with_resident(|r| r.launch_output) {
             self.apply_onboarding(out);
         }
+    }
+
+    /// Registers the saved summon hotkey and starts polling for it. A
+    /// shortcut macOS refuses stays saved and is shown in Settings with the
+    /// reason; the poll runs either way, so a shortcut picked in Settings
+    /// later works without a relaunch.
+    fn start_hotkey(&self) {
+        let Some(spec) = self.with_resident(|r| r.settings.hotkey) else {
+            return;
+        };
+        let registrar = match GlobalRegistrar::new() {
+            Ok(registrar) => registrar,
+            Err(e) => {
+                eprintln!("{APP_NAME}: global hotkey not available: {e}");
+                self.with_resident(|r| r.hotkey_error = Some(Refusal::NotAcceptedAtLaunch(spec)));
+                return;
+            }
+        };
+        let mut slot = HotkeySlot::new(registrar);
+        // A file edited by hand is not held to the Settings rules: whatever
+        // parses is registered, as before the recorder.
+        let failed = slot.replace(spec).err();
+        self.with_resident(|r| {
+            r.hotkey = Some(slot);
+            if let Some(e) = &failed {
+                eprintln!("{APP_NAME}: global hotkey not available: {e}");
+                r.hotkey_error = Some(Refusal::NotAcceptedAtLaunch(spec));
+            }
+        });
+        let target: &AnyObject = self.as_ref();
+        // SAFETY: `hotkeyTick:` is implemented as
+        // `-(void)hotkeyTick:(NSTimer *)timer`; the run loop retains the
+        // repeating timer, which retains its target.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                HOTKEY_POLL.as_secs_f64(),
+                target,
+                sel!(hotkeyTick:),
+                None,
+                true,
+            )
+        };
+        timer.setTolerance(HOTKEY_POLL.as_secs_f64() / 2.0);
     }
 
     /// Runs `f` on the resident state, if the app runs resident.
@@ -461,11 +494,22 @@ impl WinController {
         }
     }
 
+    /// The summon hotkey's timer: a press toggles the search window, or,
+    /// while Settings records a new shortcut, ends recording with no change
+    /// (macOS hands the registered shortcut to the app, not the window).
     pub(crate) fn poll_hotkey(&self) {
-        let pressed = self
-            .with_resident(|r| r.hotkey.as_ref().is_some_and(SummonHotkey::poll_pressed))
-            .unwrap_or(false);
-        if pressed {
+        let Some((pressed, recording)) = self.with_resident(|r| {
+            let pressed = r.hotkey.as_ref().is_some_and(poll_pressed);
+            (pressed, r.recorder.is_recording())
+        }) else {
+            return;
+        };
+        if !pressed {
+            return;
+        }
+        if recording {
+            self.shortcut_input(Input::SummonPressed);
+        } else {
             self.toggle_window();
         }
     }

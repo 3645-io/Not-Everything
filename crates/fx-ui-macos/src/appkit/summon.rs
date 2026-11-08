@@ -1,56 +1,73 @@
 //! The global summon hotkey, registered through the `global-hotkey` crate
 //! (Carbon `RegisterEventHotKey`, so no Accessibility prompt).
 //!
-//! [`SummonHotkey::register`] maps a [`HotkeySpec`] onto `global-hotkey`'s
-//! key code and modifiers and registers it; the window controller polls
-//! [`SummonHotkey::poll_pressed`] from a main-thread timer. The manager must
-//! be created on the main thread and live as long as the hotkey should; it
-//! unregisters when dropped.
+//! [`GlobalRegistrar`] is the [`Registrar`] of the app's
+//! [`SummonHotkey`] slot: it maps a [`HotkeySpec`] onto `global-hotkey`'s
+//! key code and modifiers and registers it, so a shortcut picked in
+//! Settings replaces the old one at once ([`crate::hotkey_slot`]). The
+//! window controller polls [`poll_pressed`] from a main-thread timer. The
+//! manager must be created on the main thread and live as long as the
+//! hotkey should; the slot unregisters its shortcut when dropped.
+//!
+//! `global-hotkey` reports a refusal without macOS's reason, so the
+//! Settings row says what usually causes one ([`Refusal::NotAccepted`]).
+//!
+//! [`Refusal::NotAccepted`]: crate::hotkey::Refusal::NotAccepted
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::hotkey::{HotkeySpec, Key};
+use crate::hotkey_slot::{HotkeySlot, Registrar};
 
-/// A registered summon hotkey.
-pub struct SummonHotkey {
+/// The app's registered summon hotkey.
+pub type SummonHotkey = HotkeySlot<GlobalRegistrar>;
+
+/// Registers summon hotkeys with `global-hotkey`'s manager.
+pub struct GlobalRegistrar {
     manager: GlobalHotKeyManager,
-    hotkey: HotKey,
 }
 
-impl SummonHotkey {
-    /// Registers `spec` as a global hotkey.
+impl GlobalRegistrar {
+    /// Starts the manager (it installs the app's Carbon hotkey handler).
     ///
     /// # Errors
     ///
-    /// A readable message when the manager cannot start or the combination
-    /// cannot be registered (for example because another app holds it).
-    pub fn register(spec: &HotkeySpec) -> Result<SummonHotkey, String> {
+    /// A readable message when the manager cannot start.
+    pub fn new() -> Result<GlobalRegistrar, String> {
         let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
-        let hotkey = to_global_hotkey(spec);
-        manager
-            .register(hotkey)
-            .map_err(|e| format!("cannot register {spec}: {e}"))?;
-        Ok(SummonHotkey { manager, hotkey })
-    }
-
-    /// Drains the pending hotkey events and returns whether this hotkey was
-    /// pressed (key-down) at least once since the last call.
-    pub fn poll_pressed(&self) -> bool {
-        let mut pressed = false;
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.id() == self.hotkey.id() && event.state() == HotKeyState::Pressed {
-                pressed = true;
-            }
-        }
-        pressed
+        Ok(GlobalRegistrar { manager })
     }
 }
 
-impl Drop for SummonHotkey {
-    fn drop(&mut self) {
-        let _ = self.manager.unregister(self.hotkey);
+impl Registrar for GlobalRegistrar {
+    type Handle = HotKey;
+
+    fn register(&mut self, spec: &HotkeySpec) -> Result<HotKey, String> {
+        let hotkey = to_global_hotkey(spec);
+        self.manager
+            .register(hotkey)
+            .map_err(|e| format!("cannot register {spec}: {e}"))?;
+        Ok(hotkey)
     }
+
+    fn unregister(&mut self, handle: HotKey) {
+        let _ = self.manager.unregister(handle);
+    }
+}
+
+/// Drains the pending hotkey events and returns whether the registered
+/// shortcut was pressed (key-down) at least once since the last call.
+/// Events of a shortcut replaced since are dropped.
+pub fn poll_pressed(slot: &SummonHotkey) -> bool {
+    let id = slot.handle().map(HotKey::id);
+    let mut pressed = false;
+    while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+        if Some(event.id()) == id && event.state() == HotKeyState::Pressed {
+            pressed = true;
+        }
+    }
+    pressed
 }
 
 /// The `global-hotkey` form of `spec`.

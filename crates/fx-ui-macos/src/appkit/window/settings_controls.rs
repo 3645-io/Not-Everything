@@ -20,7 +20,14 @@
 //!   its state; its labels are subviews, and a pick takes every click
 //!   inside it and shows a hover look.
 //! - [`PushControl`]: an `NSButton` (`.btn`), raised by a surface view
-//!   behind it and pressed in while the mouse is down.
+//!   behind it and pressed in while the mouse is down; with no surfaces,
+//!   the recorder's "Use Default" link.
+//! - [`ShortcutControl`]: the summon hotkey's key caps as a button that
+//!   records a new shortcut (the shortcut recorder board): a hover wash,
+//!   then, while recording, pressed and rimmed in green, taking the key
+//!   presses (including the ⌘ combinations the menus would take) for
+//!   [`crate::shortcut_recorder`].
+//! - [`SheetView`]: the scrolling sheet; a click on it ends recording.
 //!
 //! The buttons are borderless and untitled and their cells draw no state,
 //! so AppKit draws nothing of its own (no checkbox or radio glyph); each
@@ -46,7 +53,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole,
-    NSAccessibilityRadioButtonRole, NSAccessibilitySwitchSubrole,
+    NSAccessibilityRadioButtonRole, NSAccessibilitySwitchSubrole, NSApplication,
     NSAttributedStringNSExtendedStringDrawing, NSBaselineOffsetAttributeName, NSButton,
     NSButtonCell, NSButtonType, NSCellStyleMask, NSColor, NSControl, NSControlStateValueOff,
     NSControlStateValueOn, NSEvent, NSFocusRingType, NSFontAttributeName,
@@ -62,8 +69,10 @@ use objc2_foundation::{
 use super::classes::WinController;
 use super::paint;
 use super::surfaces::SurfaceImage;
+use crate::hotkey::Modifiers;
 use crate::onboarding::OnboardingEvent;
 use crate::settings_view::layout::{self, Frame};
+use crate::shortcut_recorder::Input;
 use crate::theme::{Rgb, Rgba, TypeStyle};
 
 // ------------------------------------------------------------------ layers
@@ -683,6 +692,66 @@ impl FlippedView {
     }
 }
 
+// ------------------------------------------------------------- sheet view
+
+/// Instance variables of [`SheetView`].
+#[derive(Default)]
+pub(super) struct SheetIvars {
+    recorder: RefCell<Weak<ShortcutControl>>,
+}
+
+define_class!(
+    // SAFETY: NSView may be subclassed; the overrides keep its contract.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FxSettingsSheet"]
+    #[ivars = SheetIvars]
+    pub(super) struct SheetView;
+
+    impl SheetView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        /// A click on the sheet (a card, a caption, the space between)
+        /// ends recording: the recorder gives up the focus, which cancels
+        /// it, as a click anywhere else in a form would.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let recording = self
+                .ivars()
+                .recorder
+                .borrow()
+                .load()
+                .is_some_and(|r| r.is_recording());
+            if recording {
+                if let Some(window) = self.window() {
+                    window.makeFirstResponder(None);
+                }
+            }
+            // SAFETY: `mouseDown:` takes one NSEvent and returns void.
+            let _: () = unsafe { msg_send![super(self), mouseDown: event] };
+        }
+    }
+);
+
+impl SheetView {
+    pub(super) fn new(mtm: MainThreadMarker) -> Retained<SheetView> {
+        let this = SheetView::alloc(mtm).set_ivars(SheetIvars::default());
+        // SAFETY: `initWithFrame:` is NSView's designated initializer.
+        let view: Retained<SheetView> =
+            unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        view.setWantsLayer(true);
+        view
+    }
+
+    /// The recorder a click on the sheet stops.
+    pub(super) fn set_recorder(&self, recorder: &ShortcutControl) {
+        *self.ivars().recorder.borrow_mut() = Weak::new(recorder);
+    }
+}
+
 // ------------------------------------------------------------------ switch
 
 /// The images of a switch in one theme.
@@ -1127,6 +1196,279 @@ impl ChoiceControl {
     }
 }
 
+// --------------------------------------------------------- shortcut recorder
+
+/// `kVK_Return` and `kVK_ANSI_KeypadEnter`: with the focus on the caps,
+/// they start recording, as Space does.
+const START_KEYS: [u16; 2] = [0x24, 0x4C];
+
+/// How a [`ShortcutControl`] looks.
+#[derive(Clone, Default)]
+pub(super) struct ShortcutLooks {
+    /// Under the pointer, at rest (`.rec.is-hover`).
+    pub hover: Look,
+    /// While recording (`.rec[aria-pressed=true]`).
+    pub recording: Look,
+    /// The box's corner radius, for the focus outline.
+    pub radius: f64,
+    /// The focus outline's colour.
+    pub focus: Option<Rgba>,
+}
+
+/// Instance variables of [`ShortcutControl`].
+#[derive(Default)]
+pub(super) struct ShortcutIvars {
+    looks: RefCell<ShortcutLooks>,
+    hovered: Cell<bool>,
+    focused: Cell<bool>,
+    recording: Cell<bool>,
+    ring: OnceCell<Layer>,
+    target: RefCell<Weak<SettingsTarget>>,
+}
+
+define_class!(
+    // SAFETY: NSButton may be subclassed; the overrides call super or
+    // replace drawing and key handling while recording, which the button
+    // never needs.
+    #[unsafe(super(NSButton, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FxSettingsShortcut"]
+    #[ivars = ShortcutIvars]
+    pub(super) struct ShortcutControl;
+
+    impl ShortcutControl {
+        #[unsafe(method(wantsUpdateLayer))]
+        fn wants_update_layer(&self) -> bool {
+            true
+        }
+
+        /// The window draws the control; the button draws nothing.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {}
+
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            self.apply();
+        }
+
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        /// The caps inside take no clicks; the whole box records.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            // SAFETY: `hitTest:` takes an NSPoint and returns a view or nil.
+            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
+            hit.map(|_| self.retain().into_super().into_super().into_super())
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(true);
+            redraw(self);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(false);
+            redraw(self);
+        }
+
+        /// While recording the caps take the keys, also with Full Keyboard
+        /// Access off; otherwise as any button.
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            // SAFETY: `acceptsFirstResponder` takes nothing and returns BOOL.
+            let accepts: bool = unsafe { msg_send![super(self), acceptsFirstResponder] };
+            self.ivars().recording.get() || accepts
+        }
+
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            // SAFETY: `becomeFirstResponder` takes nothing and returns BOOL.
+            let ok: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            if ok {
+                self.ivars().focused.set(true);
+                reveal(self);
+                redraw(self);
+            }
+            ok
+        }
+
+        /// Losing the focus cancels recording.
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            // SAFETY: `resignFirstResponder` takes nothing and returns BOOL.
+            let ok: bool = unsafe { msg_send![super(self), resignFirstResponder] };
+            if ok {
+                self.ivars().focused.set(false);
+                redraw(self);
+                if self.ivars().recording.get() {
+                    self.send(Input::Cancel);
+                }
+            }
+            ok
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            if self.ivars().recording.get() {
+                self.send(key_input(event));
+            } else if START_KEYS.contains(&event.keyCode()) {
+                // SAFETY: `performClick:` takes an optional sender (none)
+                // and sends the button's action on the main thread.
+                unsafe { self.performClick(None) };
+            } else {
+                // SAFETY: `keyDown:` takes one NSEvent and returns void.
+                let _: () = unsafe { msg_send![super(self), keyDown: event] };
+            }
+        }
+
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, event: &NSEvent) {
+            if self.ivars().recording.get() {
+                self.send(Input::Modifiers(modifiers(event)));
+            } else {
+                // SAFETY: `flagsChanged:` takes one NSEvent and returns void.
+                let _: () = unsafe { msg_send![super(self), flagsChanged: event] };
+            }
+        }
+
+        /// While recording, a ⌘ or ⌃ combination is a shortcut to record,
+        /// not a menu command: ⌘Q must not quit, nor ⌘W close the window.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
+            if self.ivars().recording.get() {
+                self.send(key_input(event));
+                true
+            } else {
+                // SAFETY: `performKeyEquivalent:` takes one NSEvent and
+                // returns BOOL.
+                let handled: bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
+                handled
+            }
+        }
+    }
+);
+
+impl ShortcutControl {
+    /// The caps' button, sending `action` to `target` when clicked and its
+    /// key presses to `target` while recording.
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        target: &SettingsTarget,
+        action: objc2::runtime::Sel,
+    ) -> Retained<ShortcutControl> {
+        let ivars = ShortcutIvars::default();
+        *ivars.target.borrow_mut() = Weak::new(target);
+        let this = ShortcutControl::alloc(mtm).set_ivars(ivars);
+        // SAFETY: `initWithFrame:` is NSView's designated initializer.
+        let button: Retained<ShortcutControl> =
+            unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        plain(&button, NSButtonType::MomentaryPushIn);
+        // SAFETY: the role is an immutable framework constant.
+        button.setAccessibilityRole(Some(unsafe { NSAccessibilityButtonRole }));
+        let t: &AnyObject = target.as_ref();
+        // SAFETY: as for `SwitchControl::new`.
+        unsafe {
+            button.setTarget(Some(t));
+            button.setAction(Some(action));
+        }
+        // SAFETY: the area's owner is the button itself, which keeps it; no
+        // user info.
+        let area = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveInActiveApp
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(&button),
+                None,
+            )
+        };
+        button.addTrackingArea(&area);
+        button
+    }
+
+    /// Whether the caps record.
+    pub(super) fn is_recording(&self) -> bool {
+        self.ivars().recording.get()
+    }
+
+    /// Shows the caps recording or not, with `looks`, read by VoiceOver as
+    /// `spoken`. Starting to record takes the keyboard focus; when
+    /// recording ends the focus goes back to the window unless Full
+    /// Keyboard Access is on, so a click leaves no focus outline behind.
+    pub(super) fn set(&self, recording: bool, looks: ShortcutLooks, spoken: &str) {
+        *self.ivars().looks.borrow_mut() = looks;
+        self.setAccessibilityLabel(Some(&NSString::from_str(spoken)));
+        let was = self.ivars().recording.replace(recording);
+        if let Some(window) = self.window() {
+            if recording && !was {
+                window.makeFirstResponder(Some(self));
+            } else if was && !recording && self.ivars().focused.get() {
+                let mtm = MainThreadMarker::from(self);
+                if !NSApplication::sharedApplication(mtm).isFullKeyboardAccessEnabled() {
+                    window.makeFirstResponder(None);
+                }
+            }
+        }
+        redraw(self);
+    }
+
+    /// Forgets the hover look (the window closed under the pointer).
+    pub(super) fn reset_hover(&self) {
+        self.ivars().hovered.set(false);
+    }
+
+    fn send(&self, input: Input) {
+        if let Some(target) = self.ivars().target.borrow().load() {
+            target.shortcut_input(input);
+        }
+    }
+
+    fn apply(&self) {
+        let iv = self.ivars();
+        let Some(root) = Layer::of(self) else { return };
+        let looks = iv.looks.borrow();
+        let recording = iv.recording.get();
+        let look = if recording {
+            &looks.recording
+        } else if iv.hovered.get() {
+            &looks.hover
+        } else {
+            &Look::None
+        };
+        let scale = backing_scale(self);
+        transaction(None, || {
+            root.show(look, scale);
+            keep_unclipped(self);
+            if let Some(focus) = looks.focus {
+                // While recording the green rim shows where the keys go.
+                let ring = iv.focused.get() && !recording;
+                focus_ring(self, &iv.ring, ring, looks.radius, focus);
+            }
+        });
+    }
+}
+
+/// The modifiers held in `event`.
+fn modifiers(event: &NSEvent) -> Modifiers {
+    Modifiers::from_event_flags(event.modifierFlags().0 as u64)
+}
+
+/// `event`, a key going down, for the recorder.
+fn key_input(event: &NSEvent) -> Input {
+    Input::Key {
+        code: u32::from(event.keyCode()),
+        modifiers: modifiers(event),
+        repeat: event.isARepeat(),
+    }
+}
+
 // -------------------------------------------------------------- push button
 
 /// How a [`PushControl`] looks at rest and pressed.
@@ -1139,6 +1481,9 @@ pub(super) struct PushLooks {
     pub down: Look,
     /// The focus outline's colour.
     pub focus: Option<Rgba>,
+    /// The control's corner radius for the focus outline; `None` for a
+    /// pill (`.btn`).
+    pub radius: Option<f64>,
 }
 
 /// Instance variables of [`PushControl`].
@@ -1274,7 +1619,9 @@ impl PushControl {
         let Some(root) = Layer::of(self) else { return };
         let looks = iv.looks.borrow();
         let scale = backing_scale(self);
-        let radius = self.bounds().size.height / 2.0;
+        let radius = looks
+            .radius
+            .unwrap_or_else(|| self.bounds().size.height / 2.0);
         transaction(None, || {
             let none = Look::None;
             root.show(if iv.pressed.get() { &looks.down } else { &none }, scale);
@@ -1318,21 +1665,39 @@ define_class!(
         fn window_did_resize(&self, _notification: &NSNotification) {
             self.with(|c| c.settings_resized());
         }
+
+        /// Another window or app took the keys: recording ends.
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notification: &NSNotification) {
+            self.with(|c| c.shortcut_input(Input::Cancel));
+        }
     }
 
     impl SettingsTarget {
+        /// The summon hotkey's caps: start recording a new shortcut.
+        #[unsafe(method(shortcutClicked:))]
+        fn shortcut_clicked(&self, _sender: Option<&AnyObject>) {
+            self.with(|c| c.shortcut_input(Input::Start));
+        }
+
+        /// "Use Default": the app's default summon hotkey.
+        #[unsafe(method(shortcutReset:))]
+        fn shortcut_reset(&self, _sender: Option<&AnyObject>) {
+            self.with_control(|c| c.reset_hotkey());
+        }
+
         /// The Launch at Login switch.
         #[unsafe(method(loginSwitched:))]
         fn login_switched(&self, sender: &NSButton) {
             let on = sender.state() == NSControlStateValueOn;
-            self.with(|c| c.login_switched(on));
+            self.with_control(|c| c.login_switched(on));
         }
 
         /// The "Your files first" switch.
         #[unsafe(method(yourFilesFirstSwitched:))]
         fn your_files_first_switched(&self, sender: &NSButton) {
             let on = sender.state() == NSControlStateValueOn;
-            self.with(|c| c.your_files_first_changed(on));
+            self.with_control(|c| c.your_files_first_changed(on));
         }
 
         /// A segment of the appearance control; its tag is the mode's
@@ -1340,21 +1705,21 @@ define_class!(
         #[unsafe(method(appearancePicked:))]
         fn appearance_picked(&self, sender: &NSButton) {
             let tag = sender.tag();
-            self.with(|c| c.appearance_changed(tag));
+            self.with_control(|c| c.appearance_changed(tag));
         }
 
         /// An icon pick; its tag is the icon's index.
         #[unsafe(method(iconPicked:))]
         fn icon_picked(&self, sender: &NSButton) {
             let tag = sender.tag();
-            self.with(|c| c.icon_chosen(tag));
+            self.with_control(|c| c.icon_chosen(tag));
         }
 
         /// Open System Settings: the Full Disk Access page, as the access
         /// callout and the menu's Grant item open it.
         #[unsafe(method(openAccessSettings:))]
         fn open_access_settings(&self, _sender: Option<&AnyObject>) {
-            self.with(|c| c.onboarding_event(OnboardingEvent::GrantClicked));
+            self.with_control(|c| c.onboarding_event(OnboardingEvent::GrantClicked));
         }
     }
 );
@@ -1375,6 +1740,30 @@ impl SettingsTarget {
         if let Some(controller) = self.ivars().controller.load() {
             f(&controller);
         }
+    }
+
+    /// Another control was used: recording ends first (a click on a
+    /// button doesn't take the focus from the caps), then `f` runs.
+    fn with_control(&self, f: impl FnOnce(&WinController)) {
+        self.with(|c| {
+            c.shortcut_input(Input::Cancel);
+            f(c);
+        });
+    }
+
+    /// What the caps' key presses and focus changes mean while recording.
+    pub(super) fn shortcut_input(&self, input: Input) {
+        self.with(|c| c.shortcut_input(input));
+    }
+
+    /// The selector the caps send when clicked.
+    pub(super) fn shortcut_action() -> objc2::runtime::Sel {
+        sel!(shortcutClicked:)
+    }
+
+    /// The selector "Use Default" sends.
+    pub(super) fn reset_action() -> objc2::runtime::Sel {
+        sel!(shortcutReset:)
     }
 
     /// The selector the Launch at Login switch sends.
