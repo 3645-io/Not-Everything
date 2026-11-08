@@ -1,0 +1,20 @@
+[package]
+name = "fx-sort"
+description = "Pre-sorted orders and batched merges."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+fx-model = { path = "../fx-model" }
+fx-index = { path = "../fx-index" }
+rayon = "1"
+
+[dev-dependencies]
+fx-bench = { path = "../fx-bench" }
+
+[lints]
+workspace = true

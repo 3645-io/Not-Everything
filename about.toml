@@ -1,0 +1,24 @@
+# cargo-about configuration for THIRD-PARTY-NOTICES.md: the notices of the
+# open-source crates the app and the command are built with, written by
+# `scripts/third-party-notices.sh` (cargo-about 0.9.3) from Cargo.lock with
+# about.hbs. The accepted licences match deny.toml's allowlist.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+# Every crate in Cargo.lock, for every target and including build-time
+# ones: more notices than the macOS app strictly needs, but the file can
+# then be checked against Cargo.lock without cargo-about
+# (crates/fx-testkit/tests/third_party_notices.rs).
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+
+# The workspace's own crates aren't published (publish = false) and are MIT
+# under LICENSE, so the notices leave them out.
+private = { ignore = true }

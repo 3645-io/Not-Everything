@@ -1,0 +1,20 @@
+# The owner's research notes stay local (clean-room policy)
+.claude/research/
+
+# Personal Claude Code settings (API key helper); never commit
+.claude/settings.local.json
+
+# Cargo build output
+/target
+
+# Local agent notes, screenshots and private patterns; never commit
+.agents/local/
+
+# Agent worktrees (Claude Code); never commit
+.claude/worktrees/
+
+# Decision records stay on the owner's machine; the public files state each outcome in plain words
+docs/decisions/
+
+# Finder's folder settings
+.DS_Store

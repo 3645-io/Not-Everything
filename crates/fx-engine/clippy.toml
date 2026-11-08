@@ -1,0 +1,4 @@
+# The writer tests (tests/writer.rs) keep a list of scripted steps as
+# `Vec<Box<dyn Fn(&FakeTree) -> Vec<Change>>>`, just above clippy's default
+# type-complexity threshold of 250.
+type-complexity-threshold = 400

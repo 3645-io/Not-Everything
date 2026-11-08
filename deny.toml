@@ -1,0 +1,34 @@
+# cargo-deny configuration: the dependency licence allowlist (the licensing
+# rules in `.agents/rules/licensing.md`). `cargo deny check licenses` runs
+# locally before a PR and in CI (`.github/workflows/ci.yml`).
+#
+# A dependency's licence expression passes when it can be satisfied with the
+# identifiers below (SPDX). This guard keeps GPL and unclear licences out of
+# the build; adding an identifier needs the owner's approval.
+
+[graph]
+# Every feature on, so optional dependencies are checked too. cargo-deny
+# checks every target by default, so the Windows and Linux crates'
+# dependencies are covered as well.
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # unicode-ident (compile time) and unicode-normalization (in the app)
+    # are "(MIT OR Apache-2.0) AND Unicode-3.0"; approved by the owner.
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+# Permissive licences only, no copyleft; ISC and BSD are allowed in advance
+# although no dependency uses them yet.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace's own crates are unpublished (`publish = false`) and MIT;
+# `crates/fx-testkit/tests/workspace_policy.rs` checks their licences.
+ignore = true

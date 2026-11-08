@@ -1,0 +1,22 @@
+[package]
+name = "fx-fs-macos"
+description = "macOS file-system source: getattrlistbulk walker, FSEvents, firmlink mapping, FDA probe, cloud-file policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fx-fs = { path = "../fx-fs" }
+fx-model = { path = "../fx-model" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+fx-bench = { path = "../fx-bench" }

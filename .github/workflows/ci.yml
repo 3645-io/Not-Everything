@@ -1,0 +1,92 @@
+name: CI
+
+# CI runs on pull requests, not on pushes: a merge into dev, main or rc/*
+# would only run the same checks a second time, which mattered while the
+# project's Actions minutes were metered. Standard runners are free for
+# public repositories, so this can be revisited.
+#
+# workflow_dispatch runs it by hand, for example on rc/X.Y.Z after tagging a
+# release candidate, so the release PR's RC gate sees the new tag. A run by
+# hand runs the other jobs too, rather than skipping them: a job skipped by
+# its `if:` reports success, which could stand in for a failed check of the
+# same commit.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macOS only. The Ubuntu job is off until the Linux phase; add
+    # ubuntu-latest back to the matrix then.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The measurement flags are compiled only with the `measure` feature
+      # (off in releases), so check that build too.
+      - name: cargo clippy (measure)
+        run: cargo clippy -p fx-ui-macos --all-targets --locked --features measure -- -D warnings
+      - name: cargo doc (broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+      - name: cargo test
+        run: cargo test --workspace --locked
+      - name: cargo test (measure)
+        run: cargo test -p fx-ui-macos --locked --features measure
+      # Release builds compile out the debug script (`cfg(debug_assertions)`),
+      # so check that the app and the command build in release too.
+      - name: cargo check (release)
+        run: cargo check --release --locked -p fx-ui-macos -p fx-cli --bins
+
+  # Every dependency's licence must be on deny.toml's allowlist, which keeps
+  # GPL and unclear licences out. Linux runners cost a tenth of macOS ones,
+  # and the check reads only Cargo.lock and the crates' metadata.
+  licenses:
+    name: dependency licences (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+  # Release PRs into main: the version must be new, and the head must be the
+  # latest release candidate tag (scripts/check-release-pr.sh). By hand, it
+  # checks an rc/X.Y.Z branch's head the same way.
+  release-pr:
+    name: release PR (version and RC gate)
+    if: >-
+      (github.event_name == 'pull_request' && github.base_ref == 'main') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'rc/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: version and RC gate
+        run: sh scripts/check-release-pr.sh origin/main

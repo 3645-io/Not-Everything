@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Not-Everything contributors"]
+repository = "https://github.com/3645-io/Not-Everything"
+homepage = "https://github.com/3645-io/Not-Everything"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Every unsafe block says why it is sound, in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+
+# Release builds use link-time optimisation: with the v0.3.0 interface it
+# keeps the installer inside the 5% size gate (DMG 4.97 MB without it,
+# 4.22 MB with it, against 4.36 MB for 0.2.0), and the first results show
+# sooner (914 ms against 957 ms without it). Debug builds and tests are
+# unchanged.
+[profile.release]
+lto = "fat"
+codegen-units = 1

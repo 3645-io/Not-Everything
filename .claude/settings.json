@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch --show-current)",
+      "Bash(git worktree list *)"
+    ],
+    "deny": [
+      "Bash(git * --output*)",
+      "Read(**/search_engine_index_design.md)"
+    ]
+  }
+}

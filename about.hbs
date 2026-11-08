@@ -1,0 +1,32 @@
+# Third-party notices
+
+Not-Everything itself is MIT-licensed (see `LICENSE`). The app and the `not-everything` command are built with the open-source crates below, whose licences ask for their notices to be kept with every copy. The app shows this text in its About panel and keeps it in its bundle; `not-everything -licenses` prints it.
+
+This file is written by `scripts/third-party-notices.sh` (cargo-about) from `Cargo.lock`. Don't edit it by hand; run the script after any dependency change.
+
+## Overview
+
+{{#each overview}}
+- {{{name}}}: {{count}} {{#if (eq count 1)}}crate{{else}}crates{{/if}}
+{{/each}}
+{{#each licenses}}
+
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- `{{{crate.name}}} {{{crate.version}}}`
+{{/each}}
+
+```text
+{{{text}}}
+```
+{{/each}}
+
+## Copyright notices for crates published without one
+
+These crates were published under the MIT licence without a copyright line, so the MIT text above that lists them shows the licence's placeholder. Their projects name the copyright holders as:
+
+- The objc2 crates (`objc2`, `objc2-encode`, `objc2-foundation`, `objc2-app-kit`, `objc2-core-foundation`, `objc2-service-management`): Mads Marquart and the objc2 contributors (https://github.com/madsmtm/objc2, whose `LICENSE-MIT.txt` names Mads Marquart).
+- The windows crates (`windows-link`, `windows-sys`, `windows-targets` and the `windows_*` target crates, built only for Windows): Microsoft Corporation (https://github.com/microsoft/windows-rs, whose `license-mit` reads "Copyright (c) Microsoft Corporation.").

@@ -1,0 +1,337 @@
+# Progress
+
+## How to use this file
+
+- Read this file first in every session, then only the `docs/PLAN.md` sections the run
+  needs.
+- One run per session. When a run ends, update its row in the runs table (status, branch or
+  PR, measured numbers) and add any follow-ups below. Update this file last.
+- If a run is cut short, set its status to **Paused**, commit the work in progress on its
+  branch, and write under "Current state" exactly where the next session should resume.
+- Benchmarks: record the machine and whether the cache was cold or warm next to every
+  number.
+- Statuses: **Not started**, **In progress**, **Paused**, **Done**.
+- The run IDs and scopes mirror the "Runs: one session each" table in `docs/PLAN.md`. If
+  the plan changes, re-export it and update this table to match.
+
+## Current state
+
+- **Final public review (2026-11-08, branch `chore/public-review-fixes`, owner request):** two fresh reviews before publishing, each checked by hand, led to these fixes, each with a test written first.
+  - **Shared settings:** `.claude/settings.json` denies git's `--output`, with which `git diff`, `git log` and `git show` write a file, and no longer allows `rustc --version` or `rustup show`, which through rustup run the toolchain a branch names. A quoted or split `--output` still gets past the deny (a rule matches the command as written); `.agents/rules/conventions.md` says so and `agent_rules.rs` records it.
+  - **CLI tarball:** every file named the builder's account as its owner. The release script now writes it as root:wheel with no extended attributes, ACLs or file flags, and stops if it names another owner or holds any pax extended header or AppleDouble file.
+  - **Old working name:** the public guard is gone, since any public check that recognises the name lets anyone recover it. The name is checked only against the owner's local list of private strings, so no tracked file holds it in any form. The spike and test bundle IDs moved to `io.3645.*`.
+  - **Docs:** stale and garbled lines in this file, two anchors in `docs/phase-1-plan.md`, and comments in `deny.toml` and `about.toml`; `CLEANROOM.md` records the review's sources.
+  - **Run 2.10** (shortcut recorder in Settings) is added to `docs/PLAN.md` and the Runs table below, as the owner wrote it. The run itself is for later.
+  - **Checks:** `cargo fmt --check`, clippy (`-D warnings`, with and without `measure`), `cargo test --workspace` (1,974 passed, 0 failed, 3 ignored), `cargo test -p fx-ui-macos --features measure` (607 passed, 1 ignored), the broken-link `cargo doc`, `cargo check --release`, `cargo deny check licenses`, the notices check and `sh -n` on every script all pass.
+- **Public documents and rules (2026-11-08, branch `chore/public-docs-and-rules`, owner request):** a final review before publishing, by four parallel reviewers and the owner, led to one cleanup done as seven parallel streams.
+  - **Kept local:** the decision records (on the owner's machine, gitignored); every tracked reference to them now gives the reason in place, and `crates/fx-testkit/tests/public_repo.rs` keeps citations and untracked shell-script modes out. The app's pre-release name is checked only against the owner's local list of private strings, so no tracked file holds it in any form.
+  - **Agent rules:** split into `.agents/rules/` (runs, branches and releases, privacy, clean room, product, licensing, conventions) behind an index; `crates/fx-testkit/tests/agent_rules.rs` checks the index. The shared `.claude/settings.json` allows only read-only commands.
+  - **Code:** the old data-folder migration and the command's fallback to the old folder are removed; the measurement flags (`--synthetic`, `--launch-probe`, `--gate-probe`, `--autoscroll`, `--page-cost-ms`) are compiled only with the `measure` feature, which the gate scripts and CI turn on; the debug script is compiled out of release builds; `MacPathStat::default()` keeps cloud downloads off; the data folder, stores and settings are private to the user (0700 folders, 0600 files); `localtime_r` comes from libc; unsafe blocks all carry a safety comment (now a clippy lint); four unused functions are gone.
+  - **Command:** in txt and csv output on a terminal, control characters print as `?` (json escapes them all); `-0` gives NUL-separated output; `docs/cli.md` warns about spreadsheet formulas in CSV.
+  - **Scripts and CI:** the release script checks origin, `gh` sign-in and the notary profile before tagging, treats only "release not found" as no release, and builds with `--locked`; the notices script pins cargo-about 0.9.3 and fetches first; CI adds `workflow_dispatch`, `actions/checkout@v7`, a broken-doc-link check and the `measure` build's clippy and tests.
+  - **Docs:** README, CHANGELOG (v0.1.x entries folded into one line), SECURITY, the plan export, the gate reports, the Phase 1 plan and CLEANROOM are accurate for public readers; the research report is removed from the repository (its sources and the clean-room disclosure are in `CLEANROOM.md`); stale comments are swept across the workspace.
+  - **Checks:** `cargo fmt --check`, clippy (`-D warnings`, with and without `measure`), `cargo test --workspace` (1,952 passed, 0 failed, 3 ignored), `cargo test -p fx-ui-macos --features measure` (605 passed, 1 ignored), the broken-link `cargo doc`, `cargo deny check licenses` and the notices check all pass.
+  - **Open:** the owner mirrors the `docs/PLAN.md` edits (title, header, risk decisions) in the private plan document.
+- **Going public (2026-11-08, branch `chore/prepare-public`, owner request):** before publishing, the repository was scanned for private information. The scan found no secrets: no passwords, keys, certificates or notary credentials. The private details it did find were removed. The project moves to a fresh public repository, `3645-io/Not-Everything`, whose first commit is `dev`'s cleaned tree; its default branch is `main`.
+  - **Removed and guarded:** the private details are gone from tracked files; `privacy_policy.rs` checks every tracked file (and, on the owner's Mac, a local list of private strings). The release script takes the signing identity from `NE_SIGN_IDENTITY`, maps the builder's home folder out of the binaries (`--remap-path-prefix`) and stops if one still holds it.
+  - **Third-party notices:** `THIRD-PARTY-NOTICES.md` (cargo-about, offline) covers every crate in `Cargo.lock`: the 54 crates any build uses (MIT, Apache-2.0, Unicode-3.0), with the copyright holders of the objc2 and windows crates, which were published without a copyright line, named by hand in `about.hbs` (a test checks the list), plus 5 locked optional dependencies no build turns on. The app shows it in the About panel and its bundle, `not-everything -licenses` prints it, the CLI tarball holds it, and the release script refuses stale notices.
+  - **Also:** agent instructions in `.agents/` (an index in `.agents/CLAUDE.md`, rule files in `.agents/rules/`; root `CLAUDE.md` and `AGENTS.md` point there); `LICENSE` names 3645 Team; `ne@3645.io` in the README and `SECURITY.md`; `ATTRIBUTION.md`; `deny.toml` licence allowlist (Unicode-3.0 added by the owner) with a CI job.
+  - **Review:** a fresh agent reviewed the branch before the move and found nothing private; its notes on stale wording (CI comment, hosting line, default branch, README install line, missing progress entry) are fixed.
+
+- **v0.3.0 (2026-11-08, branch `feature/search-and-interface`, one PR into `dev`; the owner's plan of 7–8 Nov):** the apostrophe rule, the interface rebuilt to the owner's 3645 design mockups, full-path search under 100 ms, chips remembered, local dates, search on every keystroke, a clicked row takes the focus, link-time optimised release builds, and CI on pull requests only.
+  - **Performance gate (M4 Pro, 24 GB, macOS 27.0.1, warm cache, load average about 2–3; beta builds of `dev` before and after this branch):** DMG 4,359,559 → 4,971,199 B (+14.0%) without LTO and 4,216,895 B (−3.3%) with it, so LTO is on (owner, 8 Nov). Memory: −0.2% (2M synthetic rows), +2.1% (the /Applications index). Idle CPU: +0.033 points (synthetic), and on /Applications a median of +0.052 points against the +0.05 floor, noisy (before runs 0.423, 0.241, 0.363%; after 0.415, 0.415, 0.479%), which the owner accepted with the RC go-ahead. Launch to results 1,014 → 957 ms (−5.6%), and 914 ms with LTO. Keystroke to repaint p50/p95 25.4/26.5 → 16.0/28.5 ms. Full-path search p95 about 275 → 24.1 ms.
+  - **Search on every keystroke:** AppKit's default waited about 205 ms after the last key (250 ms for one key). With `sendsSearchStringImmediately`, results come about 10 ms after each key. Over the real index (1.92M entries) each search to repaint takes p50 25.8 ms, p95 35.2 ms, max 47.7 ms (gate probe, 44 keystrokes).
+  - **Review:** the owner approved the screenshot sheet (differences 1–28, derived states 22–27) with the RC go-ahead. The channel tag's text now sits centred (item 28).
+  - **Owner's fixes after testing (8 Nov):** the search field's × sat about 6 points above the field's middle; it is now drawn by the text view in a line as tall as its button and centred by its ink (`main_layout::clear_button`). TextKit draws text higher than the text view expects in a line shorter than the font's ascent plus descent, so the design's 22-point line could not be used. The selected row's right end was cut off under a legacy scroller (17 points; shown with a mouse connected or "Show scroll bars" Always): the columns now leave the scroller's width (`main_layout::card`), Name and Path sharing the loss, and the window lays out again when the scroller style changes. Measured in a 1x debug build with synthetic data: the ×'s ink middle is within half a pixel of the field's in light and dark, and the row's rim shows whole at the right. Not checked: switching scroller styles while the app runs, and a Retina screen.
+  - **Not checked by hand yet:** real pointer hover and clicks, Grant and Not Now, typing, ⌘↩, ⌘C, drag-out and Escape, VoiceOver and Full Keyboard Access, a Retina screen, a real login item. The RC-1 test covers them.
+  - **Plan:** the build plan now records Sparkle 2 auto-updates under run 2.6: feeds, the EdDSA key, hosting (the repository was private, so the feed needed a public host; now that it is public, its releases can serve it), the in-app controls and the choices the run must record (owner, 8 Nov). `docs/PLAN.md` was re-exported.
+  - **Next:** cut `rc/0.3.0` from `dev` and publish RC-1, then the release PR into `main` (owner, 8 Nov).
+
+- **v0.2.0 released (2026-11-07):** a full GitHub release, tag `release/v0.2.0`, published from the project's earlier, private repository. It shipped the DMG, the zip, the CLI tarball and `SHA256SUMS.txt`; those downloads are not in this repository.
+  - **Notarization:** two uploads, both Accepted within minutes: the app and the command, then the DMG. A copy downloaded from GitHub and marked quarantined passed `spctl --assess --type open` as "Notarized Developer ID" and `stapler validate`, and its checksum matched (7 Nov). The plan's Phase 2 line for signed, notarized v0.2.0 releases is ticked.
+  - **RC-1:** pre-release `release/v0.2.0-RC-1` on `rc/0.2.0`, after a bugfix. The first RC-1 attempt's app inside the DMG failed `syspolicy_check distribution` ("Notary Ticket Missing"), so the fix makes the script notarize in two uploads: the app and the command first, then the DMG built from the stapled app. The owner tested RC-1 and signed it off.
+  - **How the code got in:** the release's feature and fix branches went into `dev` through one integration merge, `rc/0.2.0` was merged into `main`, `dev` moved to 0.3.0, and `main` was merged back into `dev`.
+  - **In the release:** Developer ID signing and notarization, the release flow and the Preview app, the remembered sort, Escape hides the window, the full scan starts on the Full Disk Access grant, Cmd+Q quits at once, the channel and version label and the window title, apostrophes ignored in search, Your files first, the selection kept across refreshes and the DMG. Spotlight search (run 2.8) is not in it.
+  - **Benchmarks (M4 Pro, warm cache, load average about 8):** matcher literal worst p95 13.27 → 12.87 ms; the Your files first group pass 4.8 ms p95; a tiered page at 50% matches 15.2 ms against 10.8 ms plain; the selection lookup 14.8 ms p95. Full-path p95 is about 280 ms and misses its 100 ms gate; that predates this release.
+  - **Not measured yet:** the Cmd+Q quit-to-exit time; keystroke to repaint with Your files first on and off (gate probe); peak memory while both engines run after the Full Disk Access grant.
+  - **Known limits:** Full Disk Access revoked during the full build isn't handled; a quit during a background save leaves a temp file, cleaned after 10 min; the selection is kept by path, so a renamed file drops out; the Preview app's Dock icon loses macOS's clear and tinted styles; the Your files first Settings row has no design yet.
+  - **Spotlight, round 2:** only donated content appears in Spotlight; no App Intents surfaced, from an extension or from the main app, even after a reboot. Run 2.8 stays later, not scheduled.
+- **v0.2.0 housekeeping (2026-11-07, branch `chore/housekeeping-0.2.0`; the owner's decisions of 7 Nov):**
+  - **Renumbered:** the release planned as v0.1.4 is v0.2.0 (the owner's versioning decision of 7 Nov). It ships the Developer ID signing and notarization of 4 Nov, and adds a DMG to the release files (owner, 7 Nov; the DMG comes early from run 2.6, the rest of 2.6 stays).
+  - **Spotlight search moved out of v0.2.0 (owner, 7 Nov):** run 2.8 goes to a later version, not scheduled. Its spike found that on macOS 27.0.1 Spotlight never called an App Intents extension (the Tab scope showed "No Results", and no actions or App Shortcuts appeared), nor an app with its intents in its own Swift main executable. The Tab scope lists only content donated to Core Spotlight, and the plan rules out copying the index there.
+  - **Trademark:** the owner settled that "Everything" is not trademarked, so the name Not-Everything stays for now and v0.2.0 does not wait on a trademark search. Counsel review of the name before Phase 5 closes (run 5.2) stays advised. Recorded in the plan's naming paragraph and risk table (#1).
+  - **Run 2.9 added (Not started; not in v0.2.0):** a background indexer. A LaunchAgent inside the app bundle, registered with `SMAppService`, runs `fx-engine` with no window from login; it scans, follows file changes and saves the index, so quitting the app never touches the index. The app and the `not-everything` command become clients over `fx-ipc` (a Unix socket only the user can open). The first scan starts when the agent is registered. It depends on run 2.7's decision about Full Disk Access for the agent, and the agent is signed with the same Developer ID, inside out, before the app. Done when: after a reboot with the app never opened, a file created then is found within 1 s of opening the window.
+  - **Docs and code:** the plan gains v0.2.0 in place of v0.1.4, the DMG in v0.2.0, Spotlight search as later and not scheduled, run 2.9, the release flow and the Preview app; `docs/PLAN.md` is re-exported from the owner's plan document. The empty `crates/fx-store/src/image.rs` left over from run 1.6 is removed.
+- **Release resume (2026-11-04, branch `fix/0.1.4-release-resume`, owner request):** `scripts/release-macos.sh --resume OUT_DIR` finishes a release whose upload Apple was still processing when the script stopped. It reads the saved submission (`work/for-notary.json`), waits with the same retries, and finishes with the build that was signed and uploaded, never building or uploading again. Before writing anything it refuses a folder that does not exist, has no saved upload, misses the signed app or command, or already holds release files. Both new and resumed runs now check that Apple's ticket covers the signed app's and command's CDHash (`notarytool log`) before stapling. `crates/fx-testkit/tests/release_macos.rs` (12 tests) checks the script's text and its refusals without contacting Apple.
+  - **Checked on the owner's Mac:** resumed the folders of the first two test runs (their `for-notary.json` written by hand from the upload logs, since those runs predate the file); both picked up their submission and the app's version (0.1.3) and waited. Apple accepted all three uploads around 21:45 UTC on 4 Nov, 9–10 hours after they were sent: the first uploads of a new team. The resumed second run finished: both CDHashes were in the ticket, the app was stapled, the release files were written, and the quarantined copy was "accepted, source=Notarized Developer ID" and passed `syspolicy_check distribution`. The resumed first run, whose upload held only the app, stopped at the ticket check as intended: the app's CDHash was in the ticket, the command's was not, and nothing was stapled or written. The app's and command's CDHashes were the same in all three builds, so the release build is reproducible.
+  - **Apple status:** while the uploads were pending, Apple's system status page listed the Developer ID Notary Service as Available. Apple has no web page listing submissions; `xcrun notarytool history --keychain-profile not-everything-notary` shows them.
+  - **CI:** the first CI run of this PR never started its macOS jobs ("The job was not acquired by Runner of type hosted even after multiple attempts", with GitHub notices about macOS arm64 capacity); they were cancelled after 15 minutes, not failed by a test.
+- **Developer ID signing for v0.1.4 (2026-11-04, branch `fix/0.1.4-developer-id-signing`; the owner's decision of 4 Nov):**
+  - **Setup (owner's Mac):** the owner joined the Apple Developer Program and holds a Developer ID Application certificate and the notarytool profile `not-everything-notary`. An earlier self-signed certificate plan was dropped unmerged.
+  - **Code:** `bundle::sign(app, Signer)` signs ad hoc or with a keychain identity; every signature turns on the hardened runtime, and an identity also gets a secure timestamp. A blank or `-` identity is refused, so a release can't be signed ad hoc by mistake. `make_bundle --sign-identity NAME` uses it. `scripts/release-macos.sh NEW_DIR` builds in a fresh target folder, signs the app and the command (identifier `not-everything`), notarizes both in one upload (one wait per release, at the owner's request; the wait retries up to 5 times after a dropped status request, which happened in testing), staples the app, writes the zip, the CLI tarball and `SHA256SUMS.txt`, and checks a quarantined copy with `codesign`, `spctl --assess` and `syspolicy_check`. The app needs no entitlements.
+  - **Tests:** unit tests for the `codesign` arguments; `tests/bundle.rs` checks the runtime flag on an ad hoc signature, an unknown identity, a blank or `-` identity, and (ignored; `NE_SIGN_IDENTITY` set) a Developer ID signature's chain, team, timestamp, runtime flag and team-anchored designated requirement. The ignored test passed on the owner's Mac.
+  - **Checked on the owner's Mac (2026-11-04, Xcode 27.2):** the script's clean release build took 7 s. The Developer ID–signed bundle carries the runtime flag, the G2 chain, the owner's team and a secure timestamp, and has no entitlements. Under the hardened runtime, `Contents/MacOS/Not-Everything --synthetic 1000 --launch-probe` painted results in 415 ms and exited 0, with no code-signing denials in the system log. Apple accepted the team's first three uploads (test builds of 0.1.3) 9–10 hours after they were sent; the third run, with this merged script, then stapled the app, wrote the release files, and its quarantined copy was "accepted, source=Notarized Developer ID" and passed `syspolicy_check distribution`. In testing, `notarytool submit --wait` twice lost its status request ("The request timed out") while Apple still held the upload, which is why the script now retries the wait.
+  - **Docs:** the plan gains the release script in "Native UI and packaging", the trademark search moved to before v0.1.4, a Phase 2 checklist line for notarized v0.1.4 releases (unticked until the v0.1.4 release itself passes `spctl`; test builds already do) and run 2.6's new scope; `docs/PLAN.md` is re-exported from the owner's plan document. `CLAUDE.md` release steps, both READMEs and `CLEANROOM.md` are updated.
+  - **Before publishing v0.2.0 (planned as v0.1.4):** the trademark knockout search is no longer due (the owner's answer of 7 Nov 2026). The v0.2.0 notes must say that users grant Full Disk Access once more (the signature changes from ad hoc to Developer ID; after that it carries over), that Launch at Login may need switching on again, and that Open Anyway is no longer needed. Done: the v0.2.0 notes say all three.
+  - **Follow-ups:** run 2.6 moves signing and notarizing into CI (certificate and App Store Connect API key as secrets). Nested code added for Spotlight (a Swift part or an extension) must be signed with the same identity, inside out, before the app. Renew the certificate before 4 Dec 2027.
+- **v0.1.3 (2026-11-04, branch `fix/0.1.3-enter-to-results`):**
+  - **Bug fixed:** Return in the search field opened the first result (the search field mapped Return through the result list's key map). `actions::search_field_key` now maps Return/Enter to `SearchFieldKey::FocusResults`: the focus moves to the results with the first row selected, the arrow keys pick, and Return in the results opens. With no results the focus stays. Checked in the app with posted key events: Return moved the focus to row 0, Down moved to row 1, and with no results the focus stayed in the field.
+  - **Docs:** the plan records the product name, the v0.1.x changes, runs 0.1–1.12 as Done and the Spotlight search request (run 2.8); `docs/PLAN.md` is re-exported from the owner's plan document. `CLAUDE.md` gains the release steps and the icon build. Unused git worktrees were removed.
+  - **Next release, v0.1.4 (owner request; renumbered v0.2.0, then moved out of it on 7 Nov 2026, see run 2.8):** search from Spotlight. Typing Not-Everything in Spotlight and pressing Tab lists results from the app's index; a result opens, and an entry opens the app with the same search when the wanted file is not listed. The approach (likely App Intents, which needs a small Swift part) is still to be confirmed.
+- **v0.1.2 (2026-11-04, branch `fix/0.1.2-signing-and-rename`, merged and published as a pre-release):**
+  - **Bug fixed:** the v0.1.1 download was reported as damaged. Reproduced on the owner's `/Applications/Not-Everything.app` (quarantined by Edge): `codesign --verify` failed with "code has no resources but signature indicates they must be present", and `syspolicy_check` listed it as a fatal error. `make_bundle` now signs every bundle ad hoc (`bundle::sign_ad_hoc`); a signed bundle passes `codesign --verify --deep --strict` and Gatekeeper then only asks for approval, because the app is not notarized.
+  - **Rename finished:** the CLI command is `not-everything` (crate `fx-cli`), the bundle executable is `Not-Everything`, the app's log prefix is `Not-Everything:`, and settings and stores live in `~/Library/Application Support/Not-Everything/`; at the time the app moved its earlier data folders there at launch, and the CLI fell back to the old folder (both since removed). `CLAUDE.md` lists the exact names allowed to contain "Everything".
+  - **Release:** published after all CI checks passed. The owner deleted the v0.1.1 release (its tag remains).
+- **v0.1.1 (2026-11-04, branch `fix/0.1.1-dock-menu-settings`, merged and published as a GitHub pre-release, tag `v0.1.1`, later deleted by the owner because its download was reported as damaged):**
+  - **Bug fixed:** v0.1.0 had no Dock icon and no menu bar (reproduced: `lsappinfo` showed `type="UIElement"`). The bundle no longer sets `LSUIElement` and the app uses the regular activation policy; the main menu is data in `main_menu.rs`.
+  - **Settings window** (`settings_view.rs`, `appkit/window/settings_window.rs`), built to the owner-approved mock-up: System / Light / Dark appearance and the six approved icons. Saved as `appearance` and `app_icon` in the settings file. The Dock icon rule is `app_icon::dock_icon`.
+  - **Icons:** `scripts/build-icons.sh` (with `scripts/icons/neu-icon.mjs`, which holds the NeuIcon logic of the owner's icon designs verbatim) renders the approved Glass set and compiles it with `actool`: a solid fill plus one translucent foreground layer, so macOS draws clear and tinted like Photos. Outputs are checked in under `crates/fx-ui-macos/assets/`.
+  - **Name:** the app is Not-Everything, bundle ID `io.3645.not-everything` (the owner's decision; the `CLAUDE.md` rule narrowed to these two names). Data folders and `fx-cli` keep their names.
+  - **Checks:** 1,499 tests pass, fmt and clippy clean. App checked on the M4 Pro (macOS 27.0.1): Dock icon, menu bar, Settings in light and dark, icon switching and persistence, and the clear Dock style next to Photos.
+  - **Release files:** `Not-Everything-0.1.1-macos-arm64.zip`, `fx-cli-0.1.1-macos-arm64.tar.gz` and `SHA256SUMS.txt`, built in release with stripped binaries. Locally, stripping needs `DYLD_FALLBACK_LIBRARY_PATH` set to the toolchain's `lib` folder when cargo is run without the rustup proxy, or `rust-objcopy` cannot load `libLLVM.dylib`.
+  - **Follow-ups:** the trademark knockout search for the name (not needed: the owner's answer of 7 Nov 2026); the icon designs' tuned 16 and 32 px artwork cannot ship through Icon Composer.
+- **v0.1.0 release test (2026-11-04, on `build/macos-mvp`):** the full app test before the first release found two major bugs, both fixed with tests on this branch.
+  - **A scan of `/` skipped every firmlinked folder** (`/Users`, `/Applications`, `/Library`, `/private`, `/opt`, ...): 514k entries instead of 2.3M. Cause: the walker's replaced-directory check (run 0.3 review fixes) compared a firmlink's listing ID with the Data volume inode, and both volumes report the same `st_dev` on current macOS. Fix: `fx_fs_macos::scan::reopened_dir_matches` accepts firmlinks (`tests/firmlink_crossing.rs`).
+  - **The app never saved its index**, so every launch rescanned and `fx-cli` found no store. Fix: fx-engine saves right after a full rescan and at the latest `checkpoint_max_delay` (5 min) after the first unsaved change; the app saves on quit (`ResultsSource::save_index`).
+  - Version set to 0.1.0. The measured numbers are in `CHANGELOG.md` and `docs/gates/phase-1.md`.
+- **Phase:** built through Phase 1, with the v0.3.0 interface. The Phase 0 and Phase 1 gates are partly measured (`docs/gates/`); each is passed only once the owner's measurements are in.
+- **Run 1.12 (newest), Phase 1 gate tooling:** done on branch `run/1.12-phase1-gate-benchmarks`. The tooling and `docs/gates/phase-1.md` are in place. **The Phase 1 gate is not passed until the owner records the full-scale numbers** (see the 1.12 row and the follow-up below). Next: the owner measures Phase 1; after that, Phase 2 (run 2.1).
+- **Run 1.5, `fx-sort` pre-sorted orders and batched merge:** done on branch `run/1.5-sort-orders`. Clean-room restricted run: `docs/PLAN.md` only; nobody opened `.claude/research/`.
+  - `SortSource` trait (id_bound, is_live, name, parent, size, modified, created, kind) with an impl for `fx_index::Snapshot`. `SortKey` {Name, Path, Size, Modified, Created}. Each is a total order: Name compares the case-folded name, then raw bytes, then EntryId. Path compares component-wise along the parent chain, so a folder's subtree is contiguous right after it. Numeric keys break ties with the Name rule.
+  - `Order` (a `u32` permutation of live IDs) is built with a rayon parallel sort and has a `validate` check. `MatchSet` bitset plus `emit(order, matches, direction, offset, limit) -> Page { total, ids }` makes one filtered pass.
+  - `Order::apply(src, &Batch)` filters removed and dirty IDs, sorts the batch and merges linearly. `Batch::upsert` is for attribute-only changes and re-sorts just that entry. `Batch::moved` is for name or parent changes and, for the Path order, carries the folder's whole subtree. That keeps folder-mtime batches cheap.
+  - Tests: `tests/orders.rs` (build and emit equal a naive sort on seeded random data, plus a real `fx_index` snapshot) and `tests/merge.rs` (random batch rounds equal a fresh build for every key, plus edge cases including folder mtime-only and rename/move). `fx-testkit` core-crate policy now lists fx-sort as implemented with allowlisted deps fx-model, fx-index, rayon and dev fx-bench.
+  - `examples/sort_bench.rs`: build time per order, emit p50/p95 (1% and 50% match sets, both directions), merge p50/p95 for 1k/10k batches and a folder-mtime-only Path case.
+  - **Owner follow-up:** run `cargo run --release -p fx-sort --example sort_bench` at 2M and 5M entries on the M4 Pro and record the numbers, machine and cache state here. The team could not run release benchmarks.
+  - **Follow-up for run 1.8 (fx-engine writer):** whatever feeds fx-sort from the index updater must send folder renames and reparents through `Batch::moved`, not `Batch::upsert`, or the Path order goes silently wrong. Its integration tests should validate merged Path orders against `Order::build`. Optionally add a debug-build check in `apply`.
+  - Run 1.6 (`fx-store` file format) is done on branch `run/1.6-store-format`; see its row in the Runs table. **Next run: 1.7** (`fx-fs-macos` scanner).
+- **Run 1.4, `fx-query` matchers:** done on branch `run/1.4-query-matchers`. The review passed.
+  - `fold`: Unicode lowercase plus accent stripping (NFD, drop marks with a nonzero combining class, so Indic Mc signs survive, then NFC). NFC and NFD names compare equal. `FoldedColumn` is a parallel-built folded search copy. The `eval` oracle now folds; conformance part 1 has 218 cases (10 new accent cases).
+  - `regex_term`: `regex` crate, `(?i)` unless `case:`, full path under `path:`. An invalid regex matches nothing. The dialect is documented: no look-around or back-references. Alternation needs quotes (`regex:"a|b"`), because an unquoted `|` is OR.
+  - `matcher`: `SearchView` trait plus `VecView`. `CompiledQuery` covers memmem literals, folded wildcards, `*.ext` as a suffix compare, regex, functions and lazy full paths with per-thread folder caches. It runs in rayon chunks with a cancel check at least every 65,536 entries. `search_within` supports refinement. Randomized differential tests match the oracle exactly.
+  - `refine`: conservative narrowing reuse, an 8-entry LRU for backspace, epoch invalidation, and stats counters.
+  - `examples/matcher_bench.rs`: p50/p95 per query class plus GATE lines, with `--quick` for debug runs.
+  - **Owner follow-up:** run `cargo run --release -p fx-query --example matcher_bench` at 2M and 5M entries on the M4 Pro and record the machine and cache state. Budgets: literal p95 ≤16 ms at 2M and ≤30 ms at 5M; regex and full path ≤100 ms at 2M.
+  - Other follow-ups: fx-engine must implement `SearchView` over `fx_index::Snapshot`. `ext:`/`parent:`/`len:` don't fold. Check the regex `|` reading against Everything. `tests/matcher.rs` is slow in debug (about 30 s).
+- **Run 1.3, `fx-query` parser part 2:** done on branch `run/1.3-query-parser-part2`. The review passed.
+  - The AST gains `Node::Function(Filter)` and `Parsed.count` (a result limit from `count:N`). `eval::Candidate` gains optional metadata (size, modified/created/accessed, child count, hidden/symlink/read-only) and implements `Default`. `eval::EvalContext { now, utc_offset_secs }` and `matches_in` fix the clock; `matches` uses a default context. Missing metadata never matches.
+  - Functions: `size:`, `ext:`, `parent:`/`infolder:`, `depth:`, `len:`, `empty:`, `count:`, `attrib:` (D/H/L/R), plus `dm:`/`dc:`/`da:` and the long `date...:` forms. They share one comparison and range grammar (`:`, `=`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `a..b`).
+  - Size: units b/kb/mb/gb/tb in 1024 steps, compared at the unit's precision (`size:1kb` matches 1024–2047, `size:==1kb` exactly 1024), and the constants empty/tiny/small/medium/large/huge/gigantic/unknown. Folders have no size.
+  - Dates: keywords today, yesterday, thisweek, lastweek, thismonth, lastmonth, thisyear and lastyear (weeks start Monday), and ISO 8601 dates from `YYYY` to `YYYY-MM-DDTHH:MM[:SS]`. A partial date means its whole period. The calendar maths is hand-written, std only, with a fixed UTC offset and no time-zone database.
+  - Macros `audio:`, `doc:`, `exe:`, `pic:`, `video:` and `zip:` expand to `ext:` lists that include macOS types. `pic:holiday` means the macro AND the term.
+  - Tests: new suites `functions_api.rs`, `size_functions.rs`, `date_functions.rs`, `macros.rs` and `conformance_part2.rs`, with **conformance part 1 (208) plus part 2 (≥92) giving ≥300 cases, all passing**. The run-1.2 tests were updated for the new `Node` variant and `Candidate` fields. Readings continue from 10 in the part-2 suite header. No new dependencies.
+  - **Next run: 1.4** (matchers). Follow-ups: the evaluator still lacks accent folding and regex. Local time uses a fixed UTC offset, so DST is ignored; the engine must supply the offset. Check the readings (week start, folder size, ext: on folders, size rounding at range ends) against a real Everything.
+- **Run 1.2, `fx-query` parser part 1:** done on branch `run/1.2-query-parser-part1`.
+  - `fx-query::syntax`: `SearchOptions` (global toggles), `TermOptions`, `TermKind`, `Node` (And/Or/Not/Term/MatchAll) and `Pattern` (Literal/Wildcard/Regex). `parse(input, opts) -> Parsed { query, diagnostics }` never fails, so partial input works for search-as-you-type. Unclosed quotes and groups close at end of input, a stray `>` is ignored, empty OR operands are dropped, and each recovery gives a diagnostic with a byte span.
+  - Precedence: NOT, then OR, then AND, so `a b|c` = a AND (b OR c). Quotes make spaces and operators literal, and quoted parts can join unquoted text.
+  - Wildcards: `WildcardPattern` handles `*`, `?` and `**` and must match the whole name, or the whole path in path mode, where `*` doesn't cross `/` and `**` does. The matcher has no exponential blowup, and `extension_hint()` returns the extension for exactly `*.ext` (for run 1.4).
+  - Modifiers: `case:`, `path:`, `file:`/`files:`, `folder:`/`folders:`, `ww:`/`wholeword:`, `wfn:`/`wholefilename:`, `regex:`, `diacritics:`, `start-with:` and `end-with:`, plus the no- forms. They stack and apply to terms, phrases and groups, and the innermost one wins. A bare `file:` or `folder:` is a plain kind filter. Other bare modifiers give a diagnostic and match everything. An unknown `word:` prefix stays literal text, so run 1.3 can add functions.
+  - `eval::matches(node, &Candidate)`: a naive reference oracle for run 1.4's fast matchers. It returns `Unsupported` for regex. Accent folding is not done, because there is no NFD data and no new dependency, so non-ASCII compares exactly.
+  - Tests: `parse_operators.rs`, `wildcards.rs`, `modifiers.rs` and `conformance_part1.rs`, with **208 conformance cases, all passing**. The shared `Case` type is in `tests/conformance/mod.rs`, ready for run 1.3 to add cases.
+  - Doc ambiguities, recorded as readings 1–9 in the suite header: precedence, spaces around `|`, wildcards staying on inside quotes, `*` not crossing `/` in path mode, bare `file:`/`folder:`, accent folding (not asserted), `ww:` word boundaries, quoted phrases joined to text, and `regex:` taking the rest of its word raw. Check these against Everything when one is available.
+  - **Next run: 1.3** (functions, size/date grammar, macros; extend the conformance suite to ≥300).
+- **Previous newest run:** 0.8, Phase 0 gate. Done on branch `run/0.8-phase0-gate`. **The Phase 0 gate is not passed: measurements are pending** (see `docs/gates/phase-0.md`). No agent can run release benchmarks or the GUI, or reboot, so the owner must take the measurements. New artefacts:
+  - `fx-bench gate-summary --machine <label> --cache <warm|cold|unknown> [--format md|json] <log>...`: reads the `GATE ...` lines every Phase 0 benchmark prints (both formats) and writes a markdown or JSON table. Exit 0 if all rows PASS, 1 for any FAIL, MISSING or unparsed row, 2 for bad args or an unreadable file. Read-only, std only. Tests: `crates/fx-bench/tests/gate_summary.rs`.
+  - `scripts/phase0-gate.sh --machine <label> --cache <warm|cold> --out <new-dir>`: builds in release, runs every gate benchmark one at a time into `<out>/*.log`, then writes `<out>/summary.md` with gate-summary. It refuses an existing out dir and never calls rm or purge. On a cold pass, load_bench only runs against an image written before the reboot (`--store-dir` with `--reuse`); otherwise the store gate gets a SKIP row. Test: `crates/fx-testkit/tests/phase0_gate.rs`.
+  - `docs/gates/phase-0.md`: gate report with all 7 Phase 0 items, their current status, the commands, and empty result slots for the M4 Pro and the 8 GB Mac, warm and cold.
+  - Risks #1–20 recorded: no owner was available, so the plan's suggested defaults are adopted provisionally ("owner may override"). #1 name and the trademark search are pending owner (both settled since); #5 is provisional objc2, as is the UI shell decision.
+  - `docs/phase-1-plan.md`: run dependency order for 1.1–1.12, gate criteria mapped to runs, carry-forwards and standing rules.
+  - **Next run: 1.1** (clean-room restricted: `docs/PLAN.md` only).
+- **Previous run:** 0.7, UI spike. Done on branch `run/0.7-ui-spike-objc2-table`. See the 0.7 row. Follow-up: on the M4 Pro, run the UI spike's measurement procedure (autoscroll, 20 launch probes warm and after a cold boot, `.app` size; `docs/gates/phase-0.md`, item 6), fill in its results table, then make the shell decision final. Next run: 0.8.
+- **Previous newest run:** 0.6, FSEvents spike. Done on branch `run/0.6-fsevents-spike`. See the 0.6 row and the follow-ups. No dependency changes. The gate numbers are not yet measured.
+- **Latest run:** 0.4, search spike. Done on branch `run/0.4-search-spike`.
+  - `fx-query::substring`:
+    - `NameColumn` is a validated view over the `fx_bench::Names` layout.
+    - `SubstringQuery` builds one `memmem::Finder` per query. Modes are Sensitive and AsciiInsensitive; the folded copy from `fold_ascii_lowercase` has the same length, so the offsets are reused.
+    - `search`, `count` and `search_chunked` run rayon chunks aligned to entry boundaries (`DEFAULT_CHUNK_ENTRIES = 16_384`) and return IDs in ascending order.
+    - Cancellation: `Generation` and `CancelToken`, checked before each chunk and every `CHECK_INTERVAL` = 65,536 entries.
+    - No unsafe code.
+  - Example `search_bench` (`crates/fx-query/examples/`) prints p50, p95, p99 and max per query, plus a PASS/FAIL gate line.
+  - Tests: `crates/fx-query/tests/substring.rs` checks the scan against a naive `contains`, across thread counts and chunk sizes, plus edge cases, case folding, cancellation and column validation.
+  - fx-testkit: `fx-query` is now in `IMPLEMENTED_CRATES`. `core_crates.rs` has a `CORE_DEPENDENCY_ALLOWLIST`, which for fx-query is memchr, rayon and fx-bench (dev). **A future run that adds a dependency to a core crate must add it to this allowlist.**
+  - **Gate not yet measured:** nobody on the team could run release binaries.
+- **Last run:** 0.2, `fx-bench` generator and harness. Done on branch
+  `run/0.2-bench-generator-harness`.
+  - `fx-bench` (std only, no third-party dependencies) is now a library plus a binary.
+    - `rng`: xoshiro256** seeded through SplitMix64, with unbiased `below(n)` (Lemire) and
+      integer-only `chance`. The stream is bit-identical on every platform.
+    - `names`: `generate_names(count, seed)` builds one NUL-separated UTF-8 buffer with
+      `u32` offsets, a weighted extension table, mixed word styles and about 1 in 80,000
+      names non-ASCII (NFC and NFD forms, CJK), plus an `fnv1a64()` checksum.
+    - `tree`: `generate_tree(entries, seed, TreeShape)` builds parent pointers (parent[i] <
+      i, root parent = `u32::MAX`), about 19% directories and a maximum depth of 32.
+      Sibling names are unique ignoring ASCII case and NFC/NFD, so the tree can be written
+      to APFS. `Tree::path` returns relative paths that start with `root/`.
+    - `harness`: warmup plus timed iterations and nearest-rank min, max, mean, p50, p95 and
+      p99. The closure's output is dropped outside the timed region. `MachineInfo` records
+      the OS, arch, parallelism and CPU brand (sysctl or `/proc/cpuinfo`), and a cache
+      state label (warm, cold or unknown). Reports come as text or hand-written JSON.
+    - `materialize`: writes the first N entries of a tree as directories and empty files
+      into an existing empty directory. It never deletes, renames or moves anything.
+    - Binary `fx-bench` with `gen`, `materialize` and `self-bench` subcommands. Bad
+      arguments exit with code 2. The `gen` timing covers generation only, and checksum
+      time is printed on its own line.
+  - Tests: `crates/fx-bench/tests/{generator,harness,materialize,cli}.rs`.
+    - 5M names are generated twice with the same seed and must be identical.
+    - A golden names checksum is pinned: `generate_names(1_000, 20_240_601)` →
+      `0xc3a80cee929b3be3`. A golden tree checksum, `dir_count` and sample paths are also
+      pinned. Changing them breaks seed stability.
+    - Tree invariants, percentile math, JSON/text output, materialize against
+      `Tree::path`, and CLI exit codes.
+  - fx-testkit: `core_crates.rs` now has an `IMPLEMENTED_CRATES` list (currently
+    `fx-bench`). Crates on it are exempt from the run 0.1 "placeholder only" check and may
+    have `src/main.rs`. **A future run that gives a crate real code must add the crate to
+    this list.**
+- **Measured numbers (run 0.2):** reported by the implementer, not timed benchmarks. The
+  generator's mean name length is about 17.1 B (the plan measured 17.3 B), the tree is
+  about 19% directories, and the mean depth is about 10. The coordinator could not run
+  release binaries, so the 5M generation time and the `self-bench` p50/p95 are **not yet
+  recorded**; see the follow-ups.
+- **Previous run:** 0.1, project setup. Done on branch `run/0.1-workspace-scaffold`.
+  - Workspace: virtual Cargo workspace (`members = ["crates/*"]`, resolver 3, edition 2024,
+    rust-version 1.85, `license = "MIT"`, `publish = false`, shared `[workspace.lints]`).
+  - Crates: 17 empty placeholder crates, each holding only a doc comment.
+    - Platform-agnostic: fx-model, fx-index, fx-query, fx-sort, fx-store, fx-engine,
+      fx-ipc, fx-fs, fx-cli (binary), fx-bench, fx-testkit.
+    - Platform-specific: fx-fs-macos, fx-fs-windows, fx-fs-linux, fx-ui-macos, fx-ui-win32,
+      fx-ui-gtk. None has dependencies yet, so the workspace builds on any host.
+  - Toolchain: `rust-toolchain.toml` (stable, rustfmt, clippy).
+  - CI: `.github/workflows/ci.yml` runs `cargo fmt --all --check`,
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` and
+    `cargo test --workspace --locked`. macOS (`macos-latest`) is required; Ubuntu is
+    informational (`continue-on-error`).
+  - Policy tests in `crates/fx-testkit/tests/`: `workspace_policy.rs`, `core_crates.rs`,
+    `platform_crates.rs`, with shared helpers in `common/mod.rs`, all std only. They check:
+    - the `fx-` prefix, and no "everything" in any crate name;
+    - the license is inherited MIT, `MIT OR Apache-2.0` or `Apache-2.0`, and any
+      non-inherited license is listed in the README's "Designated Apache-2.0
+      subcomponents" table;
+    - `publish = false`, the stable toolchain pin, and that every planned crate exists.
+  - Docs: README (licensing policy), `CLEANROOM.md`, this file.
+- **Measured numbers (run 0.1):** none. That run was scaffolding and had no benchmarks.
+- **Toolchain:** rustc 1.99.1 stable on aarch64-apple-darwin.
+- **Dependencies:** none third-party (`Cargo.lock` lists only the 17 workspace packages).
+- **Resume point:** n/a. Run 0.2 is complete.
+- **Next run:** 0.3 (scanner spike). It can use `fx-bench materialize` for synthetic trees.
+
+## Runs
+
+| Run | Scope | Status | Notes |
+| --- | --- | --- | --- |
+| 0.1 | Cargo workspace with empty `fx-*` crates, MIT license and Apache-2.0 subcomponent policy, `CLEANROOM.md`, `PROGRESS.md`, CI (fmt, clippy, tests on macOS) | Done | Local fmt, clippy and tests green; the first GitHub Actions run on the PR is the CI-green check. No third-party dependencies |
+| 0.2 | `fx-bench`: synthetic file-tree and name generator, benchmark harness | Done | Branch `run/0.2-bench-generator-harness`. 5M names reproducible (tested), golden checksums pinned, harness reports p50/p95/p99. std only, no deps. Mean name 17.1 B, ~19% dirs. 5M timing not yet recorded |
+| 0.3 | Scanner spike: parallel `getattrlistbulk` walker | Done | Informal, M4 Pro, warm cache: `/` ~2.2M entries; 1 thread ~65k/s (gate 180k missed); 8 threads ~10.4 s (gate 10 s missed). Follow-up: tune attribute set; run scan_bench formally. Run 0.3's Apple sources are in CLEANROOM.md (added at the v0.1.0 release) |
+| 0.4 | Search spike: `memchr` + `rayon` scan | Done | Branch `run/0.4-search-spike`. `fx-query::substring`: chunked parallel memmem scan with cancellation; `search_bench` example. Deps memchr 2.8.3, rayon 1.12.0. Gate p95 ≤10 ms at 5M/8 threads **not yet measured** |
+| 0.5 | Store spike: column file and mmap load | Done | Branch `run/0.5-store-spike`. `fx-store`: versioned header (magic `FXSTORE1`, clean flag, volume ID, event ID, UUID, column table with checksums), 5 LE columns at 64 B alignment, atomic temp+sync_all+rename write, O(1)-validated memmap2/bytemuck load, `verify_checksums` (FNV-1a lanes + SplitMix64 finaliser). **Gate unmeasured:** no release binaries could be run. Command: `cargo run --release -p fx-store --example load_bench -- --count 5000000 --cache warm`. The time is an upper bound because the gate path runs a full `search` and takes the first ID, with no early exit. Record p95, MB, B/entry and machine; cold cache needs `sudo purge` or a reboot |
+| 0.6 | FSEvents spike: own binding, per-volume stream, event ID and UUID replay | Done | Branch `run/0.6-fsevents-spike`. Own FFI in `fx-fs-macos::fsevents`, no new dependencies. Pieces: flag classifier with a `volume_root` parameter, `FsEventsCursor` (event ID plus UUID) with gap rules, and `VolumeStream`. `VolumeStream` keeps the cursor at the replay start until HistoryDone. Offline replay and gap tests pass. **Gate unmeasured:** `cargo run --release -p fx-fs-macos --example fsevents_bench -- latency --ops 1000 --cache warm` and `-- replay --ops 10000` |
+| 0.7 | UI spike: `objc2` NSTableView with 2M virtual rows | Done | Branch `run/0.7-ui-spike-objc2-table`. `fx-ui-macos` is implemented. Platform-agnostic `model` (virtual rows over an fx-bench tree, size/date formatting, filter), `frame_stats` (p50/p95/p99/max plus a GATE line), `spike_args` and `bundle` (`.app` writer that never deletes; `dir_size`). AppKit layer behind the macOS cfg with deps objc2 0.6, objc2-foundation and objc2-app-kit 0.3. Examples `table_spike` (`--autoscroll`, `--launch-probe`) and `make_bundle`. Shell decision written: **provisional, objc2 recommended, pending measurement**. fx-testkit allows objc2 for fx-ui-macos only, under the macOS cfg. Gate numbers (p95 frame ≤16.7 ms at 2M rows, launch to first paint, `.app` size) **not yet measured**: no agent could run the GUI |
+| 0.8 | Phase 0 gate: cold-boot benchmark re-run, decision records, Phase 1 plan agreed | Done | Branch `run/0.8-phase0-gate`. **Gate not passed: measurements pending** (`docs/gates/phase-0.md`). Built `fx-bench gate-summary`, `scripts/phase0-gate.sh`, the risk-table defaults adopted provisionally (name and trademark then pending owner, since settled), `docs/phase-1-plan.md`. Known: the 0.3 scanner informally missed its gates (~65k/s on 1 thread, ~10.4 s on 8 threads); carried into run 1.7. No new dependencies |
+| 1.1 | `fx-model` + `fx-index`: types, column store, name buffer, extension table | Done | Branch `run/1.1-model-index`. fx-model types (EntryId, FileKey, Entry, flags, ResumeCursor, Change, StartOutcome). fx-index: NameBuffer, ExtensionTable (u16, OVERFLOW), packed columns, delta + deletion bitset, compaction with remap, Arc snapshots. Std only. 73 B/entry at 100k (unit-test estimate). Follow-ups: bulk-build path or auto-compaction off during full scans (1.3/1.8); subtree removal is O(n), so add child lists for 1.8; reword the doc on stale values for removed IDs; random test should check ext and re-insert. The 1.1 CLEANROOM.md row is in (added at the v0.1.0 release) |
+| 1.2 | `fx-query` parser, part 1: operators, wildcards, modifiers | Done | Branch `run/1.2-query-parser-part1`. Std-only `fx-query::syntax`: AST, lexer, lenient never-failing `parse` with diagnostics, wildcards (`*`, `?`, `**`, whole-name rule, `*.ext` hint), modifiers with no- forms; `eval` reference oracle (regex returns Unsupported). 208 conformance cases pass (`tests/conformance_part1.rs`). No new deps |
+| 1.3 | `fx-query` parser, part 2: functions, size and date grammar, macros | Done | Branch `run/1.3-query-parser-part2`. Functions (size, ext, parent, depth, len, empty, count, attrib, dm/dc/da), 1.5 comparison/range grammar, size constants, date keywords + ISO 8601, macros; `Candidate` metadata + `EvalContext`. ≥300 conformance cases pass (208 + part 2). Std only, no new deps |
+| 1.4 | `fx-query` matchers: substring, case and diacritics, regex, full path, cancellation, refinement | Done | Branch `run/1.4-query-matchers`. fold.rs (Unicode case + diacritic folding, FoldedColumn), regex_term.rs (`regex` crate), matcher.rs (CompiledQuery over SearchView, parallel, cancellable, full path via parent pointers), refine.rs (type-ahead refinement + LRU), examples/matcher_bench.rs (GATE lines). New deps: unicode-normalization, regex (MIT OR Apache-2.0). Budgets not yet measured in release |
+| 1.5 | `fx-sort`: pre-sorted orders and batched merge | Done | Branch `run/1.5-sort-orders`. Clean-room restricted (`docs/PLAN.md` only). `SortSource` (impl for `fx_index::Snapshot`), `SortKey` {Name, Path, Size, Modified, Created} with total orders, rayon-built `Order`, `MatchSet` + `emit` paging both directions, and batched `Order::apply` with `Batch::upsert`/`moved`. Matches a naive sort and a fresh build on random data. Bench numbers not yet measured (owner follow-up) |
+| 1.6 | `fx-store`: file format, checksums, atomic checkpoint, mmap load | Done | Branch `run/1.6-store-format`. Clean-room (`docs/PLAN.md` only). fx-index `IndexParts`, `Snapshot::to_parts`, `Index::from_parts` (validated, IDs preserved). fx-store v2 format: header checksum, volume table with ResumeCursor, 64 B-aligned checksummed columns, saved orders (validated permutations of live IDs). Atomic `write_checkpoint`, O(1) `MappedIndex::open`, `verify_checksums`, `to_index`, typed `LoadError`. `open_or_rebuild` rebuilds on missing, old or corrupt files and reports the reason and clean flag; stale-temp cleanup is scoped to the target and to files past an age threshold. Follow-ups: owner runs `cargo run --release -p fx-store --example load_bench` at 2M and 5M (M4 Pro, warm) against the ≤50 ms budget; the empty `crates/fx-store/src/image.rs` is removed (2026-11-07); fx-index `delete_one` now keeps rename overrides on removed entries (counted in `delta_len` until compaction) |
+| 1.7 | `fx-fs-macos` scanner: mount points, firmlinks, exclusions, cloud-file policy | Done | Branch `run/1.7-macos-scanner`. `fx-fs` platform traits (VolumeEnumerator, ChangeSource, PermissionProbe/AccessState) and an exclusion engine (hidden/system, folders, wildcards incl. `**`, regex, include-only roots). `fx-fs-macos`: getfsstat volume table (only `/` indexed), firmlink mapping so `/System/Volumes/Data` is never entered twice, cloud policy (materialization off, dataless folders not entered). `MacScanner` emits parents before children. Row filled in at the v0.1.0 release: the coordinator ran out of context before updating this file. Follow-ups: NFC/NFD in exclusions; walker paths from the canonical root |
+| 1.8 | FSEvents change source plus `fx-engine` writer thread and snapshots | Done | Branch `run/1.8-fsevents-engine-writer`. `fx_fs::PathStat` + `reconcile_path`/`diff_subtree`. `fx-fs-macos` `FsEventsSource` (ChangeSource on `ResumeCursor::FsEvents`, flag→Change routing, coalescing, `dropped_before_cursor`, exact `RawEvent::flags` + `rescan_subtree`), `MacPathStat` (lstat, no materialization). `fx-engine`: writer thread (50–200 ms batches, `Batch::moved` for renames/reparents, arc-swap snapshots, generations), recovery and health state, `SearchView` query API, checkpoint policy saving the cursor through fx-store, catch-up on startup. Tests: fakes plus the macOS e2e (resume asserted as `Resumed`, no full root rescan). **Owner follow-up:** run `cargo run --release -p fx-engine --example freshness_bench` (gate ≤1 s p99) and record the machine and cache state. CLEANROOM.md has its 1.8 entry (added at the v0.1.0 release). |
+| 1.9 | `fx-ui-macos`: window, search field, results table, status bar, open, reveal, copy, drag | Done | Branch `run/1.9-ui-macos-window`. Built on the provisional shell decision (objc2, PLAN risk #5 default; owner unavailable). Controller, columns, read-only actions, drag mask copy+link, AppKit window, `fx-ui-macos` bin. Synthetic 2M autoscroll p95 0.92–1.05 ms (synthetic source only); launch probe about 1.0 s. Follow-up: scroll over the real engine is unmeasured. The CLEANROOM.md entry was added at the v0.1.0 release. |
+| 1.10 | Menu-bar item, global hotkey, login item, FDA onboarding and non-FDA mode | Done | Branch `run/1.10-menubar-hotkey-fda`. Resident app on NSStatusItem, global summon hotkey (global-hotkey, Carbon RegisterEventHotKey, no Accessibility prompt), Launch at Login through SMAppService, `FdaProbe` and Full Disk Access onboarding, limited (non-FDA) mode that skips the consent-prompt folders, per-scope stores. Row filled in at the v0.1.0 release: the run's budget ran out before updating this file. Owner check: no TCC prompt without Full Disk Access, and a grant detected within 2 s |
+| 1.11 | `fx-cli`: `es`-style CLI | Done | Branch `run/1.11-cli-es-style`. Added `fx_engine::StoreReader`, which reads a store without writing to it. The fx-cli lib+bin has es-style args and txt/csv/json output. Exit codes are 0 and 3–9; 7 covers an invalid regex or a rejected store, and 8 means no index was found. The root is canonicalized, and the CLI falls back to the limited-scope store. Documented in docs/cli.md. Follow-ups: efu output; the reviewer's last verdict was "changes" and was not reviewed again. |
+| 1.12 | Phase 1 gate: startup, search, freshness, catch-up and memory benchmarks | Done; gate pending owner measurement | Branch `run/1.12-phase1-gate-benchmarks`. fx-bench `gate1` + `fx-bench phase1-summary`: Phase 1 criteria, p50/p95/p99, PASS/FAIL/NOT MEASURED, summary.md with machine, cache state and measured scale per row. Rows run below gate scale (e.g. `--quick`) show NOT MEASURED, 'below gate scale (N)'. Under `--cache cold`, startup and launch are judged by the worst sample. fx-index `Snapshot::heap_bytes()` (real allocations); `fx_engine::memory_report()` is built on it plus the order capacities. New fx-engine examples: `startup_bench` (with `--cache cold`, the engine path is timed before any reader pass), `catchup_bench` and `first_run_bench`; each emits its entry or change counts. fx-ui-macos `--gate-probe`: launch to first row painted, keystroke to repaint, autoscroll over a real store. `scripts/phase1-gate.sh` (cold pass: STARTUP_RUNS=1, LAUNCHES=1). `docs/gates/phase-1.md`. fx-testkit `phase1_gate.rs` pins the script and the doc, and checks ≥300 conformance cases. Checked in CI at small scale: ≥300 syntax cases; ≤100 B/entry at 100k synthetic entries; small-scale catch-up equals a fresh scan; CLI formats and exit codes. **Not measured:** every full-scale number (2M/5M, 20 launches, 1,000 ops, 10k offline changes, first run, cold boot, 8 GB Mac) |
+| 2.1 | FSEvents edge-case tests and fixes | Not started | |
+| 2.2 | `fx-testkit` soak and fuzz harness; 24 h soak | Not started | |
+| 2.3 | Crash-safety tests: 200 `kill -9` runs during checkpoints | Not started | |
+| 2.4 | External APFS/HFS+ and FAT/exFAT volumes | Not started | |
+| 2.5 | VoiceOver support and Quick Look on Space | Not started | |
+| 2.6 | DMG, Homebrew cask, Sparkle updates, signing and notarizing in CI | Not started | Developer ID signing and notarization came early, in v0.2.0 (planned as v0.1.4; the owner's decision of 4 Nov, branch `fix/0.1.4-developer-id-signing`); 2.6 moves them into CI. The DMG also came early and shipped in v0.2.0 (owner, 7 Nov 2026); the rest of 2.6 stays |
+| 2.7 | LaunchAgent FDA experiment and public beta | Not started | |
+| 2.8 | Search from Spotlight: the app's name, Tab, then a search | Spike done; moved out of v0.2.0 | Owner request (4 Nov): results listed in Spotlight from the app's index; an entry opens the app with the same search. The spike found that on macOS 27.0.1 Spotlight never called an App Intents extension (Tab scope "No Results", no actions or App Shortcuts), nor intents in an app's own Swift main executable; the Tab scope lists only content donated to Core Spotlight, which the plan rules out copying. Round 2: only donated content appears in Spotlight; no App Intents surfaced, from an extension or from the main app, even after a reboot. The owner moved it out of v0.2.0 on 7 Nov 2026; later version, not scheduled |
+| 2.9 | Background indexer: a LaunchAgent in the app bundle runs `fx-engine` from login; the app and the `not-everything` command become `fx-ipc` clients | Not started | Added 2026-11-07 (owner); not in v0.2.0. Registered with `SMAppService`; scans, follows changes and saves the index with no window, so quitting the app never touches it; `fx-ipc` is a Unix socket only the user can open; the first scan starts at registration. Depends on run 2.7's Full Disk Access decision; the agent is signed with the same Developer ID, inside out, before the app. Done when a file created after a reboot, with the app never opened, is found within 1 s of opening the window |
+| 2.10 | Shortcut recorder in Settings | Not started | Added 2026-11-08 (owner), for the website's "New features" list. Today Settings shows the shortcut (Option-Space, or Option-Shift-Space in the Preview app) but can't change it: only the `hotkey=` line of the settings file can, and a shortcut that fails to register is reported only on stderr. Done when a shortcut picked in Settings works at once and after a relaunch, and one macOS can't register is refused with the reason while the previous shortcut stays |
+| 3.1 | `fx-fs-windows` enumerator (`FSCTL_ENUM_USN_DATA`) | Not started | |
+| 3.2 | USN journal change source and resume cursor | Not started | |
+| 3.3 | Windows service, named-pipe `fx-ipc`, client signature check | Not started | |
+| 3.4 | `fx-ui-win32`: virtual ListView shell | Not started | |
+| 3.5 | ReFS, Dev Drive and FAT/exFAT fallbacks | Not started | |
+| 3.6 | MSI, signing, winget; Phase 3 gate | Not started | |
+| 4.1 | `fx-fs-linux` walker and directory-mtime reconciler | Not started | |
+| 4.2 | fanotify change source with inotify fallback | Not started | |
+| 4.3 | systemd daemon, Unix-socket IPC, per-user filtering | Not started | |
+| 4.4 | `fx-ui-gtk`: GTK4 shell | Not started | |
+| 4.5 | .deb and PPA packaging; Phase 4 gate | Not started | |
+| 5.1 | Independent syntax docs and Everything compatibility matrix | Not started | |
+| 5.2 | License audit, trademark check | Not started | |
+| 5.3 | Threat model and security review of IPC and daemons | Not started | |
+| 5.4 | Community files: contributing guide, code of conduct, issue templates | Not started | |
+| 6.1 | Network share detection and scan-based indexing on macOS | Not started | |
+| 6.2 | Scheduled and on-demand background rescans, then Windows and Ubuntu shares | Not started | |
+
+## Follow-ups / open decisions
+
+These are the owner's calls. Record each outcome here and in the Decision column of the
+plan's "Risks and open questions" table.
+
+- [ ] **Record run 0.2 benchmark numbers** on the M4 Pro with a warm cache, noting the
+  machine and cache state from the report:
+  `cargo run --release -p fx-bench -- gen --count 5000000 --seed 1` (generation time and
+  checksum; run it twice to confirm the checksums match) and
+  `cargo run --release -p fx-bench -- self-bench --cache warm`. Repeat on the 8 GB Mac
+  for run 0.8.
+- [ ] **Record the run 0.4 search gate** (p95 ≤10 ms over 5M names, 8 threads) on the M4 Pro with a warm cache:
+  `cargo run --release -p fx-query --example search_bench -- --threads 8 --cache warm`. Repeat on the 8 GB Mac and after a cold boot for run 0.8.
+- [ ] **Record the run 0.6 FSEvents gate** (live p95 ≤50 ms; replay exact) on the M4 Pro, warm cache, with the commands in the 0.6 row. Also record how many scripted paths were covered only by rescans the stream added for directory renames.
+- [x] **Run 1.8 (from the 0.6 review):** done in run 1.8.
+  - Keep `RawEvent::flags` as the exact kernel word, and report the stream's added directory-rename rescan in a separate `rescan_subtree` field.
+  - Count the events dropped because their ID is ≤ the cursor (`dropped_before_cursor()`), and assert on that counter in place of the `ev.id > saved` / `before_cursor == 0` checks, which can never fail.
+  - Promote `FsEventsCursor` and `StartOutcome` into `fx-model`'s `ResumeCursor` and the `ChangeSource` trait.
+- [ ] **Close the Phase 1 gate (owner, from run 1.12):** run `scripts/phase1-gate.sh --machine <label> --cache warm --out <dir>` at full scale on the M4 Pro and on the 8 GB Mac. Then reboot and run again with `--cache cold`, reusing a store written before the reboot through `--store-dir`/`--reuse`. Paste each `summary.md` into `docs/gates/phase-1.md` and set the overall verdict. This replaces the separate owner follow-ups for the 1.4 matcher_bench, 1.5 sort_bench, 1.6 load_bench and 1.8 freshness_bench. Any FAIL row becomes a fix run before Phase 2.
+- [ ] **Run 1.12 notes:** the f2 fix task (cold launch judgement, below-scale rows) hit the team's build budget during test writing, but its changes merged and the final review passed. Re-read `crates/fx-bench/tests/phase1_gate_summary.rs` for coverage gaps when convenient. The Goal 1 "after a reboot" row rests on a single cold launch per reboot. For a cold p95 over 20 launches, repeat the reboot and run the cold pass 20 times.
+- [ ] **Close the Phase 0 gate (owner, from run 0.8):** run `scripts/phase0-gate.sh --machine <label> --cache warm --out <dir>` on the M4 Pro and on the 8 GB Mac, then again after a reboot with `--cache cold`. For a cold store number, write the image before the reboot with `--store-dir` and reuse it after with `--reuse`. Paste each `summary.md` into `docs/gates/phase-0.md` and set the overall verdict. This covers the 0.2, 0.4, 0.5, 0.6 and 0.7 measurement follow-ups above.
+- [ ] **Record the run 0.7 UI numbers** (`docs/gates/phase-0.md`, item 6) with the shell
+  choice, AppKit through `objc2`, which the app is built on (risk #5).
+- [ ] **Run 2.1:** test every rescan flag, a stored ID that is too high, and a UUID change end to end.
+- [ ] **From v0.2.0, not measured yet:** the Cmd+Q quit-to-exit time; keystroke to repaint
+  with Your files first on and off (`--gate-probe`); peak memory while both engines run
+  after the Full Disk Access grant.
+- [x] **Full-path search p95** was about 280 ms (M4 Pro, warm), against its 100 ms gate.
+  v0.3.0 brings it to 24.1 ms (`matcher_bench`, 2M entries, M4 Pro, warm, 8 Nov 2026).
+- [ ] **v0.2.0 known limits:** handle Full Disk Access revoked during the full build; a quit
+  during a background save leaves a temp file (cleaned after 10 min); the selection is
+  kept by path, so a renamed file drops out; the Preview app's Dock icon loses macOS's
+  clear and tinted styles; design the Your files first Settings row.
+- [ ] **The no-matches example `size:>10mb` (found 8 Nov 2026; owner: a future release):**
+  the app labels it "Larger than 10 MB" (`crates/fx-ui-macos/src/ui_text.rs`), but a typed
+  size covers a 1 MiB range and `>` compares with its top, so it finds only files of
+  11 MiB or more. Change the example to `size:>=10mb`, "10 MB or larger".
+- [ ] **IMPLEMENTED_CRATES upkeep:** each run that implements a placeholder crate adds it
+  to `IMPLEMENTED_CRATES` in `crates/fx-testkit/tests/core_crates.rs`.
+- [x] **Working product name** (Phase 0 checklist item 1). Decided by the owner on 4 Nov
+  2026: Not-Everything. Crates keep the `fx-` prefix.
+- [x] **Trademark knockout search** (Phase 0 checklist item 1). Settled by the owner on
+  7 Nov 2026: "Everything" is not trademarked, so no search was done and v0.2.0 does not
+  wait on one. Counsel review of the name before Phase 5 closes (run 5.2) stays advised.
+- [ ] **Risk-table items #1–20** (`docs/PLAN.md`, "Risks and open questions"). Run 0.8
+  adopted the plan defaults provisionally. Each still needs the owner's sign-off, recorded
+  in the Decision column of the plan's risk table, except those settled: #1 (the name on
+  4 Nov, the trademark answer on 7 Nov 2026), #2 (MIT), #5 (AppKit through `objc2`) and
+  #20 (the repository is public, 8 Nov 2026):
+  - [x] #1 Product name
+  - [x] #2 Project license
+  - [ ] #3 GPL exposure from research
+  - [ ] #4 Build new or contribute to Cardinal
+  - [x] #5 macOS UI shell
+  - [ ] #6 macOS process model
+  - [ ] #7 Apple's announced FDA tightening
+  - [ ] #8 Default index scope
+  - [ ] #9 External, FAT and network volumes
+  - [ ] #10 Cloud-only files
+  - [ ] #11 Regex dialect
+  - [ ] #12 Syntax target
+  - [ ] #13 Memory budget
+  - [ ] #14 Secondary trigram index
+  - [ ] #15 On-disk format
+  - [ ] #16 Unmeasured Rust performance
+  - [ ] #17 Windows signing
+  - [ ] #18 Privacy of privileged indexers
+  - [ ] #19 Minimum OS versions
+  - [x] #20 When to go public

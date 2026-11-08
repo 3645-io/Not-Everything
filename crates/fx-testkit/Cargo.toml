@@ -1,0 +1,17 @@
+[package]
+name = "fx-testkit"
+description = "Workspace policy tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+# Workspace crate (MIT, std only). Test-only: `tests/release_macos.rs` checks
+# that the release script's per-channel names are the app's.
+fx-channel = { path = "../fx-channel" }
+
+[lints]
+workspace = true

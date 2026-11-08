@@ -1,0 +1,78 @@
+[package]
+name = "fx-ui-macos"
+description = "Native macOS shell built on AppKit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# The measurement modes: the app's `--synthetic`, `--page-cost-ms`,
+# `--autoscroll`, `--launch-probe` and `--gate-probe` options, the
+# `table_spike` example and the modules behind them (synthetic rows from
+# fx-bench, frame statistics, the gate probe). Off by default, so release
+# builds have none of them; the gate scripts turn it on.
+measure = ["dep:fx-bench"]
+
+[dependencies]
+# Workspace crate: the synthetic file trees and percentiles of the
+# measurement modes.
+fx-bench = { path = "../fx-bench", optional = true }
+# Workspace crates behind the results controller.
+fx-engine = { path = "../fx-engine" }
+fx-model = { path = "../fx-model" }
+fx-query = { path = "../fx-query" }
+fx-sort = { path = "../fx-sort" }
+# Workspace crate (MIT): the private-folder helper and modes the data folder
+# shares with the store (`make_dir_private`, 0700 and 0600). Already a
+# transitive dependency through fx-engine.
+fx-store = { path = "../fx-store" }
+# Workspace crate (MIT): the platform traits (`ChangeSource`,
+# `VolumeEnumerator`, `PathStat`) the engine is built over; the EngineSource
+# integration test's fakes implement them. Already a transitive dependency
+# through fx-engine. A normal (not dev) dependency because that is how the
+# fx-testkit platform allowlist permits it for this crate.
+fx-fs = { path = "../fx-fs" }
+# Workspace crate (MIT, std only): the build channel, which sets the app's
+# name, bundle ID, data folder and default hotkey, so release candidates and
+# betas are a separate app (Not-Everything Preview).
+fx-channel = { path = "../fx-channel" }
+
+# The AppKit layer (`src/appkit/`). Licenses, verified from the locked
+# versions' manifests: objc2 0.6.5 MIT; objc2-foundation 0.3.2 MIT;
+# objc2-app-kit 0.3.2 Zlib OR Apache-2.0 OR MIT. Transitive: objc2-encode
+# 4.1.0 MIT, objc2-core-foundation 0.3.2 Zlib OR Apache-2.0 OR MIT, bitflags
+# 2.13.2 MIT OR Apache-2.0. All used under MIT. Default features stay off:
+# only the framework classes the windows use are turned on, and a new class
+# needs only a new feature of these crates, not a new crate.
+# (`NSFontDescriptor` declares `NSFontWeight`, which the windows' fonts use.)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSNotification", "NSTimer", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSURL", "NSArray", "NSIndexSet", "NSError", "NSData", "NSKeyValueObserving", "NSDictionary", "NSValue", "NSAffineTransform", "NSTimeZone", "NSAttributedString", "NSRange"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSView", "NSControl", "NSTextField", "NSSearchField", "NSTableView", "NSTableColumn", "NSTableCellView", "NSScrollView", "NSClipView", "NSText", "NSUserInterfaceItemIdentification", "NSGraphics", "NSFont", "NSCell", "NSMenu", "NSMenuItem", "NSScreen", "NSWorkspace", "NSPasteboard", "NSDragging", "NSEvent", "objc2-core-foundation", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSImage", "NSButtonCell", "NSActionCell", "NSAppearance", "NSBox", "NSColor", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext", "NSColorSpace", "NSBezierPath", "NSAffineTransform", "NSStringDrawing", "NSAttributedString", "NSFontDescriptor", "NSAccessibilityProtocols", "NSAccessibilityConstants", "NSTrackingArea", "NSParagraphStyle", "NSTableRowView", "NSImageView", "NSGradient", "NSSearchFieldCell", "NSTextFieldCell", "NSCursor", "NSScroller"] }
+# The app binary's engine runs on the macOS scanner, FSEvents source and
+# lstat-based PathStat (workspace crate, MIT).
+fx-fs-macos = { path = "../fx-fs-macos" }
+# The global summon hotkey: global-hotkey 0.9.0, Apache-2.0 OR MIT (used
+# under MIT); it registers through Carbon RegisterEventHotKey, so no
+# Accessibility prompt. Transitive: crossbeam-channel, crossbeam-utils,
+# keyboard-types, once_cell, thiserror (all MIT OR Apache-2.0), and the
+# objc2 crates above. Default features (serde, tracing) stay off.
+global-hotkey = { version = "0.9.0", default-features = false }
+# SMAppService for Launch at Login: objc2-service-management 0.3.2, Zlib OR
+# Apache-2.0 OR MIT (used under MIT); no new transitive crates.
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+
+[[bin]]
+name = "fx-ui-macos"
+path = "src/main.rs"
+
+# The Phase 0 UI spike, a measurement tool.
+[[example]]
+name = "table_spike"
+required-features = ["measure"]
+
+[lints]
+workspace = true

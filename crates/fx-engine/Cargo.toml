@@ -1,0 +1,38 @@
+[package]
+name = "fx-engine"
+description = "Owns the index: writer thread, checkpoint policy and query API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# MIT OR Apache-2.0; lock-free snapshot publishing.
+arc-swap = "1"
+fx-fs = { path = "../fx-fs" }
+fx-index = { path = "../fx-index" }
+fx-model = { path = "../fx-model" }
+# Workspace crate; query parsing, matching and the refinement cache.
+fx-query = { path = "../fx-query" }
+fx-sort = { path = "../fx-sort" }
+# Workspace crate; atomic checkpoints of the index with its resume cursor.
+fx-store = { path = "../fx-store" }
+# MIT OR Apache-2.0; `localtime_r` and `struct tm` for the local UTC offset
+# of date functions (used on macOS and Linux only).
+libc = "0.2.191"
+
+[dev-dependencies]
+# Workspace crate; percentiles, machine info and the synthetic tree
+# generator for the benchmarks and the gate tests. No cycle: fx-bench does
+# not depend on fx-engine.
+fx-bench = { path = "../fx-bench" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Workspace crate; the real FSEvents source, path stat and enumerator for
+# the macOS end-to-end tests and the freshness benchmark.
+fx-fs-macos = { path = "../fx-fs-macos" }
+
+[lints]
+workspace = true

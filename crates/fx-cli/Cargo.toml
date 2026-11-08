@@ -1,0 +1,39 @@
+[package]
+name = "fx-cli"
+description = "Read-only command-line search over the Not-Everything index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# The command is named after the product; the crate keeps the fx- prefix.
+[[bin]]
+name = "not-everything"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates (MIT); no third-party crate. The read-only
+# `StoreReader` (which parses the query and rejects invalid regular
+# expressions), the query syntax it runs, and the sort keys and directions.
+fx-engine = { path = "../fx-engine" }
+fx-query = { path = "../fx-query" }
+fx-sort = { path = "../fx-sort" }
+# Workspace crate (MIT, std only): the build channel, which names the
+# command and its data folder.
+fx-channel = { path = "../fx-channel" }
+
+[dev-dependencies]
+# Workspace crate (MIT). Test-only: `tests/store_path.rs` checks that the
+# CLI's default store path matches the app's `app_args::store_path`. The
+# library mirrors that code and does not depend on the UI crate.
+fx-ui-macos = { path = "../fx-ui-macos" }
+# Workspace crates (MIT). Test-only: `tests/cli.rs` builds a checkpoint store
+# from a fixed index for the end-to-end runs of the binary.
+fx-index = { path = "../fx-index" }
+fx-model = { path = "../fx-model" }
+fx-store = { path = "../fx-store" }
+
+[lints]
+workspace = true

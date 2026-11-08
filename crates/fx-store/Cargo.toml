@@ -1,0 +1,25 @@
+[package]
+name = "fx-store"
+description = "Index file format, checksums, atomic checkpoint and mmap load."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Licenses checked on crates.io before adding (no GPL):
+# - memmap2: MIT OR Apache-2.0 (pulls in libc: MIT OR Apache-2.0)
+# - bytemuck: Zlib OR Apache-2.0 OR MIT
+[dependencies]
+bytemuck = { version = "1", default-features = false }
+fx-index = { path = "../fx-index" }
+fx-model = { path = "../fx-model" }
+memmap2 = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+fx-bench = { path = "../fx-bench" }
+fx-query = { path = "../fx-query" }
+
+[lints]
+workspace = true
