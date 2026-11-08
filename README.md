@@ -6,7 +6,7 @@ Inspired by voidtools Everything; not affiliated with voidtools.
 
 > **Status:** a macOS preview, built through Phase 1 of the plan with the v0.3.0 interface.
 > The Phase 0 and Phase 1 gates are partly measured ([`docs/gates/`](docs/gates/)).
-> v0.3.0, not released yet, will be the first release published from this repository.
+> v0.3.0 is the first release published from this repository.
 > Releases are signed with a Developer ID, notarized and come as a DMG; the Homebrew cask
 > and automatic updates come in Phase 2. See [`CHANGELOG.md`](CHANGELOG.md) for what is in
 > it, [`docs/PLAN.md`](docs/PLAN.md) for the build plan and [`PROGRESS.md`](PROGRESS.md) for
@@ -14,7 +14,7 @@ Inspired by voidtools Everything; not affiliated with voidtools.
 
 ## Install (macOS 13 or later, Apple silicon)
 
-Once v0.3.0 is out, download `Not-Everything-<version>-macos-arm64.dmg` from the
+Download `Not-Everything-<version>-macos-arm64.dmg` from the
 [releases page](https://github.com/3645-io/Not-Everything/releases), open it, and drag
 Not-Everything onto the Applications shortcut in its window. The release also has the same app
 as `Not-Everything-<version>-macos-arm64.zip`, the `not-everything` command in
