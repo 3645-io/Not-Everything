@@ -44,6 +44,9 @@
 //! - [`app_icon`]: the six approved app icon designs and their embedded
 //!   light and dark images.
 //! - [`settings_view`]: the Settings window's copy and contents.
+//! - [`shortcut_recorder`]: the Settings recorder that picks a new summon
+//!   hotkey; [`hotkey_slot`]: the registered hotkey and how a picked one
+//!   replaces it, the new one registered before the old one goes.
 //! - [`quit`]: the steps of quitting, in order (menu-bar item and windows
 //!   first, then the index save, which usually writes nothing).
 //! - [`notices`]: the third-party notices the About panel shows.
@@ -116,6 +119,7 @@ pub mod frame_stats;
 #[cfg(feature = "measure")]
 pub mod gate_probe;
 pub mod hotkey;
+pub mod hotkey_slot;
 pub mod key_caps;
 pub mod limited;
 pub mod main_layout;
@@ -128,6 +132,7 @@ pub mod onboarding;
 pub mod quit;
 pub mod settings;
 pub mod settings_view;
+pub mod shortcut_recorder;
 pub mod source;
 #[cfg(feature = "measure")]
 pub mod spike_args;

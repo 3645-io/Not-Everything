@@ -46,7 +46,7 @@ fn styles_come_from_the_tokens() {
         let mut ring = shadows(ShadowToken::Pressed);
         ring.push(Shadow::ring(2.0, c(Token::GreenInk)));
         assert_eq!(focused.shadows, ring);
-        for selected in [Surface::ChipOn, Surface::RowSelected] {
+        for selected in [Surface::ChipOn, Surface::RowSelected, Surface::Recording] {
             let s = selected.style(theme);
             assert_eq!(s.fill, Some(c(Token::GreenWash)), "{selected:?}");
             assert_eq!(
@@ -84,6 +84,12 @@ fn styles_come_from_the_tokens() {
             [Shadow::ring(3.0, c(Token::GreenWash))]
         );
         assert_eq!(Surface::ChannelBeta.style(theme).fill, Some(c(Token::Vol)));
+        // The shortcut recorder under the pointer (`.rec.is-hover`): the
+        // row hover's well, 10 round.
+        assert_eq!(
+            Surface::RecorderHover.style(theme),
+            Surface::RowHover.style(theme)
+        );
         let callout = Surface::Callout.style(theme);
         assert_eq!(callout.fill, Some(c(Token::CautionWash)));
         assert_eq!(callout.border.unwrap().color, c(Token::CautionEdge));
@@ -96,6 +102,7 @@ fn flat_surfaces_need_no_image() {
         Surface::RowHover,
         Surface::SegmentOn,
         Surface::IconPickHover,
+        Surface::RecorderHover,
         Surface::Callout,
         Surface::ChannelRc,
         Surface::ChannelBeta,

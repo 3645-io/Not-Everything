@@ -259,3 +259,195 @@ fn every_letter_and_digit_has_a_distinct_key_code() {
     codes.dedup();
     assert_eq!(codes.len(), 36);
 }
+
+// ------------------------------------------------- recording and the rules
+//
+// Run 2.10 adds, for the Settings recorder:
+//
+// - `Key::from_carbon_code(u32) -> Option<Key>`: the key at a macOS virtual
+//   key code (`NSEvent.keyCode`), the inverse of `Key::carbon_code`; `None`
+//   for a key a shortcut can't use.
+// - `Modifiers::from_event_flags(u64)`: the modifiers in `NSEvent`'s
+//   `modifierFlags` (Shift 1 << 17, Control 1 << 18, Option 1 << 19,
+//   Command 1 << 20), ignoring Caps Lock, the numeric pad, Help and fn.
+// - `HotkeySpec::check() -> Result<(), Refusal>`: the rules a shortcut
+//   picked in Settings must pass before macOS is asked. `Refusal`'s
+//   `Display` is the reason the Settings row shows.
+
+use fx_ui_macos::hotkey::{
+    EVENT_COMMAND, EVENT_CONTROL, EVENT_OPTION, EVENT_SHIFT, KVK_ESCAPE, Refusal,
+};
+
+/// `NSEventModifierFlagCapsLock`, `NumericPad`, `Help` and `Function`.
+const OTHER_FLAGS: u64 = (1 << 16) | (1 << 21) | (1 << 22) | (1 << 23);
+
+#[test]
+fn every_key_reads_back_from_its_key_code() {
+    for key in Key::all() {
+        assert_eq!(Key::from_carbon_code(key.carbon_code()), Some(key), "{key}");
+    }
+}
+
+#[test]
+fn keys_a_shortcut_cannot_use_read_as_none() {
+    // kVK_Return, Tab, Delete, Escape, the arrows, ANSI minus, comma and
+    // grave, keypad 1, F13 and a code past the table.
+    for code in [
+        0x24, 0x30, 0x33, 0x35, 0x7B, 0x7C, 0x7D, 0x7E, 0x1B, 0x2B, 0x32, 0x53, 0x69, 0x200,
+    ] {
+        assert_eq!(Key::from_carbon_code(code), None, "{code:#x}");
+    }
+    assert_eq!(KVK_ESCAPE, 0x35);
+}
+
+#[test]
+fn event_flags_map_to_modifiers() {
+    assert_eq!(EVENT_SHIFT, 1 << 17);
+    assert_eq!(EVENT_CONTROL, 1 << 18);
+    assert_eq!(EVENT_OPTION, 1 << 19);
+    assert_eq!(EVENT_COMMAND, 1 << 20);
+    assert_eq!(Modifiers::from_event_flags(0), Modifiers::default());
+    assert_eq!(
+        Modifiers::from_event_flags(OTHER_FLAGS),
+        Modifiers::default()
+    );
+    assert_eq!(
+        Modifiers::from_event_flags(EVENT_OPTION | EVENT_SHIFT | OTHER_FLAGS),
+        Modifiers {
+            cmd: false,
+            shift: true,
+            option: true,
+            control: false,
+        }
+    );
+    assert_eq!(
+        Modifiers::from_event_flags(EVENT_COMMAND | EVENT_CONTROL),
+        Modifiers {
+            cmd: true,
+            shift: false,
+            option: false,
+            control: true,
+        }
+    );
+    // The low device-dependent bits (left or right key) are ignored too.
+    assert_eq!(
+        Modifiers::from_event_flags(EVENT_COMMAND | 0x8),
+        parse("cmd+a").modifiers
+    );
+}
+
+#[test]
+fn both_defaults_pass_the_rules() {
+    for channel in Channel::ALL {
+        assert_eq!(
+            HotkeySpec::default_for(channel).check(),
+            Ok(()),
+            "{channel:?}"
+        );
+    }
+}
+
+#[test]
+fn shortcuts_the_rules_allow() {
+    for s in [
+        "option+space",
+        "shift+option+space",
+        "control+k",
+        "control+option+k",
+        "cmd+shift+k",
+        "cmd+option+k",
+        "cmd+control+1",
+        "cmd+space+shift",
+        "control+shift+space",
+        "cmd+f5",
+        "shift+f5",
+        "option+f12",
+        "shift+option+f1",
+        "control+f2",
+    ] {
+        assert_eq!(parse(s).check(), Ok(()), "{s}");
+    }
+}
+
+#[test]
+fn command_alone_with_a_letter_or_digit_is_every_app_s() {
+    for s in [
+        "cmd+q", "cmd+w", "cmd+h", "cmd+m", "cmd+c", "cmd+1", "cmd+0",
+    ] {
+        let spec = parse(s);
+        assert_eq!(spec.check(), Err(Refusal::UsedByApps(spec)), "{s}");
+    }
+}
+
+#[test]
+fn shortcuts_that_type_a_character_are_refused() {
+    for s in [
+        "shift+k",
+        "shift+1",
+        "shift+space",
+        "option+k",
+        "option+7",
+        "shift+option+k",
+        "shift+option+2",
+    ] {
+        let spec = parse(s);
+        assert_eq!(spec.check(), Err(Refusal::TypesCharacter(spec)), "{s}");
+    }
+}
+
+#[test]
+fn macos_s_own_shortcuts_are_refused_with_the_feature() {
+    let cases = [
+        ("cmd+space", "Spotlight"),
+        ("cmd+option+space", "Finder search"),
+        ("control+space", "input sources"),
+        ("option+control+space", "input sources"),
+        ("cmd+control+space", "emoji and symbols"),
+        ("cmd+shift+3", "screenshots"),
+        ("cmd+shift+4", "screenshots"),
+        ("cmd+shift+5", "screenshots"),
+        ("cmd+shift+6", "screenshots"),
+        ("cmd+control+q", "Lock Screen"),
+        ("cmd+shift+q", "Log Out"),
+        ("cmd+option+d", "hiding the Dock"),
+        ("cmd+control+f", "full screen"),
+    ];
+    for (s, feature) in cases {
+        let spec = parse(s);
+        assert_eq!(spec.check(), Err(Refusal::System(spec, feature)), "{s}");
+    }
+}
+
+#[test]
+fn refusals_read_as_the_settings_row_s_reasons() {
+    let cases = [
+        (
+            Refusal::UsedByApps(parse("cmd+q")),
+            "\u{2318}Q is used by every app. Try another shortcut.",
+        ),
+        (
+            Refusal::TypesCharacter(parse("shift+option+k")),
+            "\u{2325}\u{21e7}K types a character. Try another shortcut.",
+        ),
+        (
+            Refusal::System(parse("cmd+space"), "Spotlight"),
+            "macOS uses \u{2318}Space for Spotlight. Try another shortcut.",
+        ),
+        (
+            Refusal::UnsupportedKey,
+            "That key can\u{2019}t be used. Use a letter, digit, Space or F1\u{2013}F12.",
+        ),
+        (
+            Refusal::NotAccepted(parse("control+option+k")),
+            "macOS didn\u{2019}t accept \u{2303}\u{2325}K. Another app may be using it.",
+        ),
+        (
+            Refusal::NotAcceptedAtLaunch(parse("option+space")),
+            "macOS didn\u{2019}t accept \u{2325}Space when the app opened. Click the keys to \
+             pick another.",
+        ),
+    ];
+    for (refusal, text) in cases {
+        assert_eq!(refusal.to_string(), text, "{refusal:?}");
+    }
+}

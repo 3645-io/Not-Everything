@@ -2,12 +2,14 @@
 //! board.
 //!
 //! The window is a top bar with only its title, over a scrolling sheet of
-//! raised cards: General (the summon hotkey as key caps, Launch at Login),
+//! raised cards: General (the summon hotkey as key caps that record a new
+//! one when clicked, Launch at Login),
 //! Search (Your files first), Appearance (System / Light / Dark), App Icon
 //! (the six approved icons, Match Row tagged "Default") and Full Disk
 //! Access, then a footnote with the version. This module holds what the
-//! rows say in each state ([`login_row`], [`your_files_first_row`],
-//! [`access_row`]) and where every box goes ([`layout`]); the AppKit layer
+//! rows say in each state ([`hotkey_row`], [`login_row`],
+//! [`your_files_first_row`], [`access_row`]) and where every box goes
+//! ([`layout`]); the AppKit layer
 //! (`appkit::window::settings_window`) measures the text, places the views
 //! and saves each change at once.
 
@@ -18,6 +20,8 @@ use fx_fs::AccessState;
 use crate::app_icon::AppIcon;
 use crate::appearance::AppearanceMode;
 use crate::build_info::BuildInfo;
+use crate::hotkey::{HotkeySpec, Modifiers, Refusal};
+use crate::key_caps::{key_caps, modifier_caps, spoken};
 
 /// The window title, the only text in the top bar.
 pub const TITLE: &str = "Settings";
@@ -60,8 +64,70 @@ pub const SECTIONS: [&str; 5] = [
 pub const HOTKEY_LABEL: &str = "Show the search window";
 
 /// The summon hotkey row's caption; its control is the hotkey's key caps
-/// (`crate::key_caps::key_caps`).
+/// (`crate::key_caps::key_caps`), which record a new one when clicked.
 pub const HOTKEY_CAPTION: &str = "Press this shortcut in any app.";
+
+/// The summon hotkey row's caption while it records (the shortcut
+/// recorder board, states 4 and 5).
+pub const HOTKEY_RECORDING_CAPTION: &str = "Type the new shortcut. Esc cancels.";
+
+/// What the recording box shows before a modifier is held.
+pub const HOTKEY_RECORDING_HINT: &str = "Type shortcut";
+
+/// The reset link's title, naming the app's `default` shortcut (the
+/// board's state 9).
+pub fn hotkey_reset_title(default: HotkeySpec) -> String {
+    format!("Use Default ({})", default.symbols())
+}
+
+/// What the summon hotkey row shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotkeyRow {
+    /// The caption under the row's name.
+    pub caption: String,
+    /// Whether the caption is a refusal (`danger-ink`, not `muted`).
+    pub error: bool,
+    /// Whether the caps record: pressed and rimmed in green.
+    pub recording: bool,
+    /// The caps: the shortcut's, or while recording the modifiers held so
+    /// far (none: the box shows [`HOTKEY_RECORDING_HINT`]).
+    pub caps: Vec<&'static str>,
+    /// The reset link's title, while the shortcut isn't the default and
+    /// the caps don't record.
+    pub reset: Option<String>,
+    /// What VoiceOver reads for the caps.
+    pub spoken: String,
+}
+
+/// The summon hotkey row for the saved shortcut `spec`, the app's
+/// `default`, the modifiers held while `recording` (`None` at rest) and the
+/// reason the last change was refused, if any (shown in place of the
+/// caption until a change succeeds, and hidden while recording).
+pub fn hotkey_row(
+    spec: HotkeySpec,
+    default: HotkeySpec,
+    recording: Option<Modifiers>,
+    error: Option<&Refusal>,
+) -> HotkeyRow {
+    match recording {
+        Some(held) => HotkeyRow {
+            caption: HOTKEY_RECORDING_CAPTION.to_string(),
+            error: false,
+            recording: true,
+            caps: modifier_caps(held),
+            reset: None,
+            spoken: format!("{HOTKEY_LABEL}: recording"),
+        },
+        None => HotkeyRow {
+            caption: error.map_or_else(|| HOTKEY_CAPTION.to_string(), Refusal::to_string),
+            error: error.is_some(),
+            recording: false,
+            caps: key_caps(spec),
+            reset: (spec != default).then(|| hotkey_reset_title(default)),
+            spoken: format!("{HOTKEY_LABEL}: {}", spoken(spec)),
+        },
+    }
+}
 
 /// The Launch at Login row's name.
 pub const LOGIN_LABEL: &str = "Launch at Login";
@@ -701,6 +767,89 @@ pub mod layout {
             Frame::new(right - width, top, width, metrics::KEY_HEIGHT),
             caps,
         )
+    }
+
+    /// How far the shortcut recorder's box (`.rec`) reaches past the caps:
+    /// above and below, and on each side (its negative margin). At rest the
+    /// row lays the caps out as before; the box only shows on hover, focus
+    /// and while recording.
+    pub const RECORDER_REACH: [f64; 2] = [5.0, 4.0];
+    /// The recorder box's height: the caps, 3 of padding and a 2-point rim
+    /// above and below.
+    pub const RECORDER_HEIGHT: f64 = metrics::KEY_HEIGHT + 2.0 * (3.0 + RECORDER_RIM);
+    /// The recorder box's rim (transparent at rest; `green-ink` while
+    /// recording).
+    pub const RECORDER_RIM: f64 = metrics::SELECTED_BORDER;
+    /// The recorder box's side padding while recording (2 at rest).
+    pub const RECORDING_PADDING_X: f64 = 6.0;
+    /// The recording box's narrowest.
+    pub const RECORDING_MIN_WIDTH: f64 = 144.0;
+    /// The hint's side padding in the recording box (`.rec-hint`).
+    pub const RECORDER_HINT_PADDING_X: f64 = 4.0;
+    /// Above the reset link (`.rec-reset` margin-top).
+    pub const RESET_GAP: f64 = 2.0;
+    /// The line the reset link sits on: its 18-point box and 2-point margin
+    /// on the baseline of the row's 20-point line (measured on the board).
+    pub const RESET_LINE: f64 = 21.0;
+
+    /// The recording box's hint, `text_width` wide, with its padding.
+    pub fn recorder_hint_width(text_width: f64) -> f64 {
+        text_width + 2.0 * RECORDER_HINT_PADDING_X
+    }
+
+    /// The recorder's footprint in its row (the control size for
+    /// [`Card::row`]) around content `content_width` wide: the caps at
+    /// rest; while `recording`, the box (at least
+    /// [`RECORDING_MIN_WIDTH`]) less what it reaches past the row.
+    pub fn recorder_size(content_width: f64, recording: bool) -> (f64, f64) {
+        let width = if recording {
+            let inset = RECORDER_RIM + RECORDING_PADDING_X;
+            (content_width + 2.0 * inset).max(RECORDING_MIN_WIDTH) - 2.0 * RECORDER_REACH[1]
+        } else {
+            content_width
+        };
+        (width, metrics::KEY_HEIGHT)
+    }
+
+    /// The recorder's box around its row control `control`.
+    pub fn recorder_box(control: Frame) -> Frame {
+        let [y, x] = RECORDER_REACH;
+        Frame::new(
+            control.x - x,
+            control.y - y,
+            control.width + 2.0 * x,
+            control.height + 2.0 * y,
+        )
+    }
+
+    /// Where content `size` (width, height) goes in the recorder box `bx`:
+    /// right-aligned inside the rim and padding, centred top to bottom.
+    pub fn recorder_content(bx: Frame, size: (f64, f64), recording: bool) -> Frame {
+        let padding = if recording {
+            RECORDING_PADDING_X
+        } else {
+            RECORDER_REACH[1] - RECORDER_RIM
+        };
+        let right = bx.right() - RECORDER_RIM - padding;
+        Frame::new(
+            right - size.0,
+            bx.y + (bx.height - size.1) / 2.0,
+            size.0,
+            size.1,
+        )
+    }
+
+    /// The hotkey row's text height: the name, the caption
+    /// `caption_height` tall and, with a `reset` link, its line.
+    pub fn hotkey_text_height(caption_height: f64, reset: bool) -> f64 {
+        text_block_height(caption_height) + if reset { RESET_LINE } else { 0.0 }
+    }
+
+    /// The reset link, `width` wide, under the caption (`caption_height`
+    /// tall) of the row text `text`.
+    pub fn reset_link(text: Frame, caption_height: f64, width: f64) -> Frame {
+        let top = text.y + text_block_height(caption_height) + RESET_GAP;
+        Frame::new(text.x, top, width, styles::LINK_BUTTON.line_height)
     }
 
     /// Where CSS puts the first baseline in a line box `line_height` tall,
