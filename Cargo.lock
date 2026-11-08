@@ -204,6 +204,7 @@ dependencies = [
  "fx-model",
  "fx-query",
  "fx-testkit",
+ "libc",
  "memmap2",
 ]
 

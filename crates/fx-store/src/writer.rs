@@ -246,6 +246,7 @@ fn write_body(
     cols: &[(Column, &[u8])],
     offsets: &[u64],
     file_len: u64,
+    on_stage: &mut dyn FnMut(WriteStage),
 ) -> io::Result<()> {
     const ZEROS: [u8; COLUMN_ALIGN] = [0; COLUMN_ALIGN];
     let mut w = BufWriter::with_capacity(1 << 20, file);
@@ -260,9 +261,12 @@ fn write_body(
     w.write_all(&ZEROS[..(file_len - pos) as usize])?;
     w.flush()?;
     drop(w);
+    on_stage(WriteStage::Written);
     // On macOS, std's sync_all issues fcntl(F_FULLFSYNC), so the data
     // reaches stable storage, not just the drive's cache.
-    file.sync_all()
+    file.sync_all()?;
+    on_stage(WriteStage::Synced);
+    Ok(())
 }
 
 /// Makes the rename itself durable by syncing the containing directory.
@@ -300,6 +304,37 @@ fn sync_dir(_target: &Path) -> io::Result<()> {
 /// one exception is [`StoreError::DirSync`]: the new file is already in
 /// place, but its rename may not survive a power loss.
 pub fn write_checkpoint(path: impl AsRef<Path>, input: &SaveInput<'_>) -> Result<u64, StoreError> {
+    write_checkpoint_with_stages(path, input, &mut |_| {})
+}
+
+/// A point in a checkpoint write that [`write_checkpoint_with_stages`]
+/// reports, in this order. Meant for the crash tests, which kill a writer
+/// at each of them.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WriteStage {
+    /// The temp file exists and is empty.
+    TempCreated,
+    /// Every byte is written to the temp file, which is not synced yet.
+    Written,
+    /// The temp file is synced and not renamed yet.
+    Synced,
+    /// The temp file is renamed over the target; the folder is not synced
+    /// yet.
+    Renamed,
+    /// The folder is synced: the checkpoint is complete.
+    DirSynced,
+}
+
+/// [`write_checkpoint`], calling `on_stage` at each [`WriteStage`] it
+/// reaches. Meant for the crash tests: `write_checkpoint` is this with a
+/// callback that does nothing.
+#[doc(hidden)]
+pub fn write_checkpoint_with_stages(
+    path: impl AsRef<Path>,
+    input: &SaveInput<'_>,
+    on_stage: &mut dyn FnMut(WriteStage),
+) -> Result<u64, StoreError> {
     if cfg!(target_endian = "big") {
         return Err(StoreError::BigEndianHost);
     }
@@ -317,13 +352,16 @@ pub fn write_checkpoint(path: impl AsRef<Path>, input: &SaveInput<'_>) -> Result
 
     let tmp = temp_path(path)?;
     let file = create_temp(&tmp)?;
-    let result = write_body(&file, &header, &cols, &offsets, file_len);
+    on_stage(WriteStage::TempCreated);
+    let result = write_body(&file, &header, &cols, &offsets, file_len, on_stage);
     drop(file);
     if let Err(e) = result.and_then(|()| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(StoreError::Io(e));
     }
+    on_stage(WriteStage::Renamed);
     sync_dir(path).map_err(StoreError::DirSync)?;
+    on_stage(WriteStage::DirSynced);
     Ok(file_len)
 }
 

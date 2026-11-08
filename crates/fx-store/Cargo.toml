@@ -11,10 +11,13 @@ publish.workspace = true
 # Licenses checked on crates.io before adding (no GPL):
 # - memmap2: MIT OR Apache-2.0 (pulls in libc: MIT OR Apache-2.0)
 # - bytemuck: Zlib OR Apache-2.0 OR MIT
+# - libc: MIT OR Apache-2.0 (already locked through memmap2); `kill(pid, 0)`
+#   tells whether a leftover temp file's writer still runs
 [dependencies]
 bytemuck = { version = "1", default-features = false }
 fx-index = { path = "../fx-index" }
 fx-model = { path = "../fx-model" }
+libc = "0.2.191"
 memmap2 = { version = "0.9", default-features = false }
 
 [dev-dependencies]
