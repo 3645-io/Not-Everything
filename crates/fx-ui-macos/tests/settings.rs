@@ -4,7 +4,8 @@
 //!
 //! - `Settings { hotkey: HotkeySpec, launch_at_login: bool,
 //!   fda_onboarding_dismissed: bool, appearance: AppearanceMode, app_icon:
-//!   AppIcon, your_files_first: bool, sort: SortState }` with public
+//!   AppIcon, your_files_first: bool, sort: SortState, column_widths:
+//!   Option<ColumnSizes>, … }` with public
 //!   fields; `Default` is the default summon hotkey (option+space), not
 //!   launching at login, the onboarding not dismissed, the system
 //!   appearance, the Match Row icon, "Your files first" on and Name
@@ -16,7 +17,9 @@
 //!   `launch_at_login`, `fda_onboarding_dismissed`, `appearance` (`system`,
 //!   `light` or `dark`), `app_icon` (an `AppIcon` value such as
 //!   `lit-slot`), `your_files_first` and `sort` (the
-//!   results column and direction, such as `size:descending`); booleans are
+//!   results column and direction, such as `size:descending`) and
+//!   `column_widths` (the resized Name, Path and Size widths, such as
+//!   `300,480,88`; absent for the default layout); booleans are
 //!   `true` / `false`. `Settings::parse(&str) -> Settings` never fails:
 //!   unknown keys and lines without `=` are ignored, whitespace around keys and
 //!   values is trimmed, and a bad value falls back to that field's default.
@@ -42,6 +45,7 @@ use fx_query::QueryOptions;
 use fx_sort::Direction;
 use fx_ui_macos::app_icon::AppIcon;
 use fx_ui_macos::appearance::AppearanceMode;
+use fx_ui_macos::column_sizes::ColumnSizes;
 use fx_ui_macos::columns::{Column, SortState};
 use fx_ui_macos::hotkey::HotkeySpec;
 use fx_ui_macos::settings::{Settings, settings_path};
@@ -95,6 +99,7 @@ fn custom() -> Settings {
             regex: true,
         },
         index_size: Some(2_014_377),
+        column_widths: Some(ColumnSizes::new([300.0, 480.0, 88.0])),
     }
 }
 
@@ -122,6 +127,7 @@ fn defaults() {
     assert!(s.your_files_first, "Your files first is on by default");
     assert_eq!(s.search_options, QueryOptions::default(), "every chip off");
     assert_eq!(s.index_size, None);
+    assert_eq!(s.column_widths, None, "the default column layout");
 }
 
 /// The release app and the Preview app (release candidates and
@@ -173,12 +179,17 @@ fn text_is_line_based_key_value() {
     assert!(lines.contains(&"match_path=false"), "{text}");
     assert!(lines.contains(&"regex=true"), "{text}");
     assert!(lines.contains(&"index_size=2014377"), "{text}");
+    assert!(lines.contains(&"column_widths=300,480,88"), "{text}");
     let text = Settings::default().to_text();
     assert!(text.lines().any(|l| l == "your_files_first=true"), "{text}");
     assert!(text.lines().any(|l| l == "regex=false"), "{text}");
     assert!(
         !text.lines().any(|l| l.starts_with("index_size")),
         "no size before a first index: {text}"
+    );
+    assert!(
+        !text.lines().any(|l| l.starts_with("column_widths")),
+        "no widths for the default layout: {text}"
     );
 }
 
@@ -594,4 +605,62 @@ fn each_app_s_shortcut_is_its_own() {
         Settings::defaults_for(Channel::Release).hotkey,
         Settings::defaults_for(Channel::Rc).hotkey
     );
+}
+
+/// The widths the column dividers set survive a relaunch; the
+/// default layout writes no line, and a bad value falls back to it.
+#[test]
+fn the_column_widths_round_trip_and_fall_back_to_the_default_layout() {
+    for widths in [
+        None,
+        Some(ColumnSizes::new([140.0, 120.0, 64.0])),
+        Some(ColumnSizes::new([300.0, 480.0, 88.0])),
+        Some(ColumnSizes::new([800.0, 800.0, 800.0])),
+    ] {
+        let s = Settings {
+            column_widths: widths,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&s.to_text()), s, "{widths:?}");
+    }
+    assert_eq!(
+        Settings::parse(" column_widths = 300, 480 ,88 \n").column_widths,
+        Some(ColumnSizes::new([300.0, 480.0, 88.0]))
+    );
+    assert_eq!(
+        Settings::parse("column_widths=1,2,3000\n").column_widths,
+        Some(ColumnSizes::new([140.0, 120.0, 800.0])),
+        "a hand-edited width is kept within its column's range"
+    );
+    for bad in [
+        "column_widths=300,480",
+        "column_widths=wide",
+        "column_widths=",
+    ] {
+        assert_eq!(Settings::parse(bad).column_widths, None, "{bad}");
+    }
+    assert_eq!(
+        Settings::parse("sort=size:descending\n").column_widths,
+        None,
+        "files written before the dividers existed keep the default layout"
+    );
+}
+
+/// Saved and loaded through the file, as a relaunch does.
+#[test]
+fn the_column_widths_survive_a_save_and_load() {
+    let dir = TempDir::new("column-widths");
+    let path = dir.path.join("settings");
+    let s = Settings {
+        column_widths: Some(ColumnSizes::new([350.0, 420.0, 96.0])),
+        ..Settings::default()
+    };
+    s.save(&path).unwrap();
+    assert_eq!(Settings::load(&path).unwrap(), s);
+    let reset = Settings {
+        column_widths: None,
+        ..s
+    };
+    reset.save(&path).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().column_widths, None);
 }

@@ -75,6 +75,8 @@
 //! - [`chips`]: the Aa, Path and .* search options.
 //! - [`main_layout`] and [`window_view`]: where the search window's parts
 //!   go and what it shows in each state.
+//! - [`column_sizes`]: the column widths the dividers between the column
+//!   titles set (drag, arrow keys, the default layout).
 //! - [`ui_text`]: the search window's copy.
 //! - [`surface`]: the surfaces and glyphs rendered into pixels, once per
 //!   theme and size class, for `appkit::window::surfaces` to share.
@@ -112,6 +114,7 @@ pub mod appkit;
 pub mod build_info;
 pub mod bundle;
 pub mod chips;
+pub mod column_sizes;
 pub mod columns;
 pub mod controller;
 pub mod daily_save;
