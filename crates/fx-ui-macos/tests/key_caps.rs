@@ -67,7 +67,7 @@ fn the_result_hints_match_the_key_map() {
         [
             (&["↩"][..], "Open"),
             (&["⌘", "↩"][..], "Reveal in Finder"),
-            (&["⌘", "C"][..], "Copy path"),
+            (&["⌥", "⌘", "C"][..], "Copy path"),
         ]
     );
     // No Quick Look hint: Quick Look is not built.
@@ -77,6 +77,10 @@ fn the_result_hints_match_the_key_map() {
     let cmd = Modifiers {
         command: true,
         ..Modifiers::default()
+    };
+    let option_cmd = Modifiers {
+        option: true,
+        ..cmd
     };
     let actions: Vec<Action> = RESULT_HINTS.iter().map(|h| h.action).collect();
     assert_eq!(
@@ -92,7 +96,9 @@ fn the_result_hints_match_the_key_map() {
         Some(Action::RevealInFinder)
     );
     assert_eq!(
-        actions::action_for_key(actions::Key::Char('c'), cmd),
+        actions::action_for_key(actions::Key::Char('c'), option_cmd),
         Some(Action::CopyPath)
     );
+    // Cmd+C alone copies nothing in the results, so no hint shows it.
+    assert_eq!(actions::action_for_key(actions::Key::Char('c'), cmd), None);
 }

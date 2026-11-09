@@ -1,10 +1,11 @@
 //! The Objective-C classes of the product window.
 //!
 //! - [`ResultsTableView`]: an `NSTableView` subclass that maps keys through
-//!   [`action_for_key`] and Escape through [`escape_action`], answers
-//!   `copy:`, limits drag-out to copy and link, tracks the row under the
-//!   pointer for the rows' hover look and, in `measure` builds, records its
-//!   draw times for the launch and gate probes.
+//!   [`action_for_key`] and Escape through [`escape_action`], leaves
+//!   `copy:` unanswered so Edit > Copy is off, limits drag-out to copy and
+//!   link, tracks the row under the pointer for the rows' hover look and,
+//!   in `measure` builds, records its draw times for the launch and gate
+//!   probes.
 //! - [`WinController`]: data source and delegate of the table, target and
 //!   delegate of the search field, application delegate and timer target.
 //!   It owns the [`ResultsController`]. It is also the status menu's target
@@ -177,17 +178,11 @@ define_class!(
             let _: () = unsafe { msg_send![super(self), keyDown: event] };
         }
 
-        /// Edit > Copy (Cmd+C) with the table focused.
-        #[unsafe(method(copy:))]
-        fn copy(&self, _sender: Option<&AnyObject>) {
-            let cmd = Modifiers {
-                command: true,
-                ..Modifiers::default()
-            };
-            if let Some(action) = action_for_key(Key::Char('c'), cmd) {
-                with_controller(|c| c.perform(action, None));
-            }
-        }
+        // No `copy:` here, on purpose: with nothing in the responder chain
+        // answering it, AppKit greys out Edit > Copy while the table has
+        // the focus. Cmd+C is kept for copying the files themselves, as in
+        // Finder, which is not built yet; Option+Cmd+C copies the paths
+        // through `keyDown:` and `action_for_key`.
 
         /// Drag-out offers copy and link only, whatever the destination.
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]

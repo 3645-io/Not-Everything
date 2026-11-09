@@ -101,7 +101,7 @@ pub const RESULT_HINTS: [KeyHint; 3] = [
     },
     KeyHint {
         action: Action::CopyPath,
-        keys: &[COMMAND, "C"],
+        keys: &[OPTION, COMMAND, "C"],
         label: "Copy path",
     },
 ];

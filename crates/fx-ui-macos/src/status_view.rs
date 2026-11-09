@@ -12,7 +12,7 @@
 //!    once the access callout is dismissed with Not Now, since the callout
 //!    says it while it shows) and the resident note (Launch at Login needs
 //!    approval). A copy cut at the copy limit is noted even over the hints,
-//!    because it answers the Cmd+C just pressed in the results.
+//!    because it answers the Option+Cmd+C just pressed in the results.
 //! 3. **The index** ([`IndexSlot`]): an error when there is one (it replaces
 //!    everything else here); else "Indexing… N of about M" with a progress
 //!    fraction, M being the previous index's size (the count alone on a
