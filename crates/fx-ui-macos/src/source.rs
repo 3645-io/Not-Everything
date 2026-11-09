@@ -228,14 +228,23 @@ pub trait ResultsSource: Send + Sync {
     /// A channel receiving every generation published from now on.
     fn subscribe(&self) -> Receiver<Generation>;
 
-    /// Called when the app quits: makes sure the next launch can load the
-    /// index instead of scanning again, writing as little as possible (an
-    /// engine writes nothing when its store holds a resume cursor; see
-    /// `fx_engine::Engine::checkpoint_for_quit`). Sources without a saved
-    /// index (the synthetic rows) do nothing.
+    /// Called when the app quits: saves what the stored index lacks, so
+    /// the next launch loads it instead of replaying up to a day of
+    /// changes (see `fx_engine::Engine::checkpoint_for_quit`). Sources
+    /// without a saved index (the synthetic rows) do nothing.
     fn save_for_quit(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// How long ago the index was last saved, for the daily save
+    /// ([`crate::daily_save`]); `None` without a saved index.
+    fn saved_ago(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Asks for a save of the index in the background and returns at once
+    /// (the daily save). Sources without a saved index do nothing.
+    fn request_save(&self) {}
 
     /// The search window's search: `query.text` under the search
     /// field's options, in the order of
@@ -372,6 +381,14 @@ impl<T: ResultsSource + ?Sized> ResultsSource for Arc<T> {
 
     fn save_for_quit(&self) -> Result<(), String> {
         (**self).save_for_quit()
+    }
+
+    fn saved_ago(&self) -> Option<std::time::Duration> {
+        (**self).saved_ago()
+    }
+
+    fn request_save(&self) {
+        (**self).request_save();
     }
 }
 
@@ -624,6 +641,16 @@ impl ResultsSource for Engine {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    /// The store's age, from its modification time.
+    fn saved_ago(&self) -> Option<std::time::Duration> {
+        self.saved_at()?.elapsed().ok()
+    }
+
+    /// [`Engine::request_checkpoint`]: the checkpoint thread saves.
+    fn request_save(&self) {
+        self.request_checkpoint();
+    }
 }
 
 /// How many searched snapshots an [`EngineSource`] keeps for row reads.
@@ -788,6 +815,14 @@ impl ResultsSource for EngineSource {
 
     fn save_for_quit(&self) -> Result<(), String> {
         ResultsSource::save_for_quit(&*self.engine)
+    }
+
+    fn saved_ago(&self) -> Option<std::time::Duration> {
+        ResultsSource::saved_ago(&*self.engine)
+    }
+
+    fn request_save(&self) {
+        ResultsSource::request_save(&*self.engine);
     }
 }
 

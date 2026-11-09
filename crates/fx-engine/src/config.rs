@@ -11,11 +11,16 @@ pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(100);
 pub const MIN_BATCH_WINDOW: Duration = Duration::from_millis(50);
 /// Longest batch window the writer accepts.
 pub const MAX_BATCH_WINDOW: Duration = Duration::from_millis(200);
-/// Default delay between the last published change and the idle checkpoint.
-pub const DEFAULT_CHECKPOINT_IDLE: Duration = Duration::from_secs(30);
+/// Default delay between the last published change and the idle
+/// checkpoint: none. A store holds a whole volume (about 251 MB for a whole
+/// disk), so the app saves it once a day and when it quits instead; a quiet
+/// spell, such as a laptop at night, would otherwise save it several times
+/// a day.
+pub const DEFAULT_CHECKPOINT_IDLE: Option<Duration> = None;
 /// Default longest delay between the first unsaved change and a checkpoint,
-/// even while changes keep arriving.
-pub const DEFAULT_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(300);
+/// even while changes keep arriving: two days, a backstop for a Mac whose
+/// app never finds a moment for its daily save.
+pub const DEFAULT_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(48 * 3600);
 /// Default number of consecutive `next_batch` errors after which the writer
 /// restarts the change source from the last published cursor.
 pub const DEFAULT_RESTART_THRESHOLD: u32 = 3;
@@ -32,7 +37,7 @@ pub struct EngineConfig {
     batch_window: Duration,
     resume_from: Option<ResumeCursor>,
     store_path: Option<PathBuf>,
-    checkpoint_idle: Duration,
+    checkpoint_idle: Option<Duration>,
     checkpoint_max_delay: Duration,
     utc_offset_secs: Option<i32>,
     restart_threshold: u32,
@@ -43,9 +48,8 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// A config for the volume mounted at `root` (an absolute path), with the
-    /// default 100 ms batch window, no resume cursor, no checkpoint file,
-    /// the default 30 s idle checkpoint delay and the default 5 min longest
-    /// checkpoint delay.
+    /// default 100 ms batch window, no resume cursor, no checkpoint file, no
+    /// idle checkpoint and the default 48 h longest checkpoint delay.
     pub fn new(root: impl Into<PathBuf>) -> EngineConfig {
         EngineConfig {
             root: root.into(),
@@ -145,9 +149,9 @@ impl EngineConfig {
     }
 
     /// Sets how long after the last published change an idle checkpoint is
-    /// written (default [`DEFAULT_CHECKPOINT_IDLE`]).
+    /// written (by default none: [`DEFAULT_CHECKPOINT_IDLE`]).
     pub fn with_checkpoint_idle(mut self, idle: Duration) -> EngineConfig {
-        self.checkpoint_idle = idle;
+        self.checkpoint_idle = Some(idle);
         self
     }
 
@@ -189,8 +193,8 @@ impl EngineConfig {
     }
 
     /// How long after the last published change an idle checkpoint is
-    /// written.
-    pub fn checkpoint_idle(&self) -> Duration {
+    /// written; `None` when there is no idle checkpoint.
+    pub fn checkpoint_idle(&self) -> Option<Duration> {
         self.checkpoint_idle
     }
 

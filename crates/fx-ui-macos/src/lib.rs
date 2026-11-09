@@ -108,6 +108,7 @@ pub mod bundle;
 pub mod chips;
 pub mod columns;
 pub mod controller;
+pub mod daily_save;
 pub mod data_folder;
 pub mod dock_ribbon;
 pub mod file_glyph;
