@@ -82,6 +82,33 @@
 # to github.com and pointing at that repository (gh repo view), checked
 # before building and before --resume goes on.
 #
+# --perf PERF_DIR puts a performance table in a release candidate's or a
+# release's notes. PERF_DIR is the output folder of
+# scripts/perf-check.sh --tier rc for the commit being built. --publish of a
+# release candidate or a release needs it, --resume included; without
+# --publish it is optional, so a dry run shows the notes as they will be
+# published; a beta takes none.
+# Before fetching or building anything, the script refuses a PERF_DIR
+# without metrics.txt, summary.md or run.txt, one of another tier, one whose
+# run.txt git: line is another commit (for --resume, the build's recorded
+# one) or says (uncommitted changes), and one whose last perf-compare: line
+# in summary.md has a failing or unmeasured metric (a regression the owner
+# approved is an exception in docs/gates/perf-baseline.toml, so it passes).
+# The table compares with the previous release, the highest release/vX.Y.Z
+# tag below the version (release candidates' tags don't count), so the
+# script also refuses, before building, a version with no earlier release or
+# whose previous release's measured values are not in
+# docs/gates/releases/<X.Y.Z>.txt. The release build includes fx-bench,
+# which is not shipped. Once the disk image is final, before the files are
+# written, the script writes $OUT/perf-metrics.txt (PERF_DIR's metrics.txt
+# and the disk image's size, dmg_bytes), has that fx-bench (perf-release)
+# compare it with docs/gates/perf-baseline.toml and the previous release
+# into $OUT/performance.md (with PERF_DIR's notes.md, the owner's own lines,
+# if it has one), puts that table in the notes after the CHANGELOG.md entry,
+# and keeps the values as $OUT/metrics-<label>.txt, which at the release the
+# owner commits as docs/gates/releases/<X.Y.Z>.txt. --resume makes them
+# again from its own --perf whenever it gets that far.
+#
 # Notarizing takes two uploads, in the order Apple documents for nested
 # containers (sign and staple the inner item before packaging it):
 #   1. the signed app and the command, in one zip (work/for-notary.zip).
@@ -104,8 +131,9 @@
 # app and builds and uploads the disk image, or, once the disk image was
 # uploaded, waits for that and finishes with it. It refuses a folder with no
 # saved first upload or channel record, a beta's, one missing the signed app
-# or command (or, once the disk image was uploaded, that image), and one
-# that already holds release files.
+# or command (or, once the disk image was uploaded, that image), one that
+# already holds release files and, with --perf, one whose build has no
+# fx-bench.
 #
 # Needs, in the login keychain: the Developer ID Application certificate,
 # named by NE_SIGN_IDENTITY as `security find-identity -v -p codesigning`
@@ -127,10 +155,10 @@
 # Safety: this script only creates the new <out> directory and files inside
 # it (work/ holds a fresh build, the signed copies, the disk image builds
 # and the uploads; check/ holds the quarantined copies); --resume only adds
-# files inside the folder it resumes, besides rewriting its logs and
-# records. It never deletes, renames or moves anything. It mounts the
-# read-write layout image in /Volumes, where Finder sees it, and the
-# quarantined copy read-only in check/mount, and detaches every image it
+# files inside the folder it resumes, besides rewriting its logs, records
+# and performance table. It never deletes, renames or moves anything. It
+# mounts the read-write layout image in /Volumes, where Finder sees it, and
+# the quarantined copy read-only in check/mount, and detaches every image it
 # attached before it exits. It fetches tags from origin before checking
 # them.
 
@@ -138,8 +166,8 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/release-macos.sh [--rc | --beta] [--publish] NEW_OUT_DIR
-       scripts/release-macos.sh --resume OUT_DIR [--publish]
+usage: scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--publish] NEW_OUT_DIR
+       scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--publish]
 EOF
     exit 2
 }
@@ -217,26 +245,37 @@ check_tarball() {
 MODE=release
 RESUME=0
 PUBLISH=0
+PERF_DIR=
 DIR=
-for arg in "$@"; do
-    case $arg in
+while [ "$#" -gt 0 ]; do
+    case $1 in
     --rc | --beta)
         [ "$MODE" = release ] && [ "$RESUME" -eq 0 ] || usage
-        MODE=${arg#--}
+        MODE=${1#--}
         ;;
     --resume)
         [ "$MODE" = release ] && [ "$RESUME" -eq 0 ] || usage
         RESUME=1
         ;;
+    --perf)
+        # Once, with a folder, never another option.
+        [ -z "$PERF_DIR" ] && [ "$#" -ge 2 ] || usage
+        case $2 in '' | -*) usage ;; esac
+        PERF_DIR=$2
+        shift
+        ;;
     --publish) PUBLISH=1 ;;
     -*) usage ;;
     *)
         [ -z "$DIR" ] || usage
-        DIR=$arg
+        DIR=$1
         ;;
     esac
+    shift
 done
 [ -n "$DIR" ] || usage
+# A beta has no GitHub page, so no performance table.
+[ "$MODE" != beta ] || [ -z "$PERF_DIR" ] || usage
 
 IDENTITY=${NE_SIGN_IDENTITY:-}
 PROFILE=${NE_NOTARY_PROFILE:-not-everything-notary}
@@ -360,6 +399,65 @@ check_no_release() {
 check_notary_profile() {
     xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 ||
         fail "the notary profile $PROFILE is missing or can't reach Apple; check it with xcrun notarytool history --keychain-profile $PROFILE, or save it with xcrun notarytool store-credentials $PROFILE"
+}
+
+# A release candidate's or a release's GitHub page carries the performance
+# table, so publishing the channel $1 needs --perf; a beta has no page.
+need_perf() {
+    if [ "$PUBLISH" -eq 1 ] && [ "$1" != beta ] && [ -z "$PERF_DIR" ]; then
+        fail "--publish of a release candidate or a release needs --perf PERF_DIR, the output folder of scripts/perf-check.sh --tier rc for the commit being built; its table goes in the release notes"
+    fi
+}
+
+# Stops unless $PERF_DIR is a finished scripts/perf-check.sh --tier rc run
+# of the commit $1, from a clean tree, whose last perf-compare: line has no
+# failing or unmeasured metric (a regression the owner approved is an
+# exception in the baseline, so it passes). Sets PERF_DIR to its full path.
+check_perf() {
+    [ -d "$PERF_DIR" ] ||
+        fail "--perf $PERF_DIR is not a folder; give the output folder of scripts/perf-check.sh --tier rc"
+    PERF_DIR=$(cd "$PERF_DIR" && pwd)
+    for f in metrics.txt summary.md run.txt; do
+        [ -f "$PERF_DIR/$f" ] ||
+            fail "$PERF_DIR has no $f, so it is not a finished scripts/perf-check.sh run"
+    done
+    perf_tier=$(sed -n 's/^tier: //p' "$PERF_DIR/run.txt" | head -n 1)
+    [ "$perf_tier" = rc ] ||
+        fail "the performance run in $PERF_DIR is of the ${perf_tier:-unknown} tier; a release needs scripts/perf-check.sh --tier rc"
+    perf_git=$(sed -n 's/^git: //p' "$PERF_DIR/run.txt" | head -n 1)
+    case $perf_git in
+    *"(uncommitted changes)"*)
+        fail "the performance run in $PERF_DIR measured uncommitted changes; run scripts/perf-check.sh --tier rc again on a clean checkout of $1"
+        ;;
+    esac
+    [ "$perf_git" = "$1" ] ||
+        fail "the performance run in $PERF_DIR measured commit ${perf_git:-unknown}, not $1, the commit being built; run scripts/perf-check.sh --tier rc on it"
+    perf_line=$(grep '^perf-compare: ' "$PERF_DIR/summary.md" | tail -n 1)
+    case $perf_line in
+    *", 0 fail, 0 not measured"*) ;;
+    *) fail "the performance run in $PERF_DIR did not pass every metric (${perf_line:-summary.md has no perf-compare: line}); fix the failures and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml" ;;
+    esac
+}
+
+# Sets PREV to the previous release, the highest release/vX.Y.Z tag below
+# $VERSION (a release candidate's tag doesn't count), and stops unless
+# docs/gates/releases/$PREV.txt holds its measured values, which the
+# performance table compares with.
+check_previous_release() {
+    PREV=$(git -C "$ROOT" tag -l 'release/v*' |
+        sed -n -E 's#^release/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' |
+        awk -F . -v version="$VERSION" '
+            BEGIN { split(version, v, "."); below = (v[1] * 1000 + v[2]) * 1000 + v[3] }
+            {
+                n = ($1 * 1000 + $2) * 1000 + $3
+                if (n < below && (prev == "" || n > best)) { best = n; prev = $0 }
+            }
+            END { print prev }
+        ')
+    [ -n "$PREV" ] ||
+        fail "no release before $VERSION (no release/vX.Y.Z tag below it), so the performance table has no previous release to compare with"
+    [ -f "$ROOT/docs/gates/releases/$PREV.txt" ] ||
+        fail "docs/gates/releases/$PREV.txt is missing: the performance table compares with the measured values of $PREV, the previous release; commit them first (its release folder's metrics-$PREV.txt)"
 }
 
 # The mount point in what `hdiutil attach` prints: the third tab-separated
@@ -557,6 +655,28 @@ check_ticket() {
     done
 }
 
+# The performance table, once the disk image $DMG is final: writes
+# $OUT/perf-metrics.txt (PERF_DIR's measured values, then the disk image's
+# size, which counts as the last dmg_bytes), has the release build's
+# fx-bench compare it with the baseline and the previous release $PREV
+# (with PERF_DIR's notes.md, the owner's own lines, if it has one) into
+# $OUT/performance.md, and keeps the values as $OUT/metrics-$LABEL.txt.
+perf_section() {
+    dmg_bytes=$(stat -f %z "$DMG") || fail "cannot read the size of $DMG"
+    {
+        awk '{ print }' "$PERF_DIR/metrics.txt"
+        echo "dmg_bytes=$dmg_bytes"
+    } >"$OUT/perf-metrics.txt"
+    set --
+    [ ! -f "$PERF_DIR/notes.md" ] || set -- --notes "$PERF_DIR/notes.md"
+    "$TARGET/release/fx-bench" perf-release --baseline "$ROOT/docs/gates/perf-baseline.toml" \
+        --previous "$ROOT/docs/gates/releases/$PREV.txt" --previous-label "$PREV" \
+        --label "$LABEL" "$@" "$OUT/perf-metrics.txt" >"$OUT/performance.md" ||
+        fail "fx-bench perf-release could not make the performance table from $OUT/perf-metrics.txt"
+    cp "$OUT/perf-metrics.txt" "$OUT/metrics-$LABEL.txt"
+    cat "$OUT/performance.md"
+}
+
 if [ "$RESUME" -eq 1 ]; then
     # Every check comes before anything is written.
     [ -d "$DIR" ] ||
@@ -602,6 +722,16 @@ if [ "$RESUME" -eq 1 ]; then
         "$OUT"/not-everything-*cli-*-macos-arm64.tar.gz "$OUT/SHA256SUMS.txt"; do
         [ ! -e "$f" ] || fail "$OUT already holds release files ($f); nothing to resume"
     done
+    # The performance table is made again from this run's --perf, with the
+    # fx-bench of the build.
+    TARGET=$WORK/target
+    need_perf "$CHANNEL"
+    if [ -n "$PERF_DIR" ]; then
+        check_perf "$COMMIT"
+        check_previous_release
+        [ -x "$TARGET/release/fx-bench" ] ||
+            fail "$TARGET/release/fx-bench is missing, so the performance table can't be made; start a new release"
+    fi
     APP_VERSION=$(plutil -extract CFBundleShortVersionString raw -o - \
         "$APP/Contents/Info.plist") || fail "no version in $APP"
     [ "$APP_VERSION" = "$VERSION" ] ||
@@ -615,6 +745,7 @@ if [ "$RESUME" -eq 1 ]; then
     check_requirement
     step "Resume $TITLE in $OUT at $STAGE (submission $ID)"
 else
+    need_perf "$MODE"
     VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -n 1)
     [ -n "$VERSION" ] || fail "no version in $ROOT/Cargo.toml"
     echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)$' ||
@@ -624,6 +755,8 @@ else
     ORIGIN_URL=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || ORIGIN_URL=
     # A wrong origin is refused before anything is fetched from it.
     [ "$PUBLISH" -eq 0 ] || check_origin
+    # So is a performance run of anything but this commit, or one that failed.
+    [ -z "$PERF_DIR" ] || check_perf "$(git -C "$ROOT" rev-parse HEAD)"
     if [ -n "$ORIGIN_URL" ]; then
         git -C "$ROOT" fetch --quiet --tags origin || fail "cannot fetch the tags from origin"
     fi
@@ -674,6 +807,8 @@ else
     esac
     COMMIT=$(git -C "$ROOT" rev-parse HEAD)
     set_names
+    # Once the tags are fetched.
+    [ -z "$PERF_DIR" ] || check_previous_release
     MAJOR=${VERSION%%.*}
     MINOR_PATCH=${VERSION#*.}
     BUILD=$((MAJOR * 10000 + ${MINOR_PATCH%.*} * 100 + ${MINOR_PATCH#*.}))
@@ -686,6 +821,7 @@ else
     [ "$CHANNEL" != release ] || echo "Release candidate: $RC_TAG"
     echo "Tag:     $TAG"
     echo "Disk image: $APP_DMG (volume \"$VOLUME\")"
+    [ -z "$PERF_DIR" ] || echo "Performance: $PERF_DIR, compared with $PREV"
 
     [ ! -e "$DIR" ] || fail "$DIR already exists; pick a new folder"
     command -v cargo >/dev/null || fail "cargo is not on PATH"
@@ -735,7 +871,8 @@ else
             >>"$WORK/build.log" 2>&1 ||
             { tail -n 30 "$WORK/build.log" >&2; fail "cargo build $* failed"; }
     }
-    build -p fx-ui-macos -p fx-cli --bins
+    # fx-bench makes the performance table; it is not shipped.
+    build -p fx-ui-macos -p fx-cli -p fx-bench --bins
     build -p fx-ui-macos --example make_bundle
     if grep -q "stripping debug info.*failed" "$WORK/build.log"; then
         fail "the binaries were not stripped; see $WORK/build.log"
@@ -827,6 +964,12 @@ attach_image "$CHECK_DMG" -readonly -nobrowse -mountroot "$OUT/check/mount"
 check_app "$MOUNTED/$APP_NAME.app"
 detach_image
 
+# Before the files, so a failure here can still be resumed.
+if [ -n "$PERF_DIR" ]; then
+    step "Make the performance table for the release notes"
+    perf_section
+fi
+
 step "Write the files"
 ditto -c -k --norsrc --keepParent "$APP" "$OUT/$APP_ZIP"
 cp "$DMG" "$OUT/$APP_DMG"
@@ -844,19 +987,35 @@ check_app "$CHECK"
 step "Done: the files are in $OUT"
 ls -l "$OUT/$APP_DMG" "$OUT/$APP_ZIP" "$OUT/$CLI_TAR" "$OUT/SHA256SUMS.txt"
 cat "$OUT/SHA256SUMS.txt"
+if [ -n "$PERF_DIR" ]; then
+    echo "The performance table in the release notes: $OUT/performance.md"
+    if [ "$CHANNEL" = release ]; then
+        echo "Commit $OUT/metrics-$LABEL.txt as docs/gates/releases/$VERSION.txt: the next release's table compares with these values"
+    else
+        echo "The measured values: $OUT/metrics-$LABEL.txt (at the release, the release's own are committed as docs/gates/releases/$VERSION.txt)"
+    fi
+fi
 
 # The release notes: the version's CHANGELOG.md entry, after a note saying
-# what a release candidate is.
-NOTES=$WORK/release-notes.md
-if [ "$CHANNEL" != beta ]; then
-    {
-        if [ "$CHANNEL" = rc ]; then
-            echo "Release candidate $NUMBER of Not-Everything $VERSION, for testing. It installs as Not-Everything Preview, a separate app with its own settings, index and hotkey (Option-Shift-Space), next to the release app; its command is not-everything-preview."
-            echo
-        fi
+# what a release candidate is and, with --perf, before the performance
+# table, one blank line between them.
+release_notes() {
+    if [ "$CHANNEL" = rc ]; then
+        echo "Release candidate $NUMBER of Not-Everything $VERSION, for testing. It installs as Not-Everything Preview, a separate app with its own settings, index and hotkey (Option-Shift-Space), next to the release app; its command is not-everything-preview."
+        echo
+    fi
+    if [ -z "$PERF_DIR" ]; then
         changelog_entry
-    } >"$NOTES"
-fi
+        return 0
+    fi
+    # The entry without its trailing blank lines.
+    changelog_entry | awk 'NF == 0 { held = held $0 "\n"; next } { printf "%s", held; held = ""; print }'
+    echo
+    cat "$OUT/performance.md"
+}
+
+NOTES=$WORK/release-notes.md
+[ "$CHANNEL" = beta ] || release_notes >"$NOTES"
 
 # A shell word for $1, quoted only when it needs to be.
 shell_word() {
