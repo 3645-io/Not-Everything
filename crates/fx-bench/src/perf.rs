@@ -839,6 +839,9 @@ pub struct Row {
     pub target: Option<f64>,
     /// Whether the target was checked at this tier.
     pub target_checked: bool,
+    /// The baseline itself misses the target, so only the allowance holds
+    /// the metric until a change meets the target ([`target_pending`]).
+    pub target_pending: bool,
     pub verdict: Verdict,
     pub gated: bool,
     pub exception: Option<String>,
@@ -856,6 +859,16 @@ impl Row {
         }
         let (base, now) = (self.baseline?, self.value?);
         (base != 0.0).then(|| (now - base) * 100.0 / base.abs())
+    }
+
+    /// The Verdict column: [`Verdict::text`], with a pending target noted
+    /// on a pass.
+    pub fn verdict_text(&self) -> String {
+        if self.target_pending && self.verdict == Verdict::Pass {
+            "PASS (target not yet met)".to_string()
+        } else {
+            self.verdict.text()
+        }
     }
 
     /// Whether the value counts as measured (for `--print-values`).
@@ -886,11 +899,15 @@ fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
         Tier::Pr | Tier::Rc => m.baseline,
     };
     let target_checked = tier != Tier::Quick || m.better == Better::Equal;
+    let pending = target_checked && target_pending(m, base);
     let value = m.aggregate.apply(samples.get(&m.key));
     let verdict = match value {
         None if partial => Verdict::Skipped,
         None => gated(m, Verdict::NotMeasured(format!("no {} samples", m.key))),
-        Some(v) => gated(m, check(m, samples, tier, v, base, target_checked)),
+        Some(v) => gated(
+            m,
+            check(m, samples, tier, v, base, target_checked && !pending),
+        ),
     };
     Row {
         id: m.id.clone(),
@@ -902,10 +919,30 @@ fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
         value,
         target: m.target,
         target_checked,
+        // Noted only while the value still misses the target too.
+        target_pending: pending && value.is_some_and(|v| misses_target(m, v)),
         verdict,
         gated: m.gated,
         exception: m.exception.clone(),
     }
+}
+
+/// Whether the baseline itself misses a `lower` or `higher` target. Until a
+/// change meets the target (0.3.1's memory, for example, at 1.5 GB against
+/// 200 MB), only the allowance holds the metric, so it can't get worse while
+/// its fix is pending, and pull requests don't all fail in the meantime. An
+/// `equal` target has no allowance to fall back on, so it is always checked.
+fn target_pending(m: &Metric, base: Option<f64>) -> bool {
+    m.better != Better::Equal && base.is_some_and(|b| misses_target(m, b))
+}
+
+/// Whether `value` misses the metric's target; false without one.
+fn misses_target(m: &Metric, value: f64) -> bool {
+    m.target.is_some_and(|t| match m.better {
+        Better::Lower => !at_most(value, t),
+        Better::Higher => !at_most(t, value),
+        Better::Equal => !nearly_equal(value, t),
+    })
 }
 
 /// Wraps the verdict of an ungated metric in TRACKED.
@@ -945,12 +982,7 @@ fn check(
             Some(_) => {}
         }
     }
-    let target = target_checked
-        && m.target.is_some_and(|t| match m.better {
-            Better::Lower => !at_most(value, t),
-            Better::Higher => !at_most(t, value),
-            Better::Equal => !nearly_equal(value, t),
-        });
+    let target = target_checked && misses_target(m, value);
     let regression = base.is_some_and(|b| {
         let allow = allowance(m, b);
         match m.better {
@@ -1076,7 +1108,7 @@ pub fn render_markdown(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
             md_cell(&show(r.value)),
             change,
             md_cell(&target),
-            md_cell(&r.verdict.text()),
+            md_cell(&r.verdict_text()),
         ));
     }
     if rows.iter().any(|r| r.target.is_some() && !r.target_checked) {
@@ -1120,8 +1152,8 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
             format!(
                 "{{\"id\":{},\"name\":{},\"key\":{},\"unit\":{},\"better\":{},\"gated\":{},\
                  \"baseline\":{},\"now\":{},\"change_pct\":{},\"target\":{},\
-                 \"target_checked\":{},\"verdict\":{},\"failed\":[{}],\"reason\":{},\
-                 \"would_be\":{},\"exception\":{}}}",
+                 \"target_checked\":{},\"target_pending\":{},\"verdict\":{},\"failed\":[{}],\
+                 \"reason\":{},\"would_be\":{},\"exception\":{}}}",
                 json_string(&r.id),
                 json_string(&r.name),
                 json_string(&r.key),
@@ -1133,6 +1165,7 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
                 opt_num(r.change_pct()),
                 opt_num(r.target),
                 r.target_checked,
+                r.target_pending,
                 json_string(r.verdict.label()),
                 failed.join(","),
                 opt_str(r.verdict.reason()),

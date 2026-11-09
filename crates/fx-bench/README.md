@@ -394,7 +394,11 @@ For each metric whose `tiers` include `--tier`:
    below it, `higher` at or above it, `equal` only at it. The quick tier
    runs at a small scale, so it skips `lower` and `higher` targets (shown
    in parentheses) but still checks `equal` targets, which state
-   correctness rather than speed.
+   correctness rather than speed. While the baseline itself misses a
+   `lower` or `higher` target (memory far above its goal, say), the target
+   is pending: only the allowance holds the metric, so it can't get worse
+   while its fix is under way, and a pass that still misses the target
+   reads `PASS (target not yet met)`.
 5. The regression check compares with `quick_baseline` at the quick tier
    and `baseline` otherwise, allowing max(baseline × `allow_pct` / 100,
    `allow_floor`), or nothing when neither is set: `lower` fails above
@@ -402,7 +406,7 @@ For each metric whose `tiers` include `--tier`:
    no regression check. Without a baseline for the tier the verdict is
    `NO BASELINE`, which is not a failure: the first run sets the baseline.
 
-Verdicts: `PASS`; `FAIL (target)`, `FAIL (regression)` or
+Verdicts: `PASS` or `PASS (target not yet met)`; `FAIL (target)`, `FAIL (regression)` or
 `FAIL (target, regression)`; `NOT MEASURED (<reason>)`; `NO BASELINE`;
 `TRACKED (would be <verdict>)` for an ungated metric; `SKIPPED`.
 

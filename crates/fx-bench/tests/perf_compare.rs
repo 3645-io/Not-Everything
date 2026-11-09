@@ -211,6 +211,71 @@ fn a_target_miss_fails() {
     assert_eq!(row(&text, "S1")[5], "<= 16 ms");
 }
 
+/// While the baseline itself misses the target (0.3.1's memory at 1.5 GB
+/// against 200 MB), only the allowance holds the metric: the miss is shown,
+/// not failed, so every PR doesn't fail until the fix lands.
+#[test]
+fn a_target_the_baseline_misses_is_pending() {
+    let t = table(
+        "M1",
+        "footprint_mb",
+        "lower",
+        "pr rc",
+        "target = 200\nbaseline = 1500\nallow_pct = 5\n",
+    );
+    let out = compare(
+        "pr",
+        std::slice::from_ref(&t),
+        &["footprint_mb=1550\n"],
+        &[],
+    );
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert_eq!(verdict(&text, "M1"), "PASS (target not yet met)");
+    assert_eq!(
+        summary_line(&text),
+        "perf-compare: 1 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped"
+    );
+    // Past the allowance (1500 + 5% = 1575) it is still a regression.
+    let out = compare(
+        "pr",
+        std::slice::from_ref(&t),
+        &["footprint_mb=1600\n"],
+        &[],
+    );
+    assert_exit(&out, 1);
+    assert_eq!(verdict(&stdout(&out), "M1"), "FAIL (regression)");
+    // Meeting the target is a plain pass.
+    let out = compare("pr", &[t], &["footprint_mb=180\n"], &[]);
+    assert_exit(&out, 0);
+    assert_eq!(verdict(&stdout(&out), "M1"), "PASS");
+}
+
+/// Higher-is-better works the same way, and the JSON report says so.
+#[test]
+fn a_pending_target_shows_in_json() {
+    let t = table(
+        "H1",
+        "rate",
+        "higher",
+        "pr",
+        "target = 100\nbaseline = 50\nallow_pct = 10\n",
+    );
+    let out = compare("pr", &[t], &["rate=48\n"], &["--format", "json"]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert!(text.contains("\"target_pending\":true"), "{text}");
+}
+
+/// Without a baseline the target is the only check, so a miss fails.
+#[test]
+fn a_target_miss_without_a_baseline_fails() {
+    let t = table("B3", "burst_pct", "lower", "pr", "target = 100\n");
+    let out = compare("pr", &[t], &["burst_pct=150\n"], &[]);
+    assert_exit(&out, 1);
+    assert_eq!(verdict(&stdout(&out), "B3"), "FAIL (target)");
+}
+
 #[test]
 fn a_target_and_regression_miss_names_both() {
     let t = table(
@@ -537,7 +602,9 @@ fn the_quick_tier_uses_quick_baseline_and_ignores_targets() {
         "a_ms",
         "lower",
         "quick pr",
-        "target = 1.2\nbaseline = 9.3\nquick_baseline = 1.0\nallow_floor = 0.5\n",
+        // The pr baseline meets the target, so the target is enforced there
+        // (a baseline that misses it would leave only the allowance).
+        "target = 1.2\nbaseline = 1.1\nquick_baseline = 1.0\nallow_floor = 0.5\n",
     );
     // 1.4 is over the target but within quick_baseline + floor (1.5).
     let quick = compare("quick", std::slice::from_ref(&t), &["a_ms=1.4\n"], &[]);
