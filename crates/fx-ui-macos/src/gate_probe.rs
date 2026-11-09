@@ -23,6 +23,9 @@
 //! per criterion, as `fx_bench::gate::parse_gate_lines` reads it. A criterion
 //! without samples is a FAIL line, never a missing one; percentiles are
 //! nearest-rank ([`fx_bench::Stats`]); a value exactly at its budget passes.
+//! After the GATE lines come the measured values as `key=value` lines
+//! ([`GateProbe::metric_lines`]) for the performance gate's script; the
+//! lines before them are unchanged, as `scripts/phase1-gate.sh` reads them.
 //!
 //! The probe only reads the index and writes its own report file, which it
 //! creates: it never replaces an existing file, so the app stays read-only.
@@ -231,6 +234,30 @@ impl GateProbe {
             out.push_str(&line);
             out.push('\n');
         }
+        for line in self.metric_lines() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The measured values as `key=value` lines, after the GATE lines:
+    /// `launch_ms` (process start to the first result painted),
+    /// `keystroke_p95_ms`, `scroll_p95_ms` (the autoscroll frame p95) and
+    /// `ui_entries`. A value without samples has no line, so a script never
+    /// reads a made-up number.
+    pub fn metric_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(d) = self.first_result {
+            out.push(format!("launch_ms={:.2}", ms(d)));
+        }
+        if let Some(s) = self.keystroke_stats() {
+            out.push(format!("keystroke_p95_ms={:.2}", ms(s.p95)));
+        }
+        if let Some(s) = self.frames.stats() {
+            out.push(format!("scroll_p95_ms={:.2}", ms(s.p95)));
+        }
+        out.push(format!("ui_entries={}", self.entries));
         out
     }
 
@@ -238,22 +265,30 @@ impl GateProbe {
     /// only that file is written, and a file already at `path` is never
     /// replaced (the error is [`std::io::ErrorKind::AlreadyExists`]).
     pub fn write_report(&self, path: &Path) -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        file.write_all(self.report_text().as_bytes())
+        write_new_file(path, &self.report_text())
     }
 }
 
-fn gate_line(criterion: &str, pass: bool, detail: &str) -> String {
+/// Writes `text` to `path`, a new file: a probe only ever creates its own
+/// report, so a file already at `path` is never replaced (the error is
+/// [`std::io::ErrorKind::AlreadyExists`]) and the app stays read-only.
+pub(crate) fn write_new_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(text.as_bytes())
+}
+
+/// A `GATE <criterion>: PASS|FAIL (<detail>)` line.
+pub(crate) fn gate_line(criterion: &str, pass: bool, detail: &str) -> String {
     let verdict = if pass { "PASS" } else { "FAIL" };
     format!("GATE {criterion}: {verdict} ({detail})")
 }
 
 /// A duration in milliseconds.
-fn ms(d: Duration) -> f64 {
+pub(crate) fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
 }
 
@@ -287,7 +322,7 @@ pub struct Observed {
 impl Observed {
     /// Whether a page applied at or after `since` has been painted; returns
     /// the paint time.
-    fn painted_since(&self, since: Instant) -> Option<Instant> {
+    pub fn painted_since(&self, since: Instant) -> Option<Instant> {
         let applied = self.last_applied.filter(|&a| a >= since)?;
         self.last_draw.filter(|&d| d >= applied)
     }

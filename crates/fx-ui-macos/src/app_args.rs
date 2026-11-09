@@ -7,10 +7,15 @@
 //! options that change files: the app is read-only.
 //!
 //! The measurement options (`--synthetic`, `--page-cost-ms`, `--autoscroll`,
-//! `--launch-probe` and `--gate-probe`) exist only in builds with the
+//! `--launch-probe`, `--gate-probe`, `--summon-probe`, `--sort-probe`,
+//! `--data-dir`, `--window` and `--query`) exist only in builds with the
 //! `measure` feature, which the gate scripts turn on. Release builds leave it
 //! off, so they reject those options as unknown and carry none of the code
 //! behind them.
+//!
+//! The app keeps its stores and settings in one data folder,
+//! [`app_data_folder`] under the home folder, or with `--data-dir` a folder
+//! of the measurement's own ([`AppArgs::data_folder`]).
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +33,8 @@ usage: fx-ui-macos [--root PATH]
 #[cfg(feature = "measure")]
 pub const USAGE: &str = "\
 usage: fx-ui-macos [--root PATH] [--synthetic N] [--page-cost-ms MS] [--autoscroll] [--launch-probe]
-                   [--gate-probe OUT]
+                   [--gate-probe OUT | --summon-probe OUT | --sort-probe OUT]
+                   [--data-dir DIR] [--window hidden|search] [--query TEXT]
 
   --root PATH         folder or volume to index (default /)
   --synthetic N       show N synthetic rows instead of an index (for measuring)
@@ -38,7 +44,21 @@ usage: fx-ui-macos [--root PATH] [--synthetic N] [--page-cost-ms MS] [--autoscro
   --gate-probe OUT    Phase 1 gate probe over the real index for --root: time to
                       the first result painted, keystroke to repaint and
                       autoscroll frames; write GATE lines to OUT, a new file,
-                      then exit (not with --synthetic)";
+                      then exit (not with --synthetic)
+  --summon-probe OUT  hide the window as Escape does and show it as the global
+                      hotkey does, 50 times; write the shortcut-to-ready-window
+                      times to OUT, a new file, then exit
+  --sort-probe OUT    with every entry listed, sort by every column both ways
+                      (one untimed round, then 5 timed rounds); write the
+                      re-sort-to-repaint times to OUT, a new file, then exit
+  --data-dir DIR      keep the stores and settings in DIR, an existing folder,
+                      instead of the app's data folder; register no global
+                      hotkey and no login item
+  --window hidden|search
+                      start hidden as Escape hides the window, or showing the
+                      search --query TEXT, then run until quit or SIGTERM (not
+                      with --autoscroll, --launch-probe or a probe)
+  --query TEXT        the search --window search shows";
 
 /// The root indexed when `--root` is not given.
 pub const DEFAULT_ROOT: &str = "/";
@@ -48,6 +68,21 @@ pub const DEFAULT_ROOT: &str = "/";
 /// It holds the stores and the settings file, and only its owner may open
 /// it ([`crate::data_folder`]).
 pub const APP_FOLDER: &str = fx_channel::Channel::CURRENT.data_folder();
+
+/// The window a `--window` run starts with (`measure` builds only). Such a
+/// run is not a measurement that exits: the resident app starts in this
+/// state and runs until it is quit or gets SIGTERM, while a script samples
+/// its CPU, energy and memory.
+#[cfg(feature = "measure")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowStart {
+    /// `--window hidden`: once launched, the window is hidden as Escape
+    /// hides it, and stays hidden.
+    Hidden,
+    /// `--window search --query TEXT`: the window shows with TEXT in the
+    /// search field and its results listed.
+    Search(String),
+}
 
 /// Parsed options of the app binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +109,23 @@ pub struct AppArgs {
     /// `--synthetic`.
     #[cfg(feature = "measure")]
     pub gate_probe: Option<PathBuf>,
+    /// Run the shortcut probe (`crate::summon_probe`) and write its report
+    /// to this new file, then exit (`--summon-probe`).
+    #[cfg(feature = "measure")]
+    pub summon_probe: Option<PathBuf>,
+    /// Run the re-sort probe (`crate::sort_probe`) and write its report to
+    /// this new file, then exit (`--sort-probe`).
+    #[cfg(feature = "measure")]
+    pub sort_probe: Option<PathBuf>,
+    /// Keep the stores and settings in this existing folder instead of the
+    /// app's data folder (`--data-dir`), so a measurement run never touches
+    /// the daily app's index or settings. Such a run also registers no
+    /// global hotkey and no login item, so it never takes the daily app's.
+    #[cfg(feature = "measure")]
+    pub data_dir: Option<PathBuf>,
+    /// The window the resident app starts with (`--window`, `--query`).
+    #[cfg(feature = "measure")]
+    pub window: Option<WindowStart>,
 }
 
 impl Default for AppArgs {
@@ -90,16 +142,25 @@ impl Default for AppArgs {
             launch_probe: false,
             #[cfg(feature = "measure")]
             gate_probe: None,
+            #[cfg(feature = "measure")]
+            summon_probe: None,
+            #[cfg(feature = "measure")]
+            sort_probe: None,
+            #[cfg(feature = "measure")]
+            data_dir: None,
+            #[cfg(feature = "measure")]
+            window: None,
         }
     }
 }
 
 impl AppArgs {
-    /// Whether the app runs a measurement (`--autoscroll`, `--launch-probe`
-    /// or `--gate-probe`) and exits, rather than running resident.
+    /// Whether the app runs a measurement (`--autoscroll`, `--launch-probe`,
+    /// `--gate-probe`, `--summon-probe` or `--sort-probe`) and exits, rather
+    /// than running resident. A `--window` run is resident.
     #[cfg(feature = "measure")]
     pub fn measuring(&self) -> bool {
-        self.autoscroll || self.launch_probe || self.gate_probe.is_some()
+        self.measurements().next().is_some()
     }
 
     /// Whether the app runs a measurement and exits: never, in a build
@@ -107,6 +168,47 @@ impl AppArgs {
     #[cfg(not(feature = "measure"))]
     pub fn measuring(&self) -> bool {
         false
+    }
+
+    /// The measurement options given, by name.
+    #[cfg(feature = "measure")]
+    fn measurements(&self) -> impl Iterator<Item = &'static str> {
+        [
+            ("--autoscroll", self.autoscroll),
+            ("--launch-probe", self.launch_probe),
+            ("--gate-probe", self.gate_probe.is_some()),
+            ("--summon-probe", self.summon_probe.is_some()),
+            ("--sort-probe", self.sort_probe.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+    }
+
+    /// The folder `--data-dir` gave.
+    #[cfg(feature = "measure")]
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    /// The folder `--data-dir` gave: never, in a build without the
+    /// `measure` feature.
+    #[cfg(not(feature = "measure"))]
+    pub fn data_dir(&self) -> Option<&Path> {
+        None
+    }
+
+    /// Whether this run has a data folder of its own (`--data-dir`): it then
+    /// registers no global hotkey and no login item, so a measurement build
+    /// never takes the daily app's shortcut.
+    pub fn has_data_dir(&self) -> bool {
+        self.data_dir().is_some()
+    }
+
+    /// Where this run keeps its stores and settings: the `--data-dir`
+    /// folder, or the app's data folder under `home` ([`app_data_folder`]).
+    pub fn data_folder(&self, home: &Path) -> PathBuf {
+        self.data_dir()
+            .map_or_else(|| app_data_folder(home), Path::to_path_buf)
     }
 }
 
@@ -142,6 +244,9 @@ impl AppArgs {
         S: Into<String>,
     {
         let mut out = AppArgs::default();
+        // `--window` and `--query` are checked together after the loop.
+        #[cfg(feature = "measure")]
+        let (mut window, mut query): (Option<String>, Option<String>) = (None, None);
         let mut it = args.into_iter().map(Into::into);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -174,6 +279,30 @@ impl AppArgs {
                     }
                     out.gate_probe = Some(PathBuf::from(value));
                 }
+                #[cfg(feature = "measure")]
+                "--summon-probe" => out.summon_probe = Some(output_path(&arg, it.next())?),
+                #[cfg(feature = "measure")]
+                "--sort-probe" => out.sort_probe = Some(output_path(&arg, it.next())?),
+                #[cfg(feature = "measure")]
+                "--data-dir" => out.data_dir = Some(existing_folder(&arg, it.next())?),
+                #[cfg(feature = "measure")]
+                "--window" => {
+                    let value = it.next().unwrap_or_default();
+                    if value != "hidden" && value != "search" {
+                        return Err(AppArgsError::new(format!(
+                            "--window needs hidden or search, got {value:?}"
+                        )));
+                    }
+                    window = Some(value);
+                }
+                #[cfg(feature = "measure")]
+                "--query" => {
+                    let value = it.next().unwrap_or_default();
+                    if value.is_empty() {
+                        return Err(AppArgsError::new("--query needs non-empty text"));
+                    }
+                    query = Some(value);
+                }
                 other if other.starts_with('-') => {
                     return Err(AppArgsError::new(format!("unknown option {other:?}")));
                 }
@@ -183,13 +312,94 @@ impl AppArgs {
             }
         }
         #[cfg(feature = "measure")]
-        if out.gate_probe.is_some() && out.synthetic.is_some() {
+        {
+            out.window = window_start(window, query)?;
+            out.check_measurements()?;
+        }
+        Ok(out)
+    }
+
+    /// Refuses the measurement options that cannot run together.
+    #[cfg(feature = "measure")]
+    fn check_measurements(&self) -> Result<(), AppArgsError> {
+        if self.gate_probe.is_some() && self.synthetic.is_some() {
             return Err(AppArgsError::new(
                 "--gate-probe measures the real index and cannot be combined with --synthetic",
             ));
         }
-        Ok(out)
+        let given: Vec<&str> = self.measurements().collect();
+        if self.window.is_some() {
+            if let Some(other) = given.first() {
+                // A `--window` run stays up to be sampled; a measurement
+                // drives the window and quits.
+                return Err(AppArgsError::new(format!(
+                    "--window starts the app to be sampled and cannot be combined with {other}"
+                )));
+            }
+        }
+        // The shortcut and re-sort probes drive the window on their own: a
+        // second measurement in the same run would time its work into
+        // theirs. (`--autoscroll` with `--launch-probe` or `--gate-probe`
+        // predates them and is left as it was.)
+        let own = ["--summon-probe", "--sort-probe"];
+        if let Some(probe) = given.iter().find(|m| own.contains(m)) {
+            if let Some(other) = given.iter().find(|m| *m != probe) {
+                return Err(AppArgsError::new(format!(
+                    "{probe} is a measurement of its own and cannot be combined with {other}"
+                )));
+            }
+        }
+        Ok(())
     }
+}
+
+/// The start window from the values of `--window` and `--query`: `search`
+/// needs a query, and a query needs `search`.
+#[cfg(feature = "measure")]
+fn window_start(
+    window: Option<String>,
+    query: Option<String>,
+) -> Result<Option<WindowStart>, AppArgsError> {
+    match (window.as_deref(), query) {
+        (None, None) => Ok(None),
+        (Some("search"), Some(text)) => Ok(Some(WindowStart::Search(text))),
+        (Some("search"), None) => Err(AppArgsError::new("--window search needs --query TEXT")),
+        (_, Some(_)) => Err(AppArgsError::new(
+            "--query needs --window search, which shows it",
+        )),
+        (Some(_), None) => Ok(Some(WindowStart::Hidden)),
+    }
+}
+
+/// Parses the value of `opt` as a report path: any non-empty path. The
+/// probe creates the file and never replaces one.
+#[cfg(feature = "measure")]
+fn output_path(opt: &str, value: Option<String>) -> Result<PathBuf, AppArgsError> {
+    match value {
+        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        Some(_) => Err(AppArgsError::new(format!(
+            "{opt} needs a non-empty output path"
+        ))),
+        None => Err(AppArgsError::new(format!("{opt} needs an output path"))),
+    }
+}
+
+/// Parses the value of `opt` as an existing folder. It is never created
+/// here: a mistyped path must not leave a new folder behind.
+#[cfg(feature = "measure")]
+fn existing_folder(opt: &str, value: Option<String>) -> Result<PathBuf, AppArgsError> {
+    let value = value.ok_or_else(|| AppArgsError::new(format!("{opt} needs a folder")))?;
+    if value.is_empty() {
+        return Err(AppArgsError::new(format!("{opt} needs a non-empty folder")));
+    }
+    let path = PathBuf::from(value);
+    if !path.is_dir() {
+        return Err(AppArgsError::new(format!(
+            "{opt} {} is not an existing folder",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 /// Parses the value of `opt` as a row count: a decimal integer from 1 to
@@ -237,12 +447,26 @@ fn millis(opt: &str, value: Option<String>) -> Result<u64, AppArgsError> {
     Ok(ms)
 }
 
+/// The app's data folder for the home folder `home`:
+/// `<home>/Library/Application Support/Not-Everything/` ([`APP_FOLDER`]). It
+/// holds the stores and the settings file.
+pub fn app_data_folder(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join(APP_FOLDER)
+}
+
 /// Where the engine store for `root` lives:
 /// `<home>/Library/Application Support/Not-Everything/stores/<file>`, with
 /// a file name derived from the root path (a readable last component plus a
 /// stable 64-bit FNV-1a hash of the whole path), so each root has its own
 /// store and the same root finds its store again on the next launch.
 pub fn store_path(home: &Path, root: &Path) -> PathBuf {
+    store_path_in(&app_data_folder(home), root, StoreScope::Full)
+}
+
+/// The store file name for `root`: see [`store_path`].
+fn store_file_name(root: &Path) -> String {
     let label: String = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -252,11 +476,7 @@ pub fn store_path(home: &Path, root: &Path) -> PathBuf {
         .take(32)
         .collect();
     let hash = fnv1a(&path_bytes(root));
-    home.join("Library")
-        .join("Application Support")
-        .join(APP_FOLDER)
-        .join("stores")
-        .join(format!("{label}-{hash:016x}.fxstore"))
+    format!("{label}-{hash:016x}.fxstore")
 }
 
 /// The access scope a checkpoint store was built in.
@@ -295,18 +515,20 @@ impl StoreScope {
 /// shares a path with any root's full store. (Limited mode arrived together
 /// with this split, so no release wrote a limited store to the full path.)
 pub fn store_path_for(home: &Path, root: &Path, scope: StoreScope) -> PathBuf {
-    let full = store_path(home, root);
-    match scope {
-        StoreScope::Full => full,
-        StoreScope::Limited => {
-            let file = full.file_name().map(ToOwned::to_owned).unwrap_or_default();
-            home.join("Library")
-                .join("Application Support")
-                .join(APP_FOLDER)
-                .join("stores-limited")
-                .join(file)
-        }
-    }
+    store_path_in(&app_data_folder(home), root, scope)
+}
+
+/// Where the engine store for `root` built in `scope` lives in the data
+/// folder `data`: `data/stores/<file>` for [`StoreScope::Full`] and
+/// `data/stores-limited/<file>` for [`StoreScope::Limited`], with the file
+/// name of [`store_path`]. [`store_path_for`] is this in
+/// [`app_data_folder`]; a `--data-dir` run passes its own folder.
+pub fn store_path_in(data: &Path, root: &Path, scope: StoreScope) -> PathBuf {
+    let folder = match scope {
+        StoreScope::Full => "stores",
+        StoreScope::Limited => "stores-limited",
+    };
+    data.join(folder).join(store_file_name(root))
 }
 
 #[cfg(unix)]

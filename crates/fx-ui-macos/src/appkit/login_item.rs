@@ -4,11 +4,42 @@
 //! example with `cargo run`) [`status`] reports
 //! [`LoginItemStatus::Unavailable`] and [`set_enabled`] returns an error
 //! instead of calling into ServiceManagement. Nothing here panics.
+//!
+//! A measurement run with a data folder of its own (`--data-dir`, `measure`
+//! builds only) calls `keep_off` first: the login item belongs to the
+//! bundle, so such a run must neither register nor remove the daily app's.
 
 use std::fmt;
 use std::path::Path;
+#[cfg(feature = "measure")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+/// Set by [`keep_off`].
+#[cfg(feature = "measure")]
+static KEPT_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Keeps this process away from the login item: [`status`] reports
+/// [`LoginItemStatus::Unavailable`], so the menu item and the Settings
+/// switch are disabled, and [`set_enabled`] refuses.
+#[cfg(feature = "measure")]
+pub fn keep_off() {
+    KEPT_OFF.store(true, Ordering::Relaxed);
+}
+
+/// Whether `keep_off` was called; never in a build without the `measure`
+/// feature.
+fn kept_off() -> bool {
+    #[cfg(feature = "measure")]
+    {
+        KEPT_OFF.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "measure"))]
+    {
+        false
+    }
+}
 
 /// The state of the app's login item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +106,7 @@ fn running_bundled() -> bool {
 
 /// The current state of the app's login item.
 pub fn status() -> LoginItemStatus {
-    if !running_bundled() {
+    if kept_off() || !running_bundled() {
         return LoginItemStatus::Unavailable;
     }
     // SAFETY: plain class method returning the app's service object.
@@ -98,6 +129,9 @@ pub fn status() -> LoginItemStatus {
 /// A readable message when not running bundled or when ServiceManagement
 /// refuses.
 pub fn set_enabled(on: bool) -> Result<LoginItemStatus, String> {
+    if kept_off() {
+        return Err("unavailable in a measurement run with its own data folder".to_string());
+    }
     if !running_bundled() {
         return Err(LoginItemStatus::Unavailable.to_string());
     }
@@ -140,5 +174,16 @@ mod tests {
         assert!(!LoginItemStatus::NotRegistered.is_on());
         assert!(!LoginItemStatus::NotFound.is_on());
         assert!(!LoginItemStatus::Unavailable.is_on());
+    }
+
+    /// A `--data-dir` run neither registers nor removes the login item,
+    /// whatever asks it to.
+    #[cfg(feature = "measure")]
+    #[test]
+    fn kept_off_reports_unavailable_and_refuses_every_change() {
+        keep_off();
+        assert_eq!(status(), LoginItemStatus::Unavailable);
+        assert!(set_enabled(true).is_err());
+        assert!(set_enabled(false).is_err());
     }
 }

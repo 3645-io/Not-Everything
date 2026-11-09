@@ -43,6 +43,11 @@
 //! it. It is a regular app with a Dock icon and its own menu bar
 //! ([`crate::main_menu`]), plus a Settings window for the appearance and the
 //! Dock icon (see `settings_window.rs`).
+//!
+//! In a `measure` build the window also runs the measurements: the launch
+//! and gate probes and autoscroll from a display-rate timer (`classes.rs`),
+//! and the shortcut and re-sort probes and the `--window` start states from
+//! a timer of their own (`probes.rs`).
 
 mod callout;
 mod card;
@@ -51,6 +56,8 @@ mod classes;
 #[cfg(debug_assertions)]
 mod debug_script;
 pub mod paint;
+#[cfg(feature = "measure")]
+mod probes;
 mod resident;
 mod ribbon;
 mod settings_controls;
@@ -131,6 +138,18 @@ pub struct WindowConfig {
     /// report to this new file and exit.
     #[cfg(feature = "measure")]
     pub gate_probe: Option<PathBuf>,
+    /// Run the shortcut probe (`crate::summon_probe::SummonRun`), write its
+    /// report to this new file and exit.
+    #[cfg(feature = "measure")]
+    pub summon_probe: Option<PathBuf>,
+    /// Run the re-sort probe (`crate::sort_probe::SortRun`), write its
+    /// report to this new file and exit.
+    #[cfg(feature = "measure")]
+    pub sort_probe: Option<PathBuf>,
+    /// Start hidden, or showing a search (`--window`); the resident app then
+    /// runs as usual.
+    #[cfg(feature = "measure")]
+    pub window_start: Option<crate::app_args::WindowStart>,
     /// Recorded as early as possible in `main`; the measurement modes time
     /// the launch from it.
     pub process_start: Instant,
@@ -174,6 +193,10 @@ pub fn run(config: WindowConfig) -> Result<(), WindowError> {
 
     #[cfg(feature = "measure")]
     let measuring = config.autoscroll || config.launch_probe || config.gate_probe.is_some();
+    #[cfg(feature = "measure")]
+    let mut config = config;
+    #[cfg(feature = "measure")]
+    let probe = probes::Probe::take(&mut config);
     let title = config.title.clone();
     let controller = WinController::new(mtm, config);
     let ui = build_window(mtm, &controller, &title, resident);
@@ -189,6 +212,10 @@ pub fn run(config: WindowConfig) -> Result<(), WindowError> {
     app.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
     controller.start_resident();
 
+    #[cfg(feature = "measure")]
+    if let Some(probe) = probe {
+        probe.start(mtm, &controller);
+    }
     #[cfg(feature = "measure")]
     if measuring {
         let fps = NSScreen::mainScreen(mtm)
@@ -411,6 +438,9 @@ mod tests {
             autoscroll: false,
             launch_probe: false,
             gate_probe: None,
+            summon_probe: None,
+            sort_probe: None,
+            window_start: None,
             process_start: Instant::now(),
             resident: None,
         };

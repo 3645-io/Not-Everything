@@ -39,14 +39,28 @@
 //! (pass, fail or not measured) and the markdown `summary.md`; the binary's
 //! `phase1-summary` subcommand uses it.
 //!
-//! The crate uses only the standard library.
+//! The [`perf`] module holds the performance gate's comparison: a hand-parsed
+//! TOML baseline of metrics with targets and allowed regressions, the
+//! `key=value` metrics files the benchmarks write, and one verdict per
+//! metric; the binary's `perf-compare` subcommand uses it. Two tools feed
+//! it: [`sample`] reads a running process's CPU, energy, wakeups, disk
+//! writes and memory from the kernel (`sample`, macOS only), and [`churn`]
+//! creates, renames and deletes files in a new folder at a steady seeded
+//! rate (`churn`) so the app can be measured while files change.
+//!
+//! The crate uses only the standard library (on macOS, `sample` also calls
+//! libSystem through its own `extern "C"` declarations).
 
+pub mod churn;
 pub mod gate;
 pub mod gate1;
 mod harness;
 mod materialize;
 mod names;
+pub mod perf;
+pub mod release;
 mod rng;
+pub mod sample;
 mod tree;
 
 pub use gate::{GateLine, GateRow, Verdict, parse_gate_lines};

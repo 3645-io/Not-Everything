@@ -1,0 +1,500 @@
+# Performance gate baseline, read by `fx-bench perf-compare` and
+# `fx-bench perf-release`.
+#
+# One table per metric of docs/gates/performance.md: the key that
+# scripts/perf-check.sh writes to metrics.txt, the target, the allowance, the
+# tiers that measure it and the baseline it is compared with. The quick tier
+# compares with `quick_baseline` (200,000 entries) and checks no targets; the
+# pr and rc tiers compare with `baseline` at gate scale.
+#
+# The baseline moves only at a release, from the release candidate's run
+# (`fx-bench perf-compare --print-values`), or by an exception the owner
+# approved, recorded in the metric's `exception` with the pull request. Never
+# edit it to make a check pass (.agents/rules/performance.md).
+#
+# MB is 1,048,576 bytes, as Activity Monitor counts them.
+
+[meta]
+machine = "Apple M4 Pro, 24 GB, macOS 27"
+cache = "warm"
+build = "0.3.2"
+date = "2026-11-09"
+# The rows of the summary table in a release's notes (fx-bench perf-release).
+summary = "B1 B4 B7 B2 M1 S1 S5 F1 F6 F2"
+# Measured on the run 2.18 branch at c2622ca, whose app code is 0.3.2's
+# plus measurement-only flags, with scripts/perf-check.sh --tier pr and
+# --tier quick. The pr run started under load (about 9).
+
+# --- Background cost --------------------------------------------------------
+
+[B1]
+name = "CPU, window hidden"
+key = "hidden_cpu_pct"
+unit = "% of a core"
+better = "lower"
+target = 1
+allow_pct = 10
+allow_floor = 0.05
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 10.389
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[B2]
+name = "CPU, window showing a search"
+key = "search_cpu_pct"
+unit = "% of a core"
+better = "lower"
+target = 5
+allow_pct = 10
+allow_floor = 0.05
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 141.16
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# The busiest interval varies a lot between runs, so its allowance is wide.
+[B3]
+name = "CPU, busiest 10 s"
+key = "cpu_max_interval_pct"
+unit = "% of a core"
+better = "lower"
+target = 100
+allow_pct = 25
+aggregate = "max"
+tiers = "pr rc"
+baseline = 147.794
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[B4]
+name = "CPU energy, window hidden"
+key = "hidden_energy_mw"
+unit = "mW"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 5
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 68.284
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[B5]
+name = "CPU energy, window showing a search"
+key = "search_energy_mw"
+unit = "mW"
+better = "lower"
+target = 250
+allow_pct = 10
+allow_floor = 5
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 2721.681
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[B6]
+name = "Wakeups a second, window hidden"
+key = "hidden_wakeups_per_s"
+unit = "per s"
+better = "lower"
+target = 2
+allow_pct = 10
+allow_floor = 0.5
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 3.032
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[B7]
+name = "Disk writes a day"
+key = "disk_written_per_day_mb"
+unit = "MB"
+better = "lower"
+target = 512
+allow_pct = 5
+allow_floor = 10
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 0
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# --- Memory -----------------------------------------------------------------
+
+[M1]
+name = "Memory, window hidden"
+key = "hidden_footprint_mb"
+unit = "MB"
+better = "lower"
+target = 200
+allow_pct = 5
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 1280.6
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[M2]
+name = "Memory, window showing a search"
+key = "search_footprint_mb"
+unit = "MB"
+better = "lower"
+target = 250
+allow_pct = 5
+aggregate = "mean"
+tiers = "pr rc"
+baseline = 1345.3
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[M3]
+name = "Memory peak, first scan"
+key = "first_scan_footprint_max_mb"
+unit = "MB"
+better = "lower"
+target = 500
+allow_pct = 5
+aggregate = "max"
+tiers = "pr rc"
+baseline = 2175
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[M4]
+name = "Index in memory, per file"
+key = "bytes_per_entry"
+unit = "B"
+better = "lower"
+target = 100
+allow_pct = 5
+aggregate = "max"
+tiers = "quick pr rc"
+baseline = 87.63
+quick_baseline = 85.25
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[M5]
+name = "Saved index on disk, per file"
+key = "store_bytes_per_entry"
+unit = "B"
+better = "lower"
+target = 100
+allow_pct = 5
+aggregate = "max"
+scale_key = "startup_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+baseline = 79.8
+quick_baseline = 79.8
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# --- Search speed -----------------------------------------------------------
+
+[S1]
+name = "Search, 2M files (p95)"
+key = "engine_ms"
+unit = "ms"
+better = "lower"
+target = 16
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+baseline = 7.129
+quick_baseline = 0.987
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S2]
+name = "Search, 5M files (p95)"
+key = "engine_5m_ms"
+unit = "ms"
+better = "lower"
+target = 30
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_5m_entries"
+scale_min = 5000000
+tiers = "pr rc"
+baseline = 17.169
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S3]
+name = "Regex search, 2M files (p95)"
+key = "regex_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+baseline = 63.934
+quick_baseline = 6.798
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S4]
+name = "Full-path search, 2M files (p95)"
+key = "fullpath_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+baseline = 26.235
+quick_baseline = 2.627
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S5]
+name = "Keystroke to results (p95)"
+key = "keystroke_p95_ms"
+unit = "ms"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+baseline = 42.55
+quick_baseline = 24.96
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S6]
+name = "Re-sort a column (p95)"
+key = "sort_p95_ms"
+unit = "ms"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "sort_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+baseline = 20.06
+quick_baseline = 8.47
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[S7]
+name = "Scroll frame time (p95)"
+key = "scroll_p95_ms"
+unit = "ms"
+better = "lower"
+target = 8.3
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+baseline = 1.14
+quick_baseline = 1.02
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# --- Freshness and start-up -------------------------------------------------
+
+[F1]
+name = "New file shown (p99)"
+key = "freshness_p99_ms"
+unit = "ms"
+better = "lower"
+target = 1000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "freshness_ops"
+scale_min = 1000
+tiers = "quick pr rc"
+baseline = 187.125
+quick_baseline = 187.083
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[F2]
+name = "Launch to first result"
+key = "launch_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+allow_pct = 10
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+baseline = 1043.25
+quick_baseline = 190.93
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[F3]
+name = "Shortcut to window ready (p95)"
+key = "summon_p95_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 2
+aggregate = "median"
+scale_key = "summon_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+baseline = 11.17
+quick_baseline = 10.54
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[F4]
+name = "First scan of the disk"
+key = "first_run_ms"
+unit = "ms"
+better = "lower"
+target = 15000
+allow_pct = 10
+aggregate = "median"
+scale_key = "first_run_entries"
+scale_min = 1500000
+tiers = "pr rc"
+baseline = 18959
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# Tracked until the first scan shows results as it goes.
+[F5]
+name = "First results during the first scan"
+key = "first_result_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+aggregate = "median"
+scale_key = "first_run_entries"
+scale_min = 1500000
+tiers = "pr rc"
+baseline = 18959.41
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+gated = false
+
+[F6]
+name = "Catch-up after a relaunch"
+key = "catchup_ms"
+unit = "ms"
+better = "lower"
+target = 10000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "catchup_changes"
+scale_min = 10000
+tiers = "quick pr rc"
+baseline = 514.649
+quick_baseline = 344.339
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+[F6u]
+name = "Search usable after a relaunch"
+key = "catchup_usable_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "catchup_changes"
+scale_min = 10000
+tiers = "quick pr rc"
+baseline = 13.032
+quick_baseline = 1.507
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+
+# --- Correctness: no allowance ------------------------------------------------
+
+[C1]
+name = "File changes missed"
+key = "freshness_missed"
+unit = "count"
+better = "lower"
+target = 0
+aggregate = "max"
+tiers = "quick pr rc"
+baseline = 0
+quick_baseline = 0
+
+[C2]
+name = "Catch-up equals a fresh scan"
+key = "catchup_equal"
+unit = "bool"
+better = "higher"
+target = 1
+aggregate = "min"
+tiers = "quick pr rc"
+baseline = 1
+quick_baseline = 1
+
+# Tracked until the 24 h soak test is built.
+[C3]
+name = "Differences after a 24 h soak"
+key = "soak_differences"
+unit = "count"
+better = "lower"
+target = 0
+aggregate = "max"
+tiers = "rc"
+gated = false
+
+# --- Optional -----------------------------------------------------------------
+
+[O1]
+name = "DMG size"
+key = "dmg_bytes"
+unit = "bytes"
+better = "lower"
+allow_pct = 5
+aggregate = "last"
+tiers = "rc"
+baseline = 4200468
+baseline_build = "0.3.2 release"
+baseline_date = "2026-11-09"
+
+# Tracked only.
+[O2]
+name = "Command-line search, 2M files"
+key = "cli_query_ms"
+unit = "ms"
+better = "lower"
+target = 100
+aggregate = "median"
+scale_key = "cli_entries"
+scale_min = 2000000
+tiers = "quick pr"
+baseline = 581.87
+quick_baseline = 33.32
+baseline_build = "0.3.2"
+baseline_date = "2026-11-09"
+gated = false
