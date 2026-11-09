@@ -46,12 +46,33 @@ fn cmd_return_reveals_in_finder() {
     );
 }
 
+fn option_cmd() -> Modifiers {
+    Modifiers {
+        command: true,
+        option: true,
+        ..Modifiers::default()
+    }
+}
+
 #[test]
-fn cmd_c_copies_the_full_path() {
+fn option_cmd_c_copies_the_full_path() {
+    // Finder's shortcut for copying a pathname.
     assert_eq!(
-        action_for_key(Key::Char('c'), cmd()),
+        action_for_key(Key::Char('c'), option_cmd()),
         Some(Action::CopyPath)
     );
+}
+
+#[test]
+fn cmd_c_in_the_results_copies_nothing() {
+    // Cmd+C is kept for copying the files themselves, as in Finder, which
+    // is not built yet; until then only Option+Cmd+C copies, and only paths.
+    for mods in all_modifiers() {
+        if mods == option_cmd() {
+            continue;
+        }
+        assert_eq!(action_for_key(Key::Char('c'), mods), None, "{mods:?}");
+    }
 }
 
 #[test]
@@ -212,13 +233,15 @@ fn the_search_field_never_opens_on_return() {
 
 #[test]
 fn other_keys_belong_to_the_search_field() {
-    // Typing, deleting and Cmd+C (copy the field's text) stay the field's.
+    // Typing, deleting, Cmd+C (copy the field's text) and Option+Cmd+C stay
+    // the field's.
     let shift = Modifiers {
         shift: true,
         ..Modifiers::default()
     };
     for (key, mods) in [
         (Key::Char('c'), cmd()),
+        (Key::Char('c'), option_cmd()),
         (Key::Char('a'), none()),
         (Key::Backspace, none()),
         (Key::Delete, cmd()),

@@ -261,7 +261,7 @@ Keys and actions (all read-only):
 | --- | --- |
 | Return / Enter in the results, double-click | Open the selection with its default app (at most 20 items) |
 | Cmd+Return / Cmd+Enter | Reveal the selection in Finder |
-| Cmd+C (Edit > Copy) | Copy the selection's full paths, one per line |
+| Option+Cmd+C | Copy the selection's full paths, one per line. Cmd+C and Edit > Copy do nothing in the results; Cmd+C will copy the files themselves, as in Finder, in a later version |
 | Return / Enter or Down arrow in the search field | Move into the results, selecting the first row (nothing happens with no results) |
 | Escape in the search field | Clear the search; with the field already empty, hide the window and go back to the previous app |
 | Escape in the results | Clear the search and move back to the field; with the field empty, hide the window and go back to the previous app |
