@@ -48,7 +48,19 @@
 //!   modes;
 //! - in a throwaway git repository, each mode refuses the wrong branch, a
 //!   dirty tree and the tag states the release flow rules out, and numbers
-//!   release candidates and betas after the highest existing tag.
+//!   release candidates and betas after the highest existing tag;
+//! - `--perf PERF_DIR` (a `scripts/perf-check.sh --tier rc` run) takes one
+//!   folder and no beta; `--publish` of a release candidate or a release
+//!   needs it, `--resume` included. Before anything is fetched or built the
+//!   script refuses a run without `metrics.txt`, `summary.md` or `run.txt`,
+//!   of another tier or commit, with uncommitted changes, or whose last
+//!   `perf-compare:` line has a failing or unmeasured metric, and a version
+//!   whose previous release (the highest `release/vX.Y.Z` tag below it) has
+//!   no `docs/gates/releases/<X.Y.Z>.txt`. The release build includes
+//!   fx-bench, which is not shipped; once the disk image is final,
+//!   `perf_section` writes `perf-metrics.txt` (with `dmg_bytes`) and runs
+//!   `fx-bench perf-release`, and `release_notes` puts its table after the
+//!   CHANGELOG.md entry.
 //!
 //! The behaviour tests never build, sign or contact Apple or GitHub: they
 //! run with only the system folders on `PATH`, so a run that passes every
@@ -507,7 +519,7 @@ fn script_keeps_the_home_folder_out_of_the_binaries() {
         "{SCRIPT} must map the home folder out of the build's paths"
     );
     let code = code_lines(&text);
-    let build = first_line_with(&code, "build -p fx-ui-macos -p fx-cli --bins")
+    let build = first_line_with(&code, RELEASE_BUILD)
         .unwrap_or_else(|| panic!("{SCRIPT} must build the app and the command"));
     let check = first_line_with(&code, "check_no_home \"$TARGET/release/")
         .unwrap_or_else(|| panic!("{SCRIPT} must check the binaries for the home folder"));
@@ -1139,18 +1151,239 @@ fn script_tags_and_publishes_only_with_publish() {
 fn script_documents_its_modes() {
     let text = script_text();
     for usage in [
-        "scripts/release-macos.sh [--rc | --beta] [--publish] NEW_OUT_DIR",
-        "scripts/release-macos.sh --resume OUT_DIR [--publish]",
+        "scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--publish] NEW_OUT_DIR",
+        "scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--publish]",
     ] {
         assert!(text.contains(usage), "{SCRIPT} usage must show {usage:?}");
     }
     let code = code_lines(&text).join("\n");
-    for option in ["--resume", "--rc", "--beta", "--publish"] {
+    for option in ["--resume", "--rc", "--beta", "--publish", "--perf"] {
         assert!(
             code.contains(option),
             "{SCRIPT} must handle the `{option}` option"
         );
     }
+    let header: String = text
+        .lines()
+        .take_while(|l| l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "--perf PERF_DIR",
+        "perf-check.sh --tier rc",
+        "docs/gates/releases/",
+    ] {
+        assert!(
+            header.contains(needle),
+            "{SCRIPT}'s header must describe --perf ({needle:?})"
+        );
+    }
+}
+
+// -- The performance table. ---------------------------------------------------
+
+/// The build of the app and the command, which also builds fx-bench.
+const RELEASE_BUILD: &str = "build -p fx-ui-macos -p fx-cli -p fx-bench --bins";
+
+/// The performance table is made with the fx-bench of the release's own
+/// build (a fresh target folder), built in the same cargo build as the app
+/// and the command rather than a second time. It is not shipped, so it is
+/// neither checked for the home folder nor packaged or published.
+#[test]
+fn script_builds_fx_bench_with_the_release_but_does_not_ship_it() {
+    let code = code_lines(&script_text());
+    let builds: Vec<&str> = code
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("build -p"))
+        .collect();
+    assert_eq!(
+        builds,
+        [RELEASE_BUILD, "build -p fx-ui-macos --example make_bundle"],
+        "{SCRIPT} must build fx-bench with the app and the command, once"
+    );
+    for (_, line) in logical_lines(&code) {
+        let ships = [
+            "check_no_home \"",
+            "make_bundle\"",
+            "make_cli_tar \"",
+            "shasum -a 256",
+            "gh release create",
+            "\"$WORK/cli/\"",
+        ]
+        .iter()
+        .any(|n| line.contains(n));
+        assert!(
+            !(ships && line.contains("fx-bench")),
+            "{SCRIPT} must not ship fx-bench: {line}"
+        );
+    }
+}
+
+/// With `--perf`, once the disk image is final (stapled and its quarantined
+/// copy checked) and before the files are written, so a failure here can
+/// still be resumed, `perf_section` writes `$OUT/perf-metrics.txt` (PERF_DIR's
+/// `metrics.txt` and the disk image's size as `dmg_bytes`), has the release
+/// build's fx-bench compare it with the baseline and the previous release
+/// (`perf-release`, with PERF_DIR's `notes.md` when there is one) into
+/// `$OUT/performance.md`, and keeps the values as `metrics-<label>.txt`.
+#[test]
+fn script_makes_the_performance_table_once_the_disk_image_is_final() {
+    let text = script_text();
+    let section = shell_function(&text, "perf_section")
+        .unwrap_or_else(|| panic!("{SCRIPT} must define perf_section"));
+    let code = code_lines(&section);
+    line_with_all(
+        &code,
+        &["stat -f %z", r#""$DMG""#],
+        "read the disk image's size",
+    );
+    line_with_all(&code, &["dmg_bytes="], "write dmg_bytes");
+    line_with_all(
+        &code,
+        &[r#""$PERF_DIR/metrics.txt""#],
+        "copy PERF_DIR's metrics",
+    );
+    line_with_all(
+        &code,
+        &[r#">"$OUT/perf-metrics.txt""#],
+        "write $OUT/perf-metrics.txt",
+    );
+    let (_, call) = line_with_all(
+        &code,
+        &[r#""$TARGET/release/fx-bench" perf-release"#],
+        "run the release build's fx-bench perf-release",
+    );
+    for arg in [
+        r#"--baseline "$ROOT/docs/gates/perf-baseline.toml""#,
+        r#"--previous "$ROOT/docs/gates/releases/$PREV.txt""#,
+        r#"--previous-label "$PREV""#,
+        r#"--label "$LABEL""#,
+        r#""$OUT/perf-metrics.txt""#,
+        r#">"$OUT/performance.md""#,
+    ] {
+        assert!(call.contains(arg), "perf-release must get {arg}: {call}");
+    }
+    assert!(
+        call.trim_end().ends_with("||"),
+        "a failing perf-release must stop the release: {call}"
+    );
+    line_with_all(
+        &code,
+        &[r#"--notes "$PERF_DIR/notes.md""#],
+        "pass the owner's notes",
+    );
+    line_with_all(
+        &code,
+        &[r#"cp "$OUT/perf-metrics.txt" "$OUT/metrics-$LABEL.txt""#],
+        "keep the values as metrics-<label>.txt",
+    );
+
+    let code = code_lines(&text);
+    let section = call_line(&code, "perf_section", "make the performance table");
+    let guard = code[..section]
+        .iter()
+        .rposition(|l| l.trim() == r#"if [ -n "$PERF_DIR" ]; then"#)
+        .unwrap_or_else(|| panic!("{SCRIPT} must make the table only with --perf"));
+    let staple = call_line(
+        &code,
+        r#"xcrun stapler staple "$DMG""#,
+        "staple the disk image",
+    );
+    let (checked, _) = line_with_all(
+        &code,
+        &[r#"check_app "$MOUNTED/$APP_NAME.app""#],
+        "check the app in the disk image",
+    );
+    let write = first_line_with(&code, "ditto -c -k --norsrc").unwrap();
+    let notes = call_line(
+        &code,
+        r#"[ "$CHANNEL" = beta ] || release_notes >"$NOTES""#,
+        "write the release notes",
+    );
+    assert!(
+        staple < checked && checked < guard && guard < section && section < write,
+        "{SCRIPT} must make the table after the disk image is stapled and checked, \
+         and before writing the files"
+    );
+    assert!(section < notes, "the table must exist before the notes");
+    let done = first_line_with(&code, "step \"Done").unwrap();
+    assert!(
+        code[done..]
+            .iter()
+            .any(|l| l.contains("echo") && l.contains("docs/gates/releases/$VERSION.txt")),
+        "the Done output must say metrics-<label>.txt becomes docs/gates/releases/<X.Y.Z>.txt"
+    );
+}
+
+/// The release notes are written by `release_notes`, which puts the table
+/// after the CHANGELOG.md entry; the behaviour test runs it.
+#[test]
+fn script_puts_the_table_after_the_changelog_entry() {
+    let text = script_text();
+    let notes = shell_function(&text, "release_notes")
+        .unwrap_or_else(|| panic!("{SCRIPT} must define release_notes"));
+    let code = code_lines(&notes);
+    let entry = code
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("changelog_entry"))
+        .unwrap_or_else(|| panic!("release_notes must print the CHANGELOG.md entry"));
+    let table = first_line_with(&code, r#"cat "$OUT/performance.md""#)
+        .unwrap_or_else(|| panic!("release_notes must print the performance table"));
+    assert!(entry < table, "the table must come after the entry");
+}
+
+/// The lines of `code` that call the function `name` (not its definition).
+fn calls_of(code: &[String], name: &str) -> Vec<usize> {
+    let head = format!("{name}()");
+    code.iter()
+        .enumerate()
+        .filter(|(_, l)| !l.contains(&head) && words(&strip_quoted(l)).iter().any(|w| w == name))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `--perf` is checked before anything is fetched or built: a new build
+/// checks that `--publish` of a release or an RC has it, and the run's
+/// files, tier, commit and verdict, before fetching the tags, and the
+/// previous release's values after fetching them and before building;
+/// `--resume` checks them all before going on.
+#[test]
+fn script_checks_the_performance_run_before_fetching_or_building() {
+    let code = code_lines(&script_text());
+    let resume = first_line_with(&code, "step \"Resume").unwrap();
+    let fetch = first_line_with(&code, "fetch --quiet --tags origin").unwrap();
+    let cargo = first_line_with(&code, "command -v cargo").unwrap();
+    for (name, after, before) in [
+        ("need_perf", resume, fetch),
+        ("check_perf", resume, fetch),
+        ("check_previous_release", fetch, cargo),
+    ] {
+        let calls = calls_of(&code, name);
+        assert_eq!(
+            calls.len(),
+            2,
+            "{SCRIPT} must call {name} for --resume and for a new build: {calls:?}"
+        );
+        assert!(
+            calls[0] < resume,
+            "--resume must call {name} before going on"
+        );
+        assert!(
+            after < calls[1] && calls[1] < before,
+            "a new build must call {name} between lines {after} and {before}: {calls:?}"
+        );
+    }
+    let (_, check) = line_with_all(&code, &["check_perf", "rev-parse HEAD"], "check HEAD");
+    assert!(
+        check.contains(r#"[ -z "$PERF_DIR" ] ||"#),
+        "only --perf is checked: {check}"
+    );
+    line_with_all(
+        &code,
+        &["check_perf \"$COMMIT\""],
+        "check the build's recorded commit on --resume",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2293,5 +2526,540 @@ esac"#;
         let _ = fs::remove_dir_all(&dir);
         assert_refused(&out, 1, "already exists", "an existing output folder");
         assert_eq!(before, after, "{SCRIPT} must not touch an existing folder");
+    }
+
+    // -- The performance table (--perf). -----------------------------------
+
+    /// What the script says when `--publish` of an RC or a release has no
+    /// `--perf`.
+    const NEEDS_PERF: &str = "needs --perf PERF_DIR";
+    /// What it says when the run in PERF_DIR has a failing or unmeasured
+    /// metric.
+    const DID_NOT_PASS: &str = "did not pass every metric";
+    /// The last line of a passing run's `summary.md`.
+    const PASSING: &str =
+        "perf-compare: 30 pass, 0 fail, 0 not measured, 1 no baseline, 2 tracked, 0 skipped";
+
+    /// Writes a finished `scripts/perf-check.sh --tier rc` run into `dir`:
+    /// `metrics.txt`, `summary.md` ending with `last`, and `run.txt` whose
+    /// `git:` line is `git`. Returns `dir` as a string.
+    fn write_perf_run(dir: &Path, git: &str, last: &str) -> String {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("metrics.txt"), "startup_ms=210\nstartup_ms=215\n").unwrap();
+        fs::write(
+            dir.join("summary.md"),
+            format!(
+                "# Performance gate: rc tier\n\n| Metric | Verdict |\n| --- | --- |\n\n{last}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("run.txt"),
+            format!("tier: rc\nsteps: startup dmg\nmachine: test\ncache: warm\ngit: {git}\nrustc: test\n"),
+        )
+        .unwrap();
+        dir.display().to_string()
+    }
+
+    /// A passing run of `git` named `name` in `repo`'s ignored `target/`.
+    fn perf_run(repo: &Sandbox, name: &str, git: &str) -> String {
+        write_perf_run(&repo.dir.join("target").join(name), git, PASSING)
+    }
+
+    /// An `rc/0.2.0` branch ready for RC 1 whose previous release, 0.1.3,
+    /// has its measured values committed, and its HEAD.
+    fn rc_with_previous_release(tag: &str) -> (Sandbox, String) {
+        let repo = release_repo(tag, "0.2.0");
+        ignore_target(&repo);
+        repo.git(&["tag", "-a", "release/v0.1.3", "-m", "0.1.3", "HEAD~1"]);
+        repo.git(&["checkout", "--quiet", "-b", "rc/0.2.0"]);
+        repo.write(
+            "docs/gates/releases/0.1.3.txt",
+            "# 0.1.3, the release's values\nstartup_ms=230\n",
+        );
+        let head = repo.commit_all("0.1.3's values");
+        (repo, head)
+    }
+
+    /// The run passed every check, `--perf` included, and stopped before
+    /// building; its Plan names the run and the previous release.
+    fn assert_planned_with_perf(out: &Output, tag: &str, label: &str, previous: &str) {
+        assert_planned(out, tag, label);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("Performance: ")
+                && stdout.contains(&format!("compared with {previous}")),
+            "the Plan must name the run and {previous}\n{}",
+            describe(out)
+        );
+    }
+
+    #[test]
+    fn perf_takes_one_folder_and_no_beta() {
+        let repo = release_repo("perf-usage", "0.2.0");
+        for args in [
+            &["--rc", "x", "--perf"][..],
+            &["--rc", "--perf", "--publish", "x"],
+            &["--rc", "--perf", "", "x"],
+            &["--rc", "--perf", "a", "--perf", "a", "x"],
+            &["--perf", "a", "--rc", "x", "--perf", "b"],
+            &["--beta", "--perf", "a", "x"],
+            &["--perf", "a", "--beta", "x"],
+            &["--resume", "x", "--perf"],
+            &["--resume", "x", "--perf", "a", "--perf", "a"],
+        ] {
+            let out = repo.run(SCRIPT, args);
+            assert_refused(&out, 2, "usage:", &format!("{args:?} is a usage error"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("[--perf PERF_DIR]"), "{}", describe(&out));
+        }
+    }
+
+    /// A release candidate's and a release's GitHub page carries the table,
+    /// so `--publish` without `--perf` is refused before anything else.
+    #[test]
+    fn publishing_a_release_candidate_or_a_release_needs_perf() {
+        let repo = release_repo("perf-needed-rc", "0.2.0");
+        ignore_target(&repo);
+        repo.git(&["checkout", "--quiet", "-b", "rc/0.2.0"]);
+        let release = released_main("perf-needed-release");
+        for (repo, args) in [
+            (&repo, &["--rc", "--publish"][..]),
+            (&repo, &["--publish", "--rc"][..]),
+            (&release, &["--publish"][..]),
+        ] {
+            let out = plan(repo, args);
+            assert_refused(&out, 1, NEEDS_PERF, &format!("{args:?} without --perf"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(!stdout.contains("== Plan"), "{}", describe(&out));
+        }
+    }
+
+    /// A beta has no GitHub page: it never needs `--perf`, published or not.
+    #[test]
+    fn a_beta_never_needs_perf() {
+        let repo = release_repo("perf-beta", "0.2.0");
+        ignore_target(&repo);
+        repo.git(&["checkout", "--quiet", "-b", "dev"]);
+        let out = plan(&repo, &["--beta"]);
+        assert_planned(&out, "beta/v0.2.0-beta-1", "0.2.0-beta-1");
+        let bare = add_local_origin(&repo);
+        let out = plan(&repo, &["--beta", "--publish"]);
+        let _ = fs::remove_dir_all(&bare);
+        // Refused for its local origin, not for --perf.
+        assert_refused(
+            &out,
+            1,
+            "3645-io/Not-Everything",
+            "--beta --publish with a local origin",
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("--perf"), "{}", describe(&out));
+    }
+
+    /// Without `--publish`, `--perf` is optional and checked the same way.
+    /// A run is refused unless it is a finished rc-tier run of the commit
+    /// being built, from a clean tree, whose last `perf-compare:` line has
+    /// no failing or unmeasured metric.
+    #[test]
+    fn perf_refuses_a_run_that_is_not_a_passing_run_of_the_commit() {
+        let (repo, head) = rc_with_previous_release("perf-run");
+        let head = head.as_str();
+        let other = "1".repeat(40);
+        let other = other.as_str();
+        let dirty = format!("{head} (uncommitted changes)");
+        let dirty = dirty.as_str();
+        let line = |fail: u32, not_measured: u32| {
+            format!(
+                "perf-compare: 30 pass, {fail} fail, {not_measured} not measured, 0 no baseline, 2 tracked, 0 skipped"
+            )
+        };
+        // (what, run.txt's git: line, summary.md's last line, a file to
+        // remove, the refusal).
+        let cases = [
+            (
+                "no metrics.txt",
+                head,
+                PASSING.to_owned(),
+                Some("metrics.txt"),
+                "has no metrics.txt",
+            ),
+            (
+                "no summary.md",
+                head,
+                PASSING.to_owned(),
+                Some("summary.md"),
+                "has no summary.md",
+            ),
+            (
+                "no run.txt",
+                head,
+                PASSING.to_owned(),
+                Some("run.txt"),
+                "has no run.txt",
+            ),
+            (
+                "another commit",
+                other,
+                PASSING.to_owned(),
+                None,
+                "the commit being built",
+            ),
+            (
+                "uncommitted changes",
+                dirty,
+                PASSING.to_owned(),
+                None,
+                "uncommitted changes",
+            ),
+            ("a failing metric", head, line(1, 0), None, DID_NOT_PASS),
+            ("ten failing metrics", head, line(10, 0), None, DID_NOT_PASS),
+            (
+                "a metric not measured",
+                head,
+                line(0, 1),
+                None,
+                DID_NOT_PASS,
+            ),
+            ("ten not measured", head, line(0, 10), None, DID_NOT_PASS),
+            (
+                "no perf-compare line",
+                head,
+                "No verdicts.".to_owned(),
+                None,
+                DID_NOT_PASS,
+            ),
+        ];
+        for (i, (what, git, last, remove, phrase)) in cases.into_iter().enumerate() {
+            let dir = repo.dir.join("target").join(format!("perf-{i}"));
+            let perf = write_perf_run(&dir, git, &last);
+            if let Some(file) = remove {
+                fs::remove_file(dir.join(file)).unwrap();
+            }
+            let out = plan(&repo, &["--rc", "--perf", &perf]);
+            assert_refused(&out, 1, phrase, &format!("a run with {what}"));
+        }
+
+        // Another tier.
+        let perf = perf_run(&repo, "perf-pr", head);
+        let run = Path::new(&perf).join("run.txt");
+        let text = fs::read_to_string(&run)
+            .unwrap()
+            .replace("tier: rc", "tier: pr");
+        fs::write(&run, text).unwrap();
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, "--tier rc", "a pr-tier run");
+
+        // Not a folder.
+        let missing = repo.dir.join("target/no-such-run").display().to_string();
+        let out = plan(&repo, &["--rc", "--perf", &missing]);
+        assert_refused(&out, 1, "is not a folder", "a missing run");
+
+        // Only the last perf-compare line counts.
+        let dir = repo.dir.join("target/perf-rerun");
+        let perf = write_perf_run(&dir, head, PASSING);
+        fs::write(
+            dir.join("summary.md"),
+            format!("{}\n\n{PASSING}\n", line(1, 1)),
+        )
+        .unwrap();
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        fs::write(
+            dir.join("summary.md"),
+            format!("{PASSING}\n\n{}\n", line(1, 0)),
+        )
+        .unwrap();
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, DID_NOT_PASS, "a failing last line");
+
+        // A passing run of HEAD, also given by a relative path.
+        let perf = perf_run(&repo, "perf-ok", head);
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        let out_dir = repo.dir.join("target/out").display().to_string();
+        let out = repo.run(SCRIPT, &["--rc", "--perf", "target/perf-ok", &out_dir]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        // The temporary folder may sit behind a symbolic link (/var).
+        let full = fs::canonicalize(&perf).unwrap().display().to_string();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("Performance: {full},")),
+            "the Plan names the run's full path\n{}",
+            describe(&out)
+        );
+    }
+
+    /// The table compares with the previous release, the highest
+    /// `release/vX.Y.Z` tag below the version (by version, not text; release
+    /// candidates' tags don't count), whose measured values must be in
+    /// `docs/gates/releases/<X.Y.Z>.txt`.
+    #[test]
+    fn perf_needs_the_previous_release_s_measured_values() {
+        let repo = release_repo("perf-previous", "0.2.0");
+        ignore_target(&repo);
+        repo.git(&["checkout", "--quiet", "-b", "rc/0.2.0"]);
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        let perf = perf_run(&repo, "perf-1", &head);
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, "no release before 0.2.0", "no earlier release");
+
+        for tag in [
+            "release/v0.1.9",
+            "release/v0.1.10",
+            "release/v0.1.11-RC-1",
+            "release/v0.2.1",
+            "release/v1.0.0",
+        ] {
+            repo.git(&["tag", "-a", tag, "-m", tag, "HEAD~1"]);
+        }
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(
+            &out,
+            1,
+            "docs/gates/releases/0.1.10.txt",
+            "0.1.10's values missing",
+        );
+
+        repo.write("docs/gates/releases/0.1.9.txt", "startup_ms=240\n");
+        repo.write(
+            "docs/gates/releases/0.1.10.txt",
+            "# 0.1.10\nstartup_ms=230\n",
+        );
+        let head = repo.commit_all("the releases' values");
+        let perf = perf_run(&repo, "perf-2", &head);
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.10");
+    }
+
+    /// A release builds `main` after the release PR, so its run is of
+    /// main's merge commit, not the release candidate's.
+    #[test]
+    fn a_release_s_run_is_of_main_s_commit() {
+        let repo = released_main("perf-release");
+        repo.git(&["tag", "-a", "release/v0.1.3", "-m", "0.1.3", "main~1"]);
+        repo.git(&["checkout", "--quiet", "rc/0.2.0"]);
+        repo.write("docs/gates/releases/0.1.3.txt", "startup_ms=230\n");
+        let rc = repo.commit_all("0.1.3's values");
+        repo.git(&["tag", "-a", "release/v0.2.0-RC-3", "-m", "rc 3"]);
+        repo.git(&["checkout", "--quiet", "main"]);
+        repo.git(&[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Release 0.2.0",
+            "rc/0.2.0",
+        ]);
+        let main = repo.git(&["rev-parse", "HEAD"]);
+
+        let perf = perf_run(&repo, "perf-rc", &rc);
+        let out = plan(&repo, &["--perf", &perf]);
+        assert_refused(
+            &out,
+            1,
+            "the commit being built",
+            "the RC's run for the release",
+        );
+        let perf = perf_run(&repo, "perf-main", &main);
+        let out = plan(&repo, &["--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0", "0.2.0", "0.1.3");
+    }
+
+    /// `--resume --publish` of a release or an RC needs `--perf` too, and
+    /// its run must be of the build's recorded commit; the folder is left as
+    /// it was.
+    #[test]
+    fn resume_publish_needs_perf_of_the_recorded_commit() {
+        let dir = uploaded_folder("perf-resume");
+        let runs = temp_path("perf-resume-runs");
+        let zero = "0".repeat(40);
+        let other = write_perf_run(&runs.join("other"), &"1".repeat(40), PASSING);
+        let dirty = write_perf_run(
+            &runs.join("dirty"),
+            &format!("{zero} (uncommitted changes)"),
+            PASSING,
+        );
+        let failing = write_perf_run(
+            &runs.join("failing"),
+            &zero,
+            "perf-compare: 29 pass, 1 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped",
+        );
+        let folder = dir.to_str().unwrap();
+        let before = tree(&dir);
+        for (args, phrase) in [
+            (vec!["--resume", folder, "--publish"], NEEDS_PERF),
+            (
+                vec!["--resume", folder, "--perf", other.as_str(), "--publish"],
+                "the commit being built",
+            ),
+            (
+                vec!["--resume", folder, "--perf", dirty.as_str()],
+                "uncommitted changes",
+            ),
+            (
+                vec!["--resume", folder, "--perf", failing.as_str()],
+                DID_NOT_PASS,
+            ),
+        ] {
+            let out = run_script(&args);
+            assert_refused(&out, 1, phrase, &format!("{args:?}"));
+            assert_eq!(
+                before,
+                tree(&dir),
+                "{SCRIPT} --resume must leave the folder untouched"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&runs);
+    }
+
+    /// `release_notes`: a release candidate's note, the CHANGELOG.md entry
+    /// and, with `--perf`, one blank line and the table; without `--perf`
+    /// the notes are the entry as before.
+    #[test]
+    fn release_notes_put_the_table_after_the_changelog_entry() {
+        let dir = temp_path("notes");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("CHANGELOG.md"),
+            "# Changelog\n\n## v0.2.0: Test release (2026-11-07)\n\nWhat changed.\n\n- One.\n  \n- Two.\n\n\n## v0.1.3: Older\n\nOld.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("performance.md"),
+            "## Performance\n\n| Metric | 0.2.0 |\n",
+        )
+        .unwrap();
+        let notes = |channel: &str, perf: &str| {
+            let body = format!(
+                "ROOT='{d}'\nOUT='{d}'\nVERSION=0.2.0\nNUMBER=2\nCHANNEL={channel}\nPERF_DIR={perf}\nrelease_notes",
+                d = dir.display()
+            );
+            let out = run_functions(&["changelog_entry", "release_notes"], &body, &[]);
+            assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let entry = "\nWhat changed.\n\n- One.\n  \n- Two.\n";
+        let table = "## Performance\n\n| Metric | 0.2.0 |\n";
+        assert_eq!(
+            notes("release", ""),
+            format!("{entry}\n\n"),
+            "no --perf: the entry as before"
+        );
+        assert_eq!(notes("release", "/perf"), format!("{entry}\n{table}"));
+        let rc = notes("rc", "/perf");
+        assert!(
+            rc.starts_with("Release candidate 2 of Not-Everything 0.2.0, for testing.")
+                && rc.ends_with(&format!("{entry}\n{table}")),
+            "{rc}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `perf_section` writes PERF_DIR's metrics and the disk image's size,
+    /// runs the release build's fx-bench (a fake that records its
+    /// arguments) and keeps its table and the values; a failing fx-bench
+    /// stops the release.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn perf_section_writes_the_metrics_and_the_table() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_path("perf-section");
+        let (root, out, perf, target) = (
+            dir.join("root"),
+            dir.join("out"),
+            dir.join("perf"),
+            dir.join("target"),
+        );
+        for d in [&root, &out, &perf, &target.join("release")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let dmg = dir.join("Not-Everything-Preview-0.2.0-RC-1-macos-arm64.dmg");
+        fs::write(&dmg, vec![0u8; 12345]).unwrap();
+        // No final newline, as a hand-edited file may have.
+        fs::write(perf.join("metrics.txt"), "startup_ms=210\ndmg_bytes=999").unwrap();
+        let fake = target.join("release/fx-bench");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$FAKE_ARGS\"\n\
+             [ \"${FAKE_EXIT:-0}\" = 0 ] || { echo 'fx-bench: perf-release: bad input' >&2; exit \"$FAKE_EXIT\"; }\n\
+             printf '## Performance\\n\\n| Metric | 0.2.0-RC-1 |\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let args_file = dir.join("args");
+        let body = format!(
+            "PERF_DIR='{}'\nDMG='{}'\nOUT='{}'\nTARGET='{}'\nROOT='{}'\nPREV=0.1.3\nLABEL=0.2.0-RC-1\nperf_section",
+            perf.display(),
+            dmg.display(),
+            out.display(),
+            target.display(),
+            root.display()
+        );
+        let run = |exit: &str| {
+            run_functions(
+                &["perf_section"],
+                &body,
+                &[
+                    ("FAKE_ARGS", args_file.to_str().unwrap()),
+                    ("FAKE_EXIT", exit),
+                ],
+            )
+        };
+        let read = |p: PathBuf| fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let metrics = out.join("perf-metrics.txt").display().to_string();
+        let expected_args = |notes: bool| {
+            let mut v = vec![
+                "perf-release".to_owned(),
+                "--baseline".into(),
+                root.join("docs/gates/perf-baseline.toml")
+                    .display()
+                    .to_string(),
+                "--previous".into(),
+                root.join("docs/gates/releases/0.1.3.txt")
+                    .display()
+                    .to_string(),
+                "--previous-label".into(),
+                "0.1.3".into(),
+                "--label".into(),
+                "0.2.0-RC-1".into(),
+            ];
+            if notes {
+                v.push("--notes".into());
+                v.push(perf.join("notes.md").display().to_string());
+            }
+            v.push(metrics.clone());
+            v.join("\n") + "\n"
+        };
+
+        let done = run("0");
+        assert_eq!(done.status.code(), Some(0), "{}", describe(&done));
+        let values = "startup_ms=210\ndmg_bytes=999\ndmg_bytes=12345\n";
+        assert_eq!(read(out.join("perf-metrics.txt")), values);
+        assert_eq!(read(out.join("metrics-0.2.0-RC-1.txt")), values);
+        assert_eq!(read(args_file.clone()), expected_args(false));
+        let table = "## Performance\n\n| Metric | 0.2.0-RC-1 |\n";
+        assert_eq!(read(out.join("performance.md")), table);
+        assert!(String::from_utf8_lossy(&done.stdout).contains(table));
+
+        // The owner's notes go to perf-release when the run has them.
+        fs::write(perf.join("notes.md"), "Measured on a quiet Mac.\n").unwrap();
+        let done = run("0");
+        assert_eq!(done.status.code(), Some(0), "{}", describe(&done));
+        assert_eq!(read(args_file.clone()), expected_args(true));
+
+        let failed = run("2");
+        assert_refused(
+            &failed,
+            1,
+            "perf-release",
+            "a failing fx-bench perf-release",
+        );
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("bad input"),
+            "{}",
+            describe(&failed)
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }
