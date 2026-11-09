@@ -394,6 +394,16 @@ impl ResultsSource for SwitchableSource {
     fn save_for_quit(&self) -> Result<(), String> {
         self.current().1.save_for_quit()
     }
+
+    /// The current source's.
+    fn saved_ago(&self) -> Option<std::time::Duration> {
+        self.current().1.saved_ago()
+    }
+
+    /// The current source's.
+    fn request_save(&self) {
+        self.current().1.request_save();
+    }
 }
 
 #[cfg(test)]

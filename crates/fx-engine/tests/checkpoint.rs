@@ -149,14 +149,15 @@ fn first_run(tree: &FakeTree, source: &FakeSource, store: &Path) -> (Engine, Res
 }
 
 #[test]
-fn checkpoint_idle_defaults_to_thirty_seconds() {
-    assert_eq!(DEFAULT_CHECKPOINT_IDLE, Duration::from_secs(30));
+fn the_idle_checkpoint_is_off_by_default() {
+    // A quiet laptop at night would otherwise save several times a day.
+    assert_eq!(DEFAULT_CHECKPOINT_IDLE, None);
     assert_eq!(
         EngineConfig::new(ROOT).checkpoint_idle(),
         DEFAULT_CHECKPOINT_IDLE
     );
     let cfg = EngineConfig::new(ROOT).with_checkpoint_idle(Duration::from_millis(250));
-    assert_eq!(cfg.checkpoint_idle(), Duration::from_millis(250));
+    assert_eq!(cfg.checkpoint_idle(), Some(Duration::from_millis(250)));
 }
 
 #[test]
@@ -270,8 +271,9 @@ fn idle_checkpoint_follows_the_last_change() {
 }
 
 #[test]
-fn checkpoint_max_delay_defaults_to_five_minutes() {
-    assert_eq!(DEFAULT_CHECKPOINT_MAX_DELAY, Duration::from_secs(300));
+fn checkpoint_max_delay_defaults_to_two_days() {
+    // A backstop for a Mac that is never idle; the app saves once a day.
+    assert_eq!(DEFAULT_CHECKPOINT_MAX_DELAY, Duration::from_secs(48 * 3600));
     assert_eq!(
         EngineConfig::new(ROOT).checkpoint_max_delay(),
         DEFAULT_CHECKPOINT_MAX_DELAY
@@ -591,17 +593,17 @@ fn checkpoint_returns_at_once_when_the_latest_snapshot_is_saved() {
 }
 
 #[test]
-fn quit_with_a_resumable_store_writes_nothing_and_the_next_launch_catches_up() {
+fn quit_with_unsaved_changes_writes_them_and_the_next_launch_resumes() {
     let dir = TempDir::new("quit-resumable");
     let store = dir.store();
     let tree = sample_tree();
     let source = FakeSource::new(StartOutcome::Resumed);
     let (engine, _) = first_run(&tree, &source, &store);
     engine.shutdown();
-    let (_, saved_cursor, _) = read_store(&store);
 
     // Reopened from a store with a resume cursor, then changed: the store is
-    // older than the latest snapshot, and quitting still writes nothing.
+    // older than the latest snapshot. The store is saved only once a day,
+    // so quitting writes the change rather than leave a day to replay.
     let source2 = FakeSource::new(StartOutcome::Resumed);
     let engine2 = open(&tree, &source2, store_config(&store));
     wait_for_tree(&engine2, &tree, "reloaded index");
@@ -610,26 +612,31 @@ fn quit_with_a_resumable_store_writes_nothing_and_the_next_launch_catches_up() {
     wait_for_tree(&engine2, &tree, "change not saved yet");
     let before = written(&store);
     let names = store_dir_names(&store);
-    assert_eq!(engine2.checkpoint_for_quit().expect("quit"), QuitSave::Skip);
-    assert_eq!(written(&store), before, "quitting wrote the store");
-    assert_eq!(store_dir_names(&store), names, "quitting left a file");
+    assert_eq!(
+        engine2.checkpoint_for_quit().expect("quit"),
+        QuitSave::Write
+    );
+    let after = written(&store);
+    assert_ne!(after, before, "quitting saved the change");
+    assert_eq!(store_dir_names(&store), names, "quitting left a temp file");
+    let (saved, quit_cursor, clean) = read_store(&store);
+    assert_eq!(saved, tree.entries(), "the store holds the change");
+    assert!(!clean, "a quit is not an orderly shutdown");
     // The app exits without dropping the engine (no orderly shutdown).
     drop(engine2);
-    assert_eq!(written(&store), before, "dropping saves nothing either");
+    assert_eq!(written(&store), after, "dropping saves nothing more");
 
-    // The next launch loads the store and replays the change made since
-    // its cursor, as after a crash.
+    // The next launch resumes from the cursor the quit saved.
     let source3 = FakeSource::new(StartOutcome::Resumed);
-    source3.push(vec![check("/vol/b/unsaved.txt")]);
     let engine3 = open(&tree, &source3, store_config(&store));
-    assert_eq!(source3.started_from(), Some(Some(saved_cursor)));
-    let snap = wait_for_tree(&engine3, &tree, "catch-up after the quit");
+    assert_eq!(source3.started_from(), Some(Some(quit_cursor)));
+    let snap = wait_for_tree(&engine3, &tree, "the launch after the quit");
     assert_orders_match(&snap);
     engine3.shutdown();
 }
 
 #[test]
-fn quit_after_the_first_scan_was_saved_writes_nothing() {
+fn quit_writes_only_what_the_saved_store_lacks() {
     let dir = TempDir::new("quit-after-scan");
     let store = dir.store();
     let tree = sample_tree();
@@ -647,13 +654,17 @@ fn quit_after_the_first_scan_was_saved_writes_nothing() {
         "the saved scan is not written again"
     );
 
+    // Nothing changed since that save: quitting writes nothing.
+    assert_eq!(engine.checkpoint_for_quit().expect("quit"), QuitSave::Skip);
+    assert_eq!(written(&store), before, "quitting rewrote a current store");
+
     tree.touch("/vol/a/later.txt", 2);
     source.push(vec![check("/vol/a/later.txt")]);
     wait_for_tree(&engine, &tree, "change after the scan");
-    assert_eq!(engine.checkpoint_for_quit().expect("quit"), QuitSave::Skip);
-    assert_eq!(written(&store), before, "quitting wrote the store");
+    assert_eq!(engine.checkpoint_for_quit().expect("quit"), QuitSave::Write);
     let (saved, _, _) = read_store(&store);
-    assert_eq!(saved, scanned, "the store still holds the saved scan");
+    assert_ne!(saved, scanned, "the change is not in the saved scan");
+    assert_eq!(saved, tree.entries(), "the quit saved the change");
     engine.shutdown();
 }
 

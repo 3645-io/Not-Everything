@@ -42,7 +42,8 @@ comes from the app menu, Cmd+Q or the status menu.
   `~/Library/Application Support/Not-Everything/settings` (for example
   `hotkey=cmd+shift+space`) and relaunch. It is registered through the
   `global-hotkey` crate (Carbon `RegisterEventHotKey`, no Accessibility
-  prompt) and polled every 100 ms from a main-thread timer. Pressing it
+  prompt); the crate hands each event to a handler that wakes the main
+  thread, so nothing polls for it (0.3.1 polled every 100 ms). Pressing it
   shows the window, activates the app and focuses the search field;
   pressing it again while the window is key hides it and hands the focus
   back to the app you were using before (see Escape below). If the
@@ -215,8 +216,8 @@ present, else a first scan); the status bar says "Indexing protected
 folders…" meanwhile. Once that engine has its first snapshot the source
 switches to it, the window re-runs its search through the normal refresh
 path, and the limited engine saves its store as on a quit
-(`ResultsSource::save_for_quit`: only when its store holds no resume
-cursor) and shuts down. Generations carry the switch count in their top
+(`ResultsSource::save_for_quit`: only what its store lacks) and shuts
+down. Generations carry the switch count in their top
 bits, so the controller takes the switch as a newer generation and never
 mixes pages or rows of the two indexes. Both engines run side by side until
 the switch, so memory and scan work briefly double.
@@ -239,21 +240,38 @@ The engine's store for a root lives in
 so the next launch serves the saved index at once; without a store the
 engine starts with a first scan.
 
+**Saving the index.** A save rewrites the whole store (about 251 MB for a
+whole disk) and flushes it to the disk, so since 0.3.2 the app saves it
+rarely, as Everything does by default: once a day, when the app quits, and
+right after a full scan. 0.3.1 saved at most 5 minutes after the first
+unsaved change, and a whole disk always has one, so it wrote about 3 GB an
+hour. The daily save (`daily_save`) is checked every 5 minutes by the
+resident app: it is due 24 hours after the last save, once nobody has used
+the keyboard or mouse for a minute (`CGEventSourceSecondsSinceLastEventType`),
+and the engine's checkpoint thread writes it (`Engine::request_checkpoint`).
+The engine's own idle save is off, and its longest delay, 48 hours, is only
+a backstop. Every save marks the store to be left out of Time Machine
+backups: the index is rebuilt from the disk when lost. A crash loses
+nothing: `Engine::open` replays the changes made since the saved cursor.
+
 **Quitting.** Cmd+Q, the status menu's Quit or a logout first hides every
-window and the menu-bar item (`quit::quit_steps`), then saves the index
-only when the next launch could not load it otherwise. Writing the whole
-store on the main thread at every quit, even when that snapshot was already
-saved, took 0.54 s from the request to process exit with the window still
-on screen (2,673,111 entries, a 218 MB store, idle, M4 Pro, warm cache).
-The engine already saves in the background (after an idle delay, at most 5
-minutes after the first unsaved change, and right after a full scan),
-always with the resume cursor, and `Engine::open` replays the changes made
-since that cursor, as after a crash. So `Engine::checkpoint_for_quit`
-writes nothing when the store holds a resume cursor. It writes the latest
-snapshot only when the store has none yet (for example a first scan that
-finished moments ago), and if that scan's background save is already
-running it waits for it instead of starting another. `Engine::checkpoint`
-returns at once when the latest snapshot is already saved.
+window and the menu-bar item (`quit::quit_steps`), then saves what the
+store lacks (`Engine::checkpoint_for_quit`), so the next launch does not
+replay up to a day of changes. Writing the whole store on the main thread
+took 0.54 s from the request to process exit with the window still on
+screen (2,673,111 entries, a 218 MB store, idle, M4 Pro, warm cache); when
+the store already holds the latest snapshot nothing is written, and when a
+save is running the quit waits for it instead of starting another.
+
+**Background work.** The window re-runs its search for each new snapshot
+only while it is on screen (`NSWindowDidChangeOcclusionStateNotification`):
+hidden, covered, on another Space or behind a locked screen, a new snapshot
+is only remembered, and the window re-runs once when it shows again. In
+0.3.1 those re-runs took about 85% of the app's background CPU. The
+engine's writer and checkpoint threads run at the utility
+quality-of-service class and the search worker at user-initiated
+(`fx_engine::qos`), so macOS can keep background work on the efficiency
+cores.
 
 Keys and actions (all read-only):
 

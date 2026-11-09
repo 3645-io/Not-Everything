@@ -133,30 +133,29 @@ pub(crate) fn load(path: &Path) -> Option<Loaded> {
 /// does with the store when the app quits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuitSave {
-    /// Writes nothing: the store holds a resume cursor (the next launch
-    /// loads it and replays the changes made since) or the latest snapshot.
+    /// Writes nothing: the store holds the latest snapshot.
     Skip,
-    /// Waits for the save being written now, and writes nothing more.
+    /// Waits for the save being written now, and writes nothing more; the
+    /// next launch replays what came after it.
     WaitForRunning,
-    /// Writes the latest snapshot: the store holds no resume cursor yet.
+    /// Writes the latest snapshot: the store is behind it.
     Write,
 }
 
 /// The store's state when the app quits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QuitState {
-    /// The store holds a resume cursor.
-    pub(crate) resumable: bool,
     /// A save is being written now.
     pub(crate) save_running: bool,
     /// The store holds the latest published snapshot.
     pub(crate) latest_saved: bool,
 }
 
-/// The quit decision: write only when the next launch could not resume
-/// from the store, and never a second time behind a running save.
+/// The quit decision: write what the store lacks, since the app saves the
+/// store only once a day and the next launch would otherwise replay up to
+/// a day of changes; never a second save behind a running one.
 pub(crate) fn quit_save(state: QuitState) -> QuitSave {
-    if state.resumable || state.latest_saved {
+    if state.latest_saved {
         QuitSave::Skip
     } else if state.save_running {
         QuitSave::WaitForRunning
@@ -165,11 +164,73 @@ pub(crate) fn quit_save(state: QuitState) -> QuitSave {
     }
 }
 
+/// When the next save is due, for a snapshot whose last change was
+/// published at `last_change` and whose first unsaved change at
+/// `first_unsaved` (`None`: nothing unsaved): `idle` after the last
+/// change, at the latest `max_delay` after the first unsaved one. `None`
+/// when neither applies (no idle delay and nothing unsaved) or a delay is
+/// too long to add to an instant.
+fn due_at(
+    last_change: Instant,
+    idle: Option<Duration>,
+    first_unsaved: Option<Instant>,
+    max_delay: Duration,
+) -> Option<Instant> {
+    let idle_due = idle.and_then(|d| last_change.checked_add(d));
+    let max_due = first_unsaved.and_then(|first| first.checked_add(max_delay));
+    match (idle_due, max_due) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The extended attribute Time Machine reads to leave an item out of
+/// backups (what `tmutil addexclusion` sets), and its value: a binary
+/// property list holding the string `com.apple.backupd`.
+#[cfg(target_os = "macos")]
+const BACKUP_EXCLUDE_NAME: &std::ffi::CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
+#[cfg(target_os = "macos")]
+const BACKUP_EXCLUDE_VALUE: [u8; 61] = [
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x5f, 0x10, 0x11, 0x63, 0x6f, 0x6d, 0x2e, 0x61,
+    0x70, 0x70, 0x6c, 0x65, 0x2e, 0x62, 0x61, 0x63, 0x6b, 0x75, 0x70, 0x64, 0x08, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c,
+];
+
+/// Leaves the store at `path` out of Time Machine backups (macOS only).
+/// The index is rebuilt from the disk when lost, and without the mark each
+/// hourly backup would copy the whole file after every save. The mark lives
+/// on the file and every save writes a new one, so every save sets it. A
+/// failure is ignored: the store is still valid, only backed up.
+pub(crate) fn exclude_from_backups(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        // SAFETY: both strings are NUL-terminated and live for the call; the
+        // value pointer and length describe the constant above.
+        unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                BACKUP_EXCLUDE_NAME.as_ptr(),
+                BACKUP_EXCLUDE_VALUE.as_ptr().cast(),
+                BACKUP_EXCLUDE_VALUE.len(),
+                0,
+                0,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
+}
+
 /// Writes `snap` to `path` atomically (mode 0600), creating a missing
 /// parent directory with mode 0700 (`fx_store::create_private_dir`). An
 /// existing directory keeps its mode: the store path can lie in any
-/// folder. Returns whether a resume cursor was saved with it.
-fn write(snap: &EngineSnapshot, path: &Path, clean: bool) -> Result<bool, StoreError> {
+/// folder. The file is left out of Time Machine backups.
+fn write(snap: &EngineSnapshot, path: &Path, clean: bool) -> Result<(), StoreError> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         create_private_dir(dir).map_err(StoreError::Io)?;
     }
@@ -193,7 +254,8 @@ fn write(snap: &EngineSnapshot, path: &Path, clean: bool) -> Result<bool, StoreE
             clean_shutdown: clean,
         },
     )?;
-    Ok(!volumes.is_empty())
+    exclude_from_backups(path);
+    Ok(())
 }
 
 struct State {
@@ -205,9 +267,6 @@ struct State {
     requested: bool,
     /// Generation of the last snapshot saved (or loaded unchanged).
     saved: Option<u64>,
-    /// The store holds a resume cursor (loaded with one, or the last save
-    /// wrote one).
-    resumable: bool,
     stop: bool,
 }
 
@@ -215,7 +274,8 @@ struct State {
 /// idle-checkpoint thread.
 pub(crate) struct Checkpoints {
     path: Option<PathBuf>,
-    idle: Duration,
+    /// `None`: no save after a quiet spell, only the longest delay.
+    idle: Option<Duration>,
     max_delay: Duration,
     state: Mutex<State>,
     wake: Condvar,
@@ -229,14 +289,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Checkpoints {
-    /// `saved` is the generation the store already holds, if any;
-    /// `resumable` whether the store holds a resume cursor.
+    /// `saved` is the generation the store already holds, if any.
     pub(crate) fn new(
         path: Option<PathBuf>,
-        idle: Duration,
+        idle: Option<Duration>,
         max_delay: Duration,
         saved: Option<u64>,
-        resumable: bool,
     ) -> Self {
         Checkpoints {
             path,
@@ -247,7 +305,6 @@ impl Checkpoints {
                 first_unsaved: None,
                 requested: false,
                 saved,
-                resumable,
                 stop: false,
             }),
             wake: Condvar::new(),
@@ -279,6 +336,13 @@ impl Checkpoints {
             lock(&self.state).requested = true;
             self.wake.notify_all();
         }
+    }
+
+    /// When the store was last written (its modification time); `None`
+    /// without a store path or a store.
+    pub(crate) fn saved_at(&self) -> Option<std::time::SystemTime> {
+        let path = self.path.as_deref()?;
+        std::fs::metadata(path).ok()?.modified().ok()
     }
 
     /// Whether the store holds the latest published snapshot.
@@ -325,7 +389,6 @@ impl Checkpoints {
             let mut st = lock(&self.state);
             st.stop = true;
             quit_save(QuitState {
-                resumable: st.resumable,
                 save_running: guard.is_none(),
                 latest_saved: st.saved == Some(current.load().generation),
             })
@@ -351,9 +414,8 @@ impl Checkpoints {
         current: &ArcSwap<EngineSnapshot>,
         clean: bool,
     ) -> Result<(), CheckpointError> {
-        let resumable = write(snap, path, clean)?;
+        write(snap, path, clean)?;
         let mut st = lock(&self.state);
-        st.resumable = resumable;
         st.saved = Some(st.saved.map_or(snap.generation, |g| g.max(snap.generation)));
         if current.load().generation == snap.generation {
             st.requested = false;
@@ -383,11 +445,17 @@ impl Checkpoints {
             }
             let now = Instant::now();
             let due = if st.requested {
-                now
+                Some(now)
             } else {
-                let idle_due = st.last_change + self.idle;
-                st.first_unsaved
-                    .map_or(idle_due, |first| idle_due.min(first + self.max_delay))
+                due_at(st.last_change, self.idle, st.first_unsaved, self.max_delay)
+            };
+            let Some(due) = due else {
+                // Nothing comes due by itself: wait for a change or a request.
+                st = self
+                    .wake
+                    .wait(st)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
             };
             if now >= due {
                 drop(st);
@@ -432,25 +500,66 @@ mod tests {
     #[test]
     fn the_quit_decision() {
         use QuitSave::{Skip, WaitForRunning, Write};
-        // (resumable, save running, latest saved) and what quitting does.
+        // (save running, latest saved) and what quitting does. Unsaved
+        // changes are written whether or not the store holds a resume
+        // cursor, since the store is saved only once a day.
         let table = [
-            ((false, false, false), Write),
-            ((false, true, false), WaitForRunning),
-            ((false, false, true), Skip),
-            ((false, true, true), Skip),
-            ((true, false, false), Skip),
-            ((true, true, false), Skip),
-            ((true, false, true), Skip),
-            ((true, true, true), Skip),
+            ((false, false), Write),
+            ((true, false), WaitForRunning),
+            ((false, true), Skip),
+            ((true, true), Skip),
         ];
-        for ((resumable, save_running, latest_saved), want) in table {
+        for ((save_running, latest_saved), want) in table {
             let state = QuitState {
-                resumable,
                 save_running,
                 latest_saved,
             };
             assert_eq!(quit_save(state), want, "{state:?}");
         }
+    }
+
+    #[test]
+    fn no_save_is_due_without_an_idle_delay_until_the_longest_delay() {
+        let now = Instant::now();
+        let hour = Duration::from_secs(3600);
+        // The idle save is off: only the longest delay makes a save due.
+        assert_eq!(
+            due_at(now, None, Some(now), 48 * hour),
+            Some(now + 48 * hour)
+        );
+        assert_eq!(due_at(now, None, None, 48 * hour), None, "nothing unsaved");
+        // With an idle delay, the earlier of the two.
+        let idle = Some(Duration::from_secs(30));
+        assert_eq!(
+            due_at(now, idle, Some(now), 48 * hour),
+            Some(now + Duration::from_secs(30))
+        );
+        // A delay too long to add to an instant never comes due.
+        assert_eq!(due_at(now, Some(Duration::MAX), None, Duration::MAX), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_saved_store_is_kept_out_of_time_machine() {
+        let dir = Scratch::new("backup-exclusion");
+        let path = dir.0.join("index.fxstore");
+        std::fs::write(&path, b"store").expect("write a file");
+        exclude_from_backups(&path);
+        // The temp folder is excluded from backups by path anyway, so
+        // `tmutil isexcluded` would pass without the mark: read the mark.
+        let out = std::process::Command::new("xattr")
+            .arg("-px")
+            .arg("com.apple.metadata:com_apple_backup_excludeItem")
+            .arg(&path)
+            .output()
+            .expect("run xattr");
+        assert!(out.status.success(), "the file carries no exclusion mark");
+        let hex: String = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .collect();
+        // A binary property list holding the string "com.apple.backupd".
+        assert!(hex.starts_with("62706C6973743030"), "{hex}");
+        assert!(hex.contains("636F6D2E6170706C652E6261636B757064"), "{hex}");
     }
 
     /// A scratch folder for one test, removed on drop.
@@ -532,13 +641,7 @@ mod tests {
         let dir = Scratch::new("quit-during-save");
         let path = dir.0.join("index.fxdb");
         let hour = Duration::from_secs(3600);
-        let checkpoints = Arc::new(Checkpoints::new(
-            Some(path.clone()),
-            hour,
-            hour,
-            None,
-            false,
-        ));
+        let checkpoints = Arc::new(Checkpoints::new(Some(path.clone()), Some(hour), hour, None));
         let current = Arc::new(ArcSwap::from_pointee(snapshot(1)));
 
         // A background save of generation 1 (the first scan): it holds the
