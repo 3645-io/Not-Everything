@@ -7,11 +7,12 @@
 //!
 //! For the performance gate: `sample` records a process's resource use
 //! (macOS only), `churn` keeps files changing at a steady rate, and
-//! `perf-compare` judges metrics against a baseline file.
+//! `perf-compare` judges metrics against a baseline file, and
+//! `perf-release` writes the performance section of a release's notes.
 //!
 //! Argument parsing is hand-written (std only). Bad arguments print usage
 //! to stderr and exit with code 2; I/O failures exit with code 1, except in
-//! `gate-summary`, `phase1-summary` and `perf-compare`, where an unreadable
+//! `gate-summary`, `phase1-summary`, `perf-compare` and `perf-release`, where an unreadable
 //! input exits with code 2 and code 1 means a gate did not pass. `sample`
 //! and `churn` also exit with code 2 when their new folder already exists
 //! or has no parent.
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use fx_bench::{
     BenchConfig, CacheState, MachineInfo, Names, TreeShape, churn, gate, gate1, generate_names,
-    generate_tree, materialize, perf, run,
+    generate_tree, materialize, perf, release, run,
 };
 
 const USAGE: &str = "\
@@ -81,6 +82,14 @@ usage:
       every file as SKIPPED instead of NOT MEASURED. Exits 0 when no gated
       metric is FAIL or NOT MEASURED, 1 otherwise, and 2 for bad arguments,
       an unreadable or malformed file, or an existing --out file.
+  fx-bench perf-release --baseline FILE --previous FILE --previous-label LABEL --label LABEL [--notes FILE] [--out FILE] METRICS_FILE...
+      Print the performance section of a release's notes: LABEL's metrics
+      (the METRICS_FILEs) against the previous release's (--previous) and the
+      targets in the baseline FILE, as a summary table of the [meta] table's
+      'summary' IDs, the --notes FILE's lines, then every metric in a folded
+      <details> table, each row marked with coloured dots. --out also writes
+      it to a new file. Exits 0, or 2 for bad arguments, an unreadable or
+      malformed file, a baseline without a 'summary', or an existing --out.
   fx-bench help
       Print this message.";
 
@@ -132,6 +141,7 @@ fn main() -> ExitCode {
         Ok(Command::Sample(args)) => cmd_sample(args),
         Ok(Command::Churn { dir, opts }) => cmd_churn(&dir, &opts),
         Ok(Command::PerfCompare(args)) => cmd_perf_compare(&args),
+        Ok(Command::PerfRelease(args)) => cmd_perf_release(&args),
         Ok(cmd) => match execute(cmd) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
@@ -181,6 +191,7 @@ enum Command {
         opts: churn::Options,
     },
     PerfCompare(PerfCompareArgs),
+    PerfRelease(PerfReleaseArgs),
 }
 
 /// The arguments of `sample`. They are only read on macOS, where the
@@ -203,6 +214,17 @@ struct PerfCompareArgs {
     out: Option<PathBuf>,
     print_values: bool,
     partial: bool,
+    metrics: Vec<PathBuf>,
+}
+
+/// The arguments of `perf-release`.
+struct PerfReleaseArgs {
+    baseline: PathBuf,
+    previous: PathBuf,
+    previous_label: String,
+    label: String,
+    notes: Option<PathBuf>,
+    out: Option<PathBuf>,
     metrics: Vec<PathBuf>,
 }
 
@@ -237,6 +259,11 @@ struct Flags {
     tier: Option<perf::Tier>,
     print_values: bool,
     partial: bool,
+    previous: Option<PathBuf>,
+    previous_label: Option<String>,
+    /// `perf-release --label`: a release's name, such as `0.4.0-RC-1`.
+    release_label: Option<String>,
+    notes: Option<PathBuf>,
     /// Positional arguments; only `gate-summary`, `phase1-summary` and
     /// `perf-compare` accept them.
     positional: Vec<PathBuf>,
@@ -275,11 +302,19 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             "--print-values",
             "--partial",
         ],
+        "perf-release" => &[
+            "--baseline",
+            "--previous",
+            "--previous-label",
+            "--label",
+            "--notes",
+            "--out",
+        ],
         other => return Err(UsageError(format!("unknown subcommand '{other}'"))),
     };
     let positional = matches!(
         sub.as_str(),
-        "gate-summary" | "phase1-summary" | "perf-compare"
+        "gate-summary" | "phase1-summary" | "perf-compare" | "perf-release"
     );
     let flags = parse_flags(sub, rest, allowed, positional)?;
 
@@ -416,6 +451,30 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                 metrics: flags.positional,
             }))
         }
+        "perf-release" => {
+            let (Some(baseline), Some(previous), Some(previous_label), Some(label)) = (
+                flags.baseline,
+                flags.previous,
+                flags.previous_label,
+                flags.release_label,
+            ) else {
+                return Err(UsageError(format!(
+                    "{sub}: --baseline, --previous, --previous-label and --label are required"
+                )));
+            };
+            if flags.positional.is_empty() {
+                return Err(UsageError(format!("{sub}: no metrics files given")));
+            }
+            Ok(Command::PerfRelease(PerfReleaseArgs {
+                baseline,
+                previous,
+                previous_label,
+                label,
+                notes: flags.notes,
+                out: flags.out,
+                metrics: flags.positional,
+            }))
+        }
         _ => {
             let iterations = flags.iterations.unwrap_or(DEFAULT_BENCH_ITERATIONS);
             if iterations == 0 {
@@ -491,7 +550,19 @@ fn parse_flags(
                 .interval
                 .replace(seconds(sub, flag, value()?)?)
                 .is_some(),
+            // A release's name has dots and capitals; a sample label is a
+            // metric-key prefix.
+            "--label" if sub == "perf-release" => flags
+                .release_label
+                .replace(label(sub, flag, value()?)?)
+                .is_some(),
             "--label" => flags.label.replace(metric_label(sub, value()?)?).is_some(),
+            "--previous" => flags.previous.replace(PathBuf::from(value()?)).is_some(),
+            "--previous-label" => flags
+                .previous_label
+                .replace(label(sub, flag, value()?)?)
+                .is_some(),
+            "--notes" => flags.notes.replace(PathBuf::from(value()?)).is_some(),
             "--burst-pct" => flags
                 .burst_pct
                 .replace(positive(sub, flag, value()?)?)
@@ -777,6 +848,82 @@ fn cmd_perf_compare(args: &PerfCompareArgs) -> ExitCode {
     }
 }
 
+/// `perf-release`: reads the baseline, the previous release's metrics,
+/// this release's metrics and the notes, then prints the section (and
+/// writes it to `--out`). Exits 2 for an unreadable or malformed file, a
+/// baseline without a `summary`, an existing `--out` or a failed write.
+fn cmd_perf_release(args: &PerfReleaseArgs) -> ExitCode {
+    let fail = |msg: String| {
+        eprintln!("fx-bench: perf-release: {msg}");
+        ExitCode::from(2)
+    };
+    if let Some(out) = &args.out {
+        if fs::symlink_metadata(out).is_ok() {
+            return fail(format!(
+                "'{}' already exists; --out writes a new file",
+                out.display()
+            ));
+        }
+    }
+    let read = |path: &Path| {
+        fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))
+    };
+    let baseline = match read(&args.baseline).and_then(|text| {
+        perf::parse_baseline(&text, &args.baseline.display().to_string()).map_err(|e| e.to_string())
+    }) {
+        Ok(b) => b,
+        Err(msg) => return fail(msg),
+    };
+    if baseline.meta.summary.is_empty() {
+        return fail(format!(
+            "{} has no 'summary' in [meta]: name the metric IDs of the summary table",
+            args.baseline.display()
+        ));
+    }
+    let load = |paths: &[PathBuf]| -> Result<perf::Samples, String> {
+        let mut samples = perf::Samples::default();
+        for path in paths {
+            read(path).and_then(|text| {
+                perf::parse_metrics(&text, &path.display().to_string(), &mut samples)
+                    .map_err(|e| e.to_string())
+            })?;
+        }
+        Ok(samples)
+    };
+    let previous = match load(std::slice::from_ref(&args.previous)) {
+        Ok(s) => s,
+        Err(msg) => return fail(msg),
+    };
+    let current = match load(&args.metrics) {
+        Ok(s) => s,
+        Err(msg) => return fail(msg),
+    };
+    let notes = match args.notes.as_deref().map(read).transpose() {
+        Ok(n) => n,
+        Err(msg) => return fail(msg),
+    };
+    let section = release::render(&release::ReleaseInput {
+        baseline: &baseline,
+        previous: &previous,
+        current: &current,
+        previous_label: &args.previous_label,
+        label: &args.label,
+        notes: notes.as_deref(),
+    });
+    if let Some(out) = &args.out {
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, section.as_bytes()));
+        if let Err(e) = written {
+            return fail(format!("cannot write '{}': {e}", out.display()));
+        }
+    }
+    print!("{section}");
+    ExitCode::SUCCESS
+}
+
 /// `gate-summary`: reads every log (read-only), prints the table and maps
 /// the outcome to an exit code (0 all pass, 1 otherwise, 2 unreadable log).
 fn cmd_gate_summary(machine: &str, cache: CacheState, fmt: Format, logs: &[PathBuf]) -> ExitCode {
@@ -869,7 +1016,8 @@ fn execute(cmd: Command) -> Result<(), String> {
         | Command::Phase1Summary { .. }
         | Command::Sample(_)
         | Command::Churn { .. }
-        | Command::PerfCompare(_) => {
+        | Command::PerfCompare(_)
+        | Command::PerfRelease(_) => {
             unreachable!("these commands set their own exit code and are run from main")
         }
     }

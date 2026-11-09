@@ -207,6 +207,9 @@ pub struct Meta {
     pub cache: Option<String>,
     pub build: Option<String>,
     pub date: Option<String>,
+    /// The metric IDs of a release's summary table, in order
+    /// (`fx-bench perf-release`); each one is a metric table of the file.
+    pub summary: Vec<String>,
 }
 
 /// One metric table of the baseline file.
@@ -276,8 +279,9 @@ pub const METRIC_KEYS: &[&str] = &[
     "exception",
 ];
 
-/// The keys the `[meta]` table may hold, all strings.
-pub const META_KEYS: &[&str] = &["machine", "cache", "build", "date"];
+/// The keys the `[meta]` table may hold, all strings. `summary` lists
+/// metric IDs separated by spaces.
+pub const META_KEYS: &[&str] = &["machine", "cache", "build", "date", "summary"];
 
 /// The reserved table name of the header table.
 const META_TABLE: &str = "meta";
@@ -425,6 +429,7 @@ pub fn parse_baseline(text: &str, source: &str) -> Result<Baseline, ParseError> 
     }
 
     let mut meta = Meta::default();
+    let mut summary_line = 0;
     for (key, (value, line)) in meta_fields {
         let Value::Str(s) = value else {
             return Err(err(
@@ -436,6 +441,10 @@ pub fn parse_baseline(text: &str, source: &str) -> Result<Baseline, ParseError> 
             "machine" => meta.machine = Some(s),
             "cache" => meta.cache = Some(s),
             "build" => meta.build = Some(s),
+            "summary" => {
+                meta.summary = s.split_whitespace().map(str::to_string).collect();
+                summary_line = line;
+            }
             _ => meta.date = Some(s),
         }
     }
@@ -444,6 +453,22 @@ pub fn parse_baseline(text: &str, source: &str) -> Result<Baseline, ParseError> 
         .into_iter()
         .map(|t| build_metric(t, &err))
         .collect::<Result<Vec<_>, _>>()?;
+    // The summary names metrics of this file, each once, so a typo can't
+    // drop a row from a release's notes unnoticed.
+    for (i, id) in meta.summary.iter().enumerate() {
+        if !metrics.iter().any(|m| &m.id == id) {
+            return Err(err(
+                summary_line,
+                format!("'summary' in [meta] lists {id}, which is not a metric table"),
+            ));
+        }
+        if meta.summary[..i].contains(id) {
+            return Err(err(
+                summary_line,
+                format!("'summary' in [meta] lists {id} twice"),
+            ));
+        }
+    }
     Ok(Baseline { meta, metrics })
 }
 
@@ -937,7 +962,7 @@ fn target_pending(m: &Metric, base: Option<f64>) -> bool {
 }
 
 /// Whether `value` misses the metric's target; false without one.
-fn misses_target(m: &Metric, value: f64) -> bool {
+pub(crate) fn misses_target(m: &Metric, value: f64) -> bool {
     m.target.is_some_and(|t| match m.better {
         Better::Lower => !at_most(value, t),
         Better::Higher => !at_most(t, value),
@@ -1003,18 +1028,18 @@ fn check(
 }
 
 /// max(|baseline| × allow_pct / 100, allow_floor), or 0 when neither is set.
-fn allowance(m: &Metric, base: f64) -> f64 {
+pub(crate) fn allowance(m: &Metric, base: f64) -> f64 {
     let pct = m.allow_pct.map_or(0.0, |p| base.abs() * p / 100.0);
     pct.max(m.allow_floor.unwrap_or(0.0))
 }
 
 /// `a <= b`, forgiving the last bits of decimal rounding so a value exactly
 /// at a limit such as 9.3 + 10% passes.
-fn at_most(a: f64, b: f64) -> bool {
+pub(crate) fn at_most(a: f64, b: f64) -> bool {
     a <= b + tolerance(b)
 }
 
-fn nearly_equal(a: f64, b: f64) -> bool {
+pub(crate) fn nearly_equal(a: f64, b: f64) -> bool {
     (a - b).abs() <= tolerance(b)
 }
 

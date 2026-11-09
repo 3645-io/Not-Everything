@@ -97,6 +97,17 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 | O1 | DMG size | `dmg_bytes` | none | 5% | R |
 | O2 | `not-everything` query time over a 2M-entry saved index (tracked) | `cli_query_ms` | ≤100 ms | tracked | Q P |
 
+## In release notes
+
+Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes, refusing to publish a release candidate or a release without a passing check of the same commit.
+
+GitHub strips text colour from release notes, so each row carries a dot next to its words:
+
+- Change: 🟢 better · ⚪ the same, within 1% · 🟡 worse but within the allowed regression · 🔴 worse than the allowed regression.
+- Target met: 🟢 met · 🟡 not yet · 🔴 missed, though the previous release met it. An ungated metric adds "(tracked)".
+
+Each release's measured values are kept in `docs/gates/releases/<version>.txt` (the release script writes them to its output folder as `metrics-<label>.txt`), so the next release has its "previous" column. Hand-written notes for the section go in `notes.md` in the perf-check folder.
+
 ## Changing the baseline
 
 - **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date.

@@ -58,6 +58,7 @@ mod harness;
 mod materialize;
 mod names;
 pub mod perf;
+pub mod release;
 mod rng;
 pub mod sample;
 mod tree;

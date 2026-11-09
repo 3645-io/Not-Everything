@@ -91,6 +91,32 @@ numbers (for example in `docs/gates/`):
 - Record the exact command, including `--count`, `--seed` and
   `--iterations`, alongside p50 and p95.
 
+## Release notes: perf-release
+
+`perf-release` writes the Performance section of a release's GitHub notes:
+this release's metrics against the previous release's and the targets of
+the baseline file.
+
+```sh
+cargo run --release -p fx-bench -- perf-release \
+    --baseline docs/gates/perf-baseline.toml \
+    --previous docs/gates/releases/0.3.2.txt --previous-label 0.3.2 \
+    --label 0.4.0-RC-1 [--notes perf/notes.md] [--out performance.md] \
+    perf/metrics.txt
+```
+
+The section is a summary table of the IDs in the baseline's `[meta]`
+`summary` (by name, without IDs), the `--notes` file's lines, and then every
+metric of the baseline in a `<details>` block, grouped by the first letter
+of its ID. GitHub strips text colour from release notes, so each row has a
+dot beside its words: Change is 🟢 better, ⚪ the same (within 1%), 🟡
+worse but within the metric's allowance, or 🔴 worse than the allowance,
+measured from the previous release's value; Target met is 🟢 met, 🟡 not
+yet, or 🔴 missed though the previous release met it, with "(tracked)" for
+an ungated metric. A metric without a value reads "not measured". It exits
+0, or 2 for bad arguments, an unreadable or malformed file, a baseline
+without a `summary`, or an existing `--out` file.
+
 ## Gate summary
 
 `gate-summary` turns the logs of the Phase 0 gate benchmarks into one
