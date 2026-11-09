@@ -453,3 +453,98 @@ fn write_report_never_replaces_a_file() {
     assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
     assert_eq!(kept, "keep me");
 }
+
+// ---------------------------------------------------------------------------
+// Metric lines
+// ---------------------------------------------------------------------------
+
+/// The value of the `key=value` line for `key` in `report`, if there is one.
+fn metric(report: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    let values: Vec<&str> = report
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .collect();
+    assert!(values.len() <= 1, "{key} appears twice:\n{report}");
+    values.first().map(|v| v.to_string())
+}
+
+#[test]
+fn report_gives_the_measured_values_as_metric_lines() {
+    let mut p = GateProbe::new(2_000_000);
+    p.set_first_result(Duration::from_micros(812_346));
+    for i in 1..=100 {
+        p.record_keystroke(ms(i));
+    }
+    for i in 1..=20 {
+        p.record_frame(ms(i));
+    }
+    let report = p.report_text();
+    assert_eq!(metric(&report, "launch_ms").as_deref(), Some("812.35"));
+    assert_eq!(
+        metric(&report, "keystroke_p95_ms").as_deref(),
+        Some("95.00")
+    );
+    assert_eq!(metric(&report, "scroll_p95_ms").as_deref(), Some("19.00"));
+    assert_eq!(metric(&report, "ui_entries").as_deref(), Some("2000000"));
+}
+
+#[test]
+fn metric_lines_agree_with_the_gate_lines() {
+    let p = passing_probe();
+    let report = p.report_text();
+    let keystroke = line_for(&p, "keystroke").detail.unwrap_or_default();
+    let p95 = metric(&report, "keystroke_p95_ms").expect("a keystroke p95");
+    assert!(
+        keystroke.starts_with(&format!("p95={p95}ms")),
+        "{keystroke:?} vs {p95}"
+    );
+    let frame = line_for(&p, "frame").detail.unwrap_or_default();
+    let scroll = metric(&report, "scroll_p95_ms").expect("a scroll p95");
+    assert!(
+        frame.starts_with(&format!("p95={scroll}ms")),
+        "{frame:?} vs {scroll}"
+    );
+    let startup = line_for(&p, "first result").detail.unwrap_or_default();
+    let launch = metric(&report, "launch_ms").expect("a launch time");
+    assert!(
+        startup.starts_with(&format!("{launch} ms")),
+        "{startup:?} vs {launch}"
+    );
+}
+
+/// A value without samples has no line, so a script never reads a made-up
+/// number; the entry count is always there.
+#[test]
+fn a_metric_without_samples_has_no_line() {
+    let report = GateProbe::new(1234).report_text();
+    for key in ["launch_ms", "keystroke_p95_ms", "scroll_p95_ms"] {
+        assert_eq!(metric(&report, key), None, "{key}:\n{report}");
+    }
+    assert_eq!(metric(&report, "ui_entries").as_deref(), Some("1234"));
+}
+
+/// `scripts/phase1-gate.sh` reads the header and the GATE lines: they come
+/// first and read as before, with the metric lines after them.
+#[test]
+fn the_metric_lines_follow_the_unchanged_report() {
+    let p = passing_probe();
+    let gates = p.gate_lines();
+    let before = format!(
+        "fx-ui-macos gate probe: 2000000 entries\nkeystroke samples: 40\nautoscroll frames: 200\n{}\n{}\n{}\n",
+        gates[0], gates[1], gates[2]
+    );
+    let report = p.report_text();
+    assert!(report.starts_with(&before), "{report}");
+    let rest = &report[before.len()..];
+    assert!(!rest.is_empty(), "metric lines follow:\n{report}");
+    for line in rest.lines() {
+        let (key, value) = line.split_once('=').expect("key=value");
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "{line}"
+        );
+        assert!(!value.is_empty(), "{line}");
+    }
+}

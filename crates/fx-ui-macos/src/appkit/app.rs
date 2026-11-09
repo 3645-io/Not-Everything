@@ -6,6 +6,11 @@
 //! a [`SwitchableSource`]: when access is granted, the window moves to a
 //! full-access engine over the same root without a relaunch (see
 //! `open_full_index`).
+//!
+//! The stores and the settings live in the data folder
+//! ([`AppArgs::data_folder`]): the app's folder under Application Support,
+//! or with `--data-dir` (a `measure` build) the measurement's own folder.
+//! Such a run registers no global hotkey and leaves the login item alone.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -25,12 +30,12 @@ use fx_fs_macos::scan::ScanOptions;
 
 use super::window::{self, FullIndexSwitch, ResidentConfig, WindowConfig};
 use crate::APP_NAME;
-use crate::app_args::{AppArgs, StoreScope, store_path_for};
+use crate::app_args::{AppArgs, StoreScope, app_data_folder, store_path_in};
 use crate::build_info::{BuildInfo, Showing, window_title};
 use crate::data_folder::make_store_folders_private;
 use crate::limited::ExcludingChangeSource;
 use crate::onboarding::{Onboarding, OnboardingEvent};
-use crate::settings::{Settings, user_settings_path};
+use crate::settings::{Settings, settings_path_in, user_settings_path};
 use crate::source::{EngineSource, ResultsSource};
 use crate::switchable::SwitchableSource;
 use crate::your_files::your_folders;
@@ -77,11 +82,26 @@ pub fn launch(args: AppArgs, process_start: Instant) -> Result<(), AppError> {
     let measuring = args.measuring();
     #[cfg(feature = "measure")]
     arm_measure_watchdog(&args);
+    #[cfg(feature = "measure")]
+    if args.has_data_dir() {
+        // Before the resident side reads the login item's status.
+        super::login_item::keep_off();
+    }
+
+    // Where the stores go: the --data-dir folder, else the app's data
+    // folder under the home folder (none without one: no store is kept).
+    let data_folder = args
+        .data_dir()
+        .map(Path::to_path_buf)
+        .or_else(|| user_home().map(|home| app_data_folder(&home)));
 
     // Settings and the Full Disk Access probe come before the scanner, so
     // limited mode can exclude the folders that would raise a consent
     // prompt.
-    let settings_path = user_settings_path();
+    let settings_path = match args.data_dir() {
+        Some(dir) => Some(settings_path_in(dir)),
+        None => user_settings_path(),
+    };
     let settings = match settings_path.as_deref().map(Settings::load) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
@@ -114,7 +134,7 @@ pub fn launch(args: AppArgs, process_start: Instant) -> Result<(), AppError> {
             // replaying the limited store's snapshot and cursor.
             let scope = StoreScope::for_access(launch_output.access);
             debug_assert_eq!(launch_output.limited_mode, scope == StoreScope::Limited);
-            let engine = open_engine(&root, scan, excluded, scope)
+            let engine = open_engine(&root, scan, excluded, scope, data_folder.as_deref())
                 .map_err(|e| AppError::Engine(root.clone(), e))?;
             let title = window_title(BuildInfo::CURRENT, Showing::Root(&root), measuring);
             let engine: Arc<dyn ResultsSource> =
@@ -125,7 +145,7 @@ pub fn launch(args: AppArgs, process_start: Instant) -> Result<(), AppError> {
                 let switchable = Arc::new(SwitchableSource::new(engine));
                 full_index = Some(FullIndexSwitch {
                     source: Arc::clone(&switchable),
-                    open: Box::new(move || open_full_index(&root)),
+                    open: Box::new(move || open_full_index(&root, data_folder.as_deref())),
                 });
                 (switchable, title)
             } else {
@@ -144,6 +164,12 @@ pub fn launch(args: AppArgs, process_start: Instant) -> Result<(), AppError> {
         launch_probe: args.launch_probe,
         #[cfg(feature = "measure")]
         gate_probe: args.gate_probe.clone(),
+        #[cfg(feature = "measure")]
+        summon_probe: args.summon_probe.clone(),
+        #[cfg(feature = "measure")]
+        sort_probe: args.sort_probe.clone(),
+        #[cfg(feature = "measure")]
+        window_start: args.window.clone(),
         process_start,
         // Measurement runs stay plain window apps: no status item, hotkey
         // or onboarding timers.
@@ -152,7 +178,9 @@ pub fn launch(args: AppArgs, process_start: Instant) -> Result<(), AppError> {
             settings_path,
             onboarding,
             launch_output,
-            hotkey: true,
+            // A run with its own data folder must not take the daily app's
+            // shortcut.
+            hotkey: !args.has_data_dir(),
             full_index,
         }),
     })
@@ -179,10 +207,10 @@ fn synthetic_source(args: &AppArgs) -> Option<(Arc<dyn ResultsSource>, String)> 
 /// full-scope store, which it loads when there is one and otherwise fills
 /// with a first scan. Runs on the switch thread, beside the limited engine
 /// (see [`SwitchableSource::switch_when_ready`]).
-fn open_full_index(root: &Path) -> Result<Arc<dyn ResultsSource>, String> {
+fn open_full_index(root: &Path, data: Option<&Path>) -> Result<Arc<dyn ResultsSource>, String> {
     let excluded = limited_exclusions(false);
     let scan = scan_options(&excluded, root).map_err(|e| e.to_string())?;
-    let engine = open_engine(root, scan, excluded, StoreScope::Full)
+    let engine = open_engine(root, scan, excluded, StoreScope::Full, data)
         .map_err(|e| AppError::Engine(root.to_path_buf(), e).to_string())?;
     Ok(Arc::new(EngineSource::new(Arc::new(engine), root)))
 }
@@ -240,9 +268,11 @@ fn scan_options(excluded: &[PathBuf], root: &Path) -> Result<ScanOptions, AppErr
 }
 
 /// Opens an engine over `root` with the macOS scanner, FSEvents source and
-/// `lstat` path stat, loading the root's store for `scope` when there is one
-/// (and falling back to a first scan when there is not). A store built in the
-/// other scope is never opened: see [`store_path_for`].
+/// `lstat` path stat, loading the root's store for `scope` in the data
+/// folder `data` when there is one (and falling back to a first scan when
+/// there is not). A store built in the other scope is never opened: see
+/// [`store_path_in`]. Without a data folder (no home folder) no store is
+/// kept.
 ///
 /// The engine's priority folders are your folders under the resolved home
 /// folder ([`your_folders`]), whatever the "Your files first" setting, so
@@ -258,6 +288,7 @@ fn open_engine(
     scan: ScanOptions,
     excluded: Vec<PathBuf>,
     scope: StoreScope,
+    data: Option<&Path>,
 ) -> std::io::Result<Engine> {
     let mut config = EngineConfig::new(root);
     if let Some(home) = user_home() {
@@ -265,7 +296,9 @@ fn open_engine(
         let resolved = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
         let yours = your_folders(&resolved);
         config = config.with_priority_folders(yours.include, yours.exclude);
-        let store = store_path_for(&home, root, scope);
+    }
+    if let Some(data) = data {
+        let store = store_path_in(data, root, scope);
         // The data folder and its stores folder are the owner's only: the
         // index holds the names of files in protected folders. They are
         // created or tightened here; the engine's saves only create a
@@ -284,13 +317,20 @@ fn open_engine(
     )
 }
 
-/// Arms the watchdog of the measurement `args` asks for, if any.
+/// Arms the watchdog of the measurement `args` asks for, if any. A
+/// `--window` run is not a measurement and gets none: it runs until it is
+/// quit or gets SIGTERM.
 #[cfg(feature = "measure")]
 fn arm_measure_watchdog(args: &AppArgs) {
     if args.gate_probe.is_some() {
         // The gate probe waits up to a minute for the first result and up
         // to `STEP_TIMEOUT` per scripted step before it gives up on them.
         arm_watchdog(Duration::from_secs(900));
+    } else if args.summon_probe.is_some() || args.sort_probe.is_some() {
+        // Up to `LIST_TIMEOUT` (300 s) for a steady list, then at most 50
+        // cycles of `HIDE_TIMEOUT` and `READY_TIMEOUT` (8 s), or 48 clicks
+        // of `STEP_TIMEOUT` (10 s).
+        arm_watchdog(Duration::from_secs(1200));
     } else if args.measuring() {
         arm_watchdog(Duration::from_secs(120));
     }

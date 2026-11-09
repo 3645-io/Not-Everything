@@ -766,6 +766,16 @@ impl ResultsCard {
         self.restyle_header();
     }
 
+    /// The click target of `column`'s title, which the re-sort probe sends
+    /// the action of, as a click does.
+    #[cfg(feature = "measure")]
+    pub(crate) fn header_target(&self, column: Column) -> Option<&objc2_app_kit::NSControl> {
+        self.columns
+            .iter()
+            .find(|h| h.column == column)
+            .map(|h| &***h.button)
+    }
+
     /// The column of a header click target's `tag`.
     pub(crate) fn column_for_tag(tag: isize) -> Option<Column> {
         usize::try_from(tag - HEADER_TAG)
