@@ -86,12 +86,12 @@ mod checkpoint;
 mod config;
 mod health;
 mod memory;
+mod paths;
 mod priority;
 pub mod qos;
 mod query;
 mod reader;
 mod snapshot;
-mod tree;
 mod writer;
 
 use std::io;
@@ -123,7 +123,6 @@ pub use snapshot::{ENGINE_SORT_KEYS, EngineSnapshot, Generation};
 use checkpoint::Checkpoints;
 use health::HealthState;
 use priority::PriorityFolders;
-use tree::Tree;
 use writer::{Recovery, Writer};
 
 /// State shared between the [`Engine`] handle and its threads.
@@ -274,18 +273,14 @@ impl Engine {
         // stable while a batch is recorded.
         index.set_compact_fraction(f64::INFINITY);
         let snap = index.snapshot();
-        let orders: Vec<Order> = orders.unwrap_or_else(|| {
-            ENGINE_SORT_KEYS
-                .iter()
-                .map(|&k| Order::build(&*snap, k))
-                .collect()
-        });
+        let orders: Vec<Order> =
+            orders.unwrap_or_else(|| Order::build_keys(&*snap, &ENGINE_SORT_KEYS));
         let orders = Arc::new(orders);
-        let tree = Tree::from_snapshot(&snap);
         let (include, exclude) = config.priority_folders();
         let priority = PriorityFolders::new(config.root(), include, exclude);
-        let group = priority.group(&tree, &snap, &orders);
-        let full_rescan = force_rescan || outcome != StartOutcome::Resumed || tree.len() == 0;
+        let group = priority.group(&index, &snap, &orders);
+        let full_rescan =
+            force_rescan || outcome != StartOutcome::Resumed || index.live_count() == 0;
         let shared = Arc::new(Shared {
             current: ArcSwap::from_pointee(EngineSnapshot {
                 index: snap,
@@ -313,7 +308,6 @@ impl Engine {
         });
         let writer = Writer {
             index,
-            tree,
             orders,
             root: config.root().to_path_buf(),
             window: config.batch_window(),
@@ -324,6 +318,7 @@ impl Engine {
             shared: Arc::clone(&shared),
             generation: 0,
             batch: Batch::new(),
+            orders_stale: false,
             full_rescan_pending: full_rescan,
             in_full_rescan: false,
             recovery: Recovery::new(config.restart_threshold(), config.restart_backoff()),

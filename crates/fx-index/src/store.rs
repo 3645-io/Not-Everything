@@ -50,7 +50,7 @@ pub(crate) struct Base {
 }
 
 /// SplitMix64 finalizer over the key; inode numbers are often sequential.
-fn hash_key(key: FileKey) -> u64 {
+pub(crate) fn hash_key(key: FileKey) -> u64 {
     let mut z = key.file_id ^ u64::from(key.volume.0).rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -58,7 +58,7 @@ fn hash_key(key: FileKey) -> u64 {
 }
 
 /// Maps a hash onto `0..buckets` without a modulo (multiply-high).
-fn bucket(hash: u64, buckets: usize) -> usize {
+pub(crate) fn bucket(hash: u64, buckets: usize) -> usize {
     ((u128::from(hash) * buckets as u128) >> 64) as usize
 }
 

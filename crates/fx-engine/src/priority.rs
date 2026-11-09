@@ -2,7 +2,7 @@
 //! snapshot that lie in the configured priority folders and are not hidden.
 //!
 //! The writer rebuilds the group whenever it publishes a snapshot with a
-//! changed index: it resolves the listed folders through its path tree,
+//! changed index: it resolves the listed folders through the index,
 //! reads the hidden entries (names starting with `.`) off the merged Name
 //! order with [`fx_sort::hidden_entries`], then reads the listed subtrees
 //! off the merged Path order with [`fx_sort::group_subtrees`], skipping the
@@ -17,7 +17,9 @@ use std::sync::Arc;
 use fx_model::EntryId;
 use fx_sort::{MatchSet, Order, SortKey, group_subtrees, hidden_entries};
 
-use crate::tree::Tree;
+use fx_index::Index;
+
+use crate::paths;
 
 /// The configured priority folders, resolved against the engine's root.
 #[derive(Debug, Clone, Default)]
@@ -42,11 +44,11 @@ impl PriorityFolders {
         }
     }
 
-    /// The group of `snap` (whose live entries `tree` mirrors), read from
-    /// the Path order among `orders`. `None` without priority folders.
+    /// The group of `snap` (a snapshot of `index`), read from the Path
+    /// order among `orders`. `None` without priority folders.
     pub(crate) fn group(
         &self,
-        tree: &Tree,
+        index: &Index,
         snap: &fx_index::Snapshot,
         orders: &[Order],
     ) -> Option<Arc<MatchSet>> {
@@ -55,7 +57,7 @@ impl PriorityFolders {
         }
         let order = |key: SortKey| orders.iter().find(|o| o.key == key);
         let (path, name) = (order(SortKey::Path)?, order(SortKey::Name)?);
-        let listed = self.resolve(tree, snap);
+        let listed = self.resolve(index, snap);
         // Hidden entries and everything inside hidden folders are never
         // first (the owner's rule).
         let hidden = hidden_entries(name, snap);
@@ -65,10 +67,9 @@ impl PriorityFolders {
     /// The listed folders that exist in `snap`, as entry IDs with their
     /// flag. Folders at or above the root decide for the root entry: the
     /// deepest one wins, and an exclusion wins a tie.
-    fn resolve(&self, tree: &Tree, snap: &fx_index::Snapshot) -> Vec<(EntryId, bool)> {
+    fn resolve(&self, index: &Index, snap: &fx_index::Snapshot) -> Vec<(EntryId, bool)> {
         let id_of = |path: &Path| {
-            tree.resolve(&self.root, path)
-                .and_then(|key| snap.lookup(key))
+            paths::resolve(index, &self.root, path, None).and_then(|id| snap.lookup(index.key(id)))
         };
         let mut listed = Vec::with_capacity(self.folders.len());
         let mut above_root: Option<(usize, bool)> = None;

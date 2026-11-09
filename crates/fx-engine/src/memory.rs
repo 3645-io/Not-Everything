@@ -15,9 +15,9 @@ use crate::snapshot::EngineSnapshot;
 /// `fx_index::Index::heap_bytes`, so allocated capacity, the uncompacted
 /// delta overlay, the deletion bitset and the extension table are all
 /// counted), plus the merged sort orders at their allocated capacity.
-/// Structures private to the writer thread (the path tree and the
-/// live-children counts) and the refinement cache of the query path are not
-/// part of a snapshot and are not counted.
+/// Structures private to the writer thread (the index's children index,
+/// 4 B per entry plus the delta's rows) and the refinement cache of the
+/// query path are not part of a snapshot and are not counted.
 ///
 /// `Display` prints the benchmark format documented in the crate README:
 /// one `metric=value` per line (`live_entries`, `id_slots`, `total_bytes`,
