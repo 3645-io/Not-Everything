@@ -57,15 +57,18 @@
 //! them; [`Engine::positions_grouped`] does so in the grouped results.
 //!
 //! Checkpoints (see [`EngineConfig::with_store_path`]): the latest snapshot
-//! is saved with its resume cursor through `fx_store::write_checkpoint` when
-//! the engine has been idle for [`EngineConfig::checkpoint_idle`] after the
-//! last change, at the latest [`EngineConfig::checkpoint_max_delay`] after
-//! the first unsaved change, right after a full rescan is published, on
-//! request ([`Engine::checkpoint`], which returns at once when the store
-//! already holds the latest snapshot) and on an orderly
+//! is saved with its resume cursor through `fx_store::write_checkpoint`, and
+//! left out of Time Machine backups, when the engine has been idle for
+//! [`EngineConfig::checkpoint_idle`] after the last change (off by default),
+//! at the latest [`EngineConfig::checkpoint_max_delay`] after the first
+//! unsaved change, right after a full rescan is published, on request
+//! ([`Engine::checkpoint`], which returns at once when the store already
+//! holds the latest snapshot, or [`Engine::request_checkpoint`], which
+//! leaves the save to the checkpoint thread) and on an orderly
 //! [`Engine::shutdown`], which alone sets the clean-shutdown flag. An app
-//! that quits calls [`Engine::checkpoint_for_quit`], which writes nothing
-//! when the store holds a resume cursor.
+//! that quits calls [`Engine::checkpoint_for_quit`], which writes what the
+//! store lacks. The writer thread and the checkpoint thread run at the
+//! utility quality-of-service class ([`qos`]).
 //! [`Engine::open`] loads the store and resumes the change source from the
 //! saved cursor, falling back to a full rescan when the store is missing or
 //! rejected, or the source reports a gap.
@@ -84,6 +87,7 @@ mod config;
 mod health;
 mod memory;
 mod priority;
+pub mod qos;
 mod query;
 mod reader;
 mod snapshot;
@@ -302,8 +306,6 @@ impl Engine {
                 config.checkpoint_idle(),
                 config.checkpoint_max_delay(),
                 saved,
-                // `open` hands a loaded store's cursor to the config.
-                saved.is_some() && config.resume_from().is_some(),
             ),
         });
         let writer = Writer {
@@ -327,7 +329,10 @@ impl Engine {
         };
         let handle = thread::Builder::new()
             .name("fx-engine-writer".into())
-            .spawn(move || writer.run())?;
+            .spawn(move || {
+                qos::set_current_thread_class(qos::ThreadClass::Utility);
+                writer.run();
+            })?;
         let mut engine = Engine {
             shared,
             writer: Some(handle),
@@ -341,7 +346,10 @@ impl Engine {
             // On error, dropping `engine` stops the writer again.
             let handle = thread::Builder::new()
                 .name("fx-engine-checkpoint".into())
-                .spawn(move || shared.checkpoints.run_idle(&shared.current))?;
+                .spawn(move || {
+                    qos::set_current_thread_class(qos::ThreadClass::Utility);
+                    shared.checkpoints.run_idle(&shared.current);
+                })?;
             engine.checkpointer = Some(handle);
         }
         Ok(engine)
@@ -551,16 +559,32 @@ impl Engine {
         self.shared.checkpoints.save(&self.shared.current, false)
     }
 
+    /// Asks the checkpoint thread to save the latest published snapshot, as
+    /// [`checkpoint`](Self::checkpoint) would, and returns at once: for a
+    /// caller that must not wait for the write, such as the app's daily
+    /// save on the main thread. Nothing happens without a store path, when
+    /// the store already holds the latest snapshot, or after
+    /// [`checkpoint_for_quit`](Self::checkpoint_for_quit).
+    pub fn request_checkpoint(&self) {
+        self.shared.checkpoints.request();
+    }
+
+    /// When the store was last written; `None` without a store path or
+    /// before the first save.
+    pub fn saved_at(&self) -> Option<std::time::SystemTime> {
+        self.shared.checkpoints.saved_at()
+    }
+
     /// The save for an app that is quitting, and so exits without dropping
-    /// the engine. It makes sure the next [`Engine::open`] can load the
-    /// index, writing as little as possible:
+    /// the engine. The app saves the store only once a day, so a quit
+    /// writes what the store lacks rather than leave the next launch up to
+    /// a day of changes to replay:
     ///
-    /// - [`QuitSave::Skip`]: nothing is written when the store holds a
-    ///   resume cursor (the next launch loads it and replays the changes
-    ///   made since, as after a crash) or the latest snapshot;
+    /// - [`QuitSave::Skip`]: nothing is written when the store holds the
+    ///   latest snapshot;
     /// - [`QuitSave::WaitForRunning`]: otherwise, when a save is being
-    ///   written (the one right after a first scan), returns once it is
-    ///   done and writes nothing more;
+    ///   written, returns once it is done and writes nothing more (the next
+    ///   launch replays what came after it);
     /// - [`QuitSave::Write`]: otherwise the latest snapshot is written, as
     ///   by [`checkpoint`](Self::checkpoint).
     ///
