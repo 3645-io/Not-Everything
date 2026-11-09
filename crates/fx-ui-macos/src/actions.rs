@@ -2,11 +2,12 @@
 //! search field, what Escape does, the clipboard text and the drag-out
 //! operation mask.
 //!
-//! The MVP is read-only, so [`Action`] has exactly three variants: open,
-//! reveal in Finder and copy the full path. There is deliberately no delete,
-//! rename, move or trash action, and the delete keys map to nothing. Quick
-//! Look on Space is not built yet. Escape ([`escape_action`]) only clears
-//! the search or hides the window; it never acts on a file.
+//! The MVP is read-only, so [`Action`] has exactly four variants: open,
+//! reveal in Finder, copy the full path and Quick Look. There is
+//! deliberately no delete, rename, move or trash action, and the delete keys
+//! map to nothing. Escape ([`escape_action`]) only clears the search or
+//! hides the window, or closes the Quick Look panel
+//! ([`crate::quick_look::preview_command`]); it never acts on a file.
 
 #![forbid(unsafe_code)]
 
@@ -21,12 +22,19 @@ pub enum Action {
     RevealInFinder,
     /// Copy the full paths of the selected items to the clipboard.
     CopyPath,
+    /// Show the selected items in the system Quick Look panel, as Finder's
+    /// Space does (or close the panel when it is open).
+    QuickLook,
 }
 
 impl Action {
     /// Every action.
-    pub const ALL: FixedList<Action, 3> =
-        FixedList([Action::Open, Action::RevealInFinder, Action::CopyPath]);
+    pub const ALL: FixedList<Action, 4> = FixedList([
+        Action::Open,
+        Action::RevealInFinder,
+        Action::CopyPath,
+        Action::QuickLook,
+    ]);
 }
 
 /// A key, as far as the action map cares.
@@ -42,6 +50,8 @@ pub enum Key {
     Delete,
     /// Escape.
     Escape,
+    /// The space bar.
+    Space,
     /// A character key, as typed without modifiers (lowercase letters).
     Char(char),
     /// Any other key.
@@ -67,6 +77,7 @@ pub struct Modifiers {
 /// - Cmd+Return or Cmd+Enter: [`Action::RevealInFinder`].
 /// - Option+Cmd+C: [`Action::CopyPath`], Finder's shortcut for copying a
 ///   pathname.
+/// - Space: [`Action::QuickLook`], as in Finder.
 ///
 /// Everything else, the delete keys with any modifiers included, gives
 /// `None`. Cmd+C alone copies nothing in the results: it is kept for
@@ -80,6 +91,7 @@ pub fn action_for_key(key: Key, mods: Modifiers) -> Option<Action> {
         Key::Return | Key::Enter if plain => Some(Action::Open),
         Key::Return | Key::Enter if cmd_only => Some(Action::RevealInFinder),
         Key::Char(c) if option_cmd && c.eq_ignore_ascii_case(&'c') => Some(Action::CopyPath),
+        Key::Space if plain => Some(Action::QuickLook),
         _ => None,
     }
 }
@@ -101,8 +113,9 @@ pub enum SearchFieldKey {
 ///   result; that is Return in the results ([`action_for_key`]).
 /// - Cmd+Return or Cmd+Enter: [`Action::RevealInFinder`].
 ///
-/// Everything else, Cmd+C included (it copies the field's text), is the
-/// field's own and gives `None`. The Down arrow also moves to the results;
+/// Everything else, Cmd+C included (it copies the field's text) and Space
+/// (it types a space; Quick Look is Space in the results), is the field's
+/// own and gives `None`. The Down arrow also moves to the results;
 /// AppKit reports it as a command, not a key.
 pub fn search_field_key(key: Key, mods: Modifiers) -> Option<SearchFieldKey> {
     let plain = !mods.command && !mods.shift && !mods.option && !mods.control;
@@ -200,11 +213,12 @@ pub fn hide_mode(active_at_summon: bool, other_window_visible: bool) -> HideMode
 /// The action-map key of a key event, from its virtual key code and its
 /// characters ignoring modifiers.
 ///
-/// Return, keypad Enter, Delete (backspace), forward delete and Escape are
-/// recognised by their virtual key codes from Apple's HIToolbox `Events.h`
-/// (`kVK_Return` 36, `kVK_ANSI_KeypadEnter` 76, `kVK_Delete` 51,
-/// `kVK_ForwardDelete` 117, `kVK_Escape` 53); any other key is its first
-/// character, lowercased, or [`Key::Other`] without one.
+/// Return, keypad Enter, Delete (backspace), forward delete, Escape and the
+/// space bar are recognised by their virtual key codes from Apple's
+/// HIToolbox `Events.h` (`kVK_Return` 36, `kVK_ANSI_KeypadEnter` 76,
+/// `kVK_Delete` 51, `kVK_ForwardDelete` 117, `kVK_Escape` 53, `kVK_Space`
+/// 49); any other key is its first character, lowercased, or [`Key::Other`]
+/// without one.
 pub fn key_from_code(key_code: u16, chars: Option<&str>) -> Key {
     match key_code {
         36 => Key::Return,
@@ -212,6 +226,7 @@ pub fn key_from_code(key_code: u16, chars: Option<&str>) -> Key {
         51 => Key::Backspace,
         117 => Key::Delete,
         53 => Key::Escape,
+        49 => Key::Space,
         _ => chars
             .and_then(|s| s.chars().next())
             .map_or(Key::Other, |c| Key::Char(c.to_ascii_lowercase())),

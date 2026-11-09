@@ -10,6 +10,13 @@
 //! standard ones. Cells are [`ResultCell`]s holding a label (and in the
 //! Name column a shared template glyph); their colours don't change with
 //! the selection, so AppKit's emphasized background style is kept out.
+//!
+//! For VoiceOver ([`crate::accessibility`]) each cell names its column and
+//! its text reads in words (set with the text, see `WinController`'s
+//! `cell_view`), so a row reads its cells in order, and the table,
+//! labelled "Results", reports the result count as its row count. The
+//! glyphs, the column titles' texts and chevrons and the syntax examples'
+//! tokens are hidden: the cells and the click targets say what they show.
 
 use std::cell::{Cell, OnceCell};
 
@@ -27,9 +34,11 @@ use objc2_foundation::{NSEdgeInsets, NSRect, NSSize, NSString};
 use super::classes::ResultsTableView;
 use super::drag_operation;
 use super::views::{
-    FlippedView, Flow, HitButton, SurfaceView, clip_to_radius, color, glyph, label, place,
-    place_line, place_text, set_label, set_text, text_height, text_width, wrapping_label,
+    FlippedView, Flow, HitButton, SurfaceView, clip_to_radius, color, glyph, hide_from_voiceover,
+    label, place, place_line, place_text, set_label, set_text, text_height, text_width,
+    wrapping_label,
 };
+use crate::accessibility::column_label;
 use crate::columns::{Column, SortState};
 use crate::main_layout::{CardLayout, Rect, card, empty_content_width, empty_state};
 use crate::surface::Surface;
@@ -239,6 +248,9 @@ impl ResultCell {
         // SAFETY: `initWithFrame:` is NSView's designated initializer.
         let cell: Retained<ResultCell> = unsafe { msg_send![super(this), initWithFrame: frame] };
         cell.setIdentifier(Some(&NSString::from_str(column.identifier())));
+        // Moving cell by cell inside a row, VoiceOver names the column. The
+        // label goes on the cell, not its text, which keeps its value.
+        set_label(&cell, column_label(column));
         let text = label(mtm);
         let (font, align) = match column {
             Column::Name => (&styles::ROW_NAME, NSTextAlignment::Left),
@@ -257,6 +269,9 @@ impl ResultCell {
                 objc2_foundation::NSPoint::new(0.0, ((height - g) / 2.0).round()),
                 NSSize::new(g, g),
             ));
+            // The name's text says "folder"; an unlabelled image would read
+            // "image".
+            hide_from_voiceover(&image);
             cell.addSubview(&image);
             let _ = cell.ivars().glyph.set(image);
             x = g + metrics::GLYPH_GAP;
@@ -353,6 +368,8 @@ impl EmptyState {
             .map(|(i, e)| {
                 let surface = SurfaceView::new(mtm);
                 let token = label(mtm);
+                // Its button reads "Search for ext:pdf".
+                hide_from_voiceover(&token);
                 let meaning = label(mtm);
                 let button = HitButton::new(
                     mtm,
@@ -575,6 +592,9 @@ impl ResultsCard {
         // Drag-out offers copy and link only, to other apps and within this one.
         table.setDraggingSourceOperationMask_forLocal(drag_operation(), false);
         table.setDraggingSourceOperationMask_forLocal(drag_operation(), true);
+        // VoiceOver: "Results, table"; AppKit reports the row count (the
+        // result count) and each row's index.
+        set_label(&table, RESULTS_LABEL);
         scroll.setDocumentView(Some(&table));
 
         let header = FlippedView::new(mtm);
@@ -590,6 +610,10 @@ impl ResultsCard {
                 let label = label(mtm);
                 let chevron = NSImageView::new(mtm);
                 chevron.setImageScaling(NSImageScaling::ScaleNone);
+                // The click target reads "Sort by Name, ascending": the
+                // title and the chevron say nothing more.
+                hide_from_voiceover(&label);
+                hide_from_voiceover(&chevron);
                 let button = HitButton::new(
                     mtm,
                     target,

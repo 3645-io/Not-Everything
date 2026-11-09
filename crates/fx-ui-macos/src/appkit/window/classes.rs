@@ -1,7 +1,8 @@
 //! The Objective-C classes of the product window.
 //!
-//! - [`ResultsTableView`]: an `NSTableView` subclass that maps keys through
-//!   [`action_for_key`] and Escape through [`escape_action`], leaves
+//! - [`ResultsTableView`]: an `NSTableView` subclass that maps Space and
+//!   Escape to the Quick Look panel through [`preview_command`], other keys
+//!   through [`action_for_key`] and Escape through [`escape_action`], leaves
 //!   `copy:` unanswered so Edit > Copy is off, limits drag-out to copy and
 //!   link, tracks the row under the pointer for the rows' hover look and,
 //!   in `measure` builds, records its draw times for the launch and gate
@@ -18,7 +19,9 @@
 //!   top bar, card, callout and status bar, follows the appearance and the
 //!   focus, answers the chips, column titles, syntax examples and ×,
 //!   highlights matches in the visible rows, and times each search for the
-//!   status bar.
+//!   status bar. It controls the Quick Look panel while the panel shows the
+//!   selection (its data source and delegate, see `quick_look.rs`), and
+//!   announces a new search's result count to VoiceOver.
 //! - [`Waker`]: a stateless object the background threads message with
 //!   `performSelectorOnMainThread:` to have the main thread drain the inbox.
 
@@ -40,19 +43,24 @@ use global_hotkey::GlobalHotKeyEvent;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
-    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+    AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationDelegate, NSControl, NSControlTextEditingDelegate, NSDragOperation,
-    NSDraggingContext, NSEvent, NSEventModifierFlags, NSEventType, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSPasteboardWriting, NSResponder, NSSearchFieldDelegate, NSTableColumn, NSTableRowView,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextFieldDelegate,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowOcclusionState, NSWorkspace,
+    NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
+    NSAccessibilityPostNotificationWithUserInfo, NSAccessibilityPriorityKey,
+    NSAccessibilityPriorityLevel, NSApplication, NSApplicationDelegate, NSControl,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingContext, NSEvent,
+    NSEventModifierFlags, NSEventType, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSSearchFieldDelegate, NSTableColumn, NSTableRowView, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextAlignment, NSTextFieldDelegate, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWindow, NSWindowOcclusionState, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSDictionary, NSIndexSet, NSMutableAttributedString, NSMutableIndexSet, NSNotFound,
-    NSNotification, NSNotificationCenter, NSPoint, NSRange, NSRect, NSString, NSTimer, NSURL,
+    NSNotification, NSNotificationCenter, NSNumber, NSPoint, NSRange, NSRect, NSString, NSTimer,
+    NSURL,
 };
 #[cfg(debug_assertions)]
 use objc2_foundation::{NSDate, NSRunLoop};
@@ -60,6 +68,7 @@ use objc2_foundation::{NSDate, NSRunLoop};
 use super::callout::Callout;
 use super::card::{ResultCell, ResultRowView, ResultsCard};
 use super::chrome::{RootView, SearchField, SearchWindow, TopBar};
+use super::quick_look;
 use super::resident::ResidentState;
 use super::status::StatusBar;
 use super::views::{self, Flow, attributes, color, tag_of};
@@ -67,6 +76,7 @@ use super::views::{self, Flow, attributes, color, tag_of};
 use super::{AUTOSCROLL_FRAMES, AUTOSCROLL_ROWS_PER_FRAME};
 use super::{MAX_OPEN, WindowConfig};
 use crate::APP_NAME;
+use crate::accessibility::{cell_speech, results_announcement};
 use crate::actions::{
     Action, EscapeAction, Focus, Key, Modifiers, SearchFieldKey, action_for_key, copy_text,
     escape_action, key_from_code, search_field_key,
@@ -77,8 +87,8 @@ use crate::appkit::time_zone::SystemTimeZone;
 use crate::chips::QueryOptions;
 use crate::columns::{Column, SortState};
 use crate::controller::{
-    DEFAULT_THROTTLE, MAX_COPY_PATHS, MAX_KEPT_SELECTION, RequestId, ResultsController,
-    SearchRequest,
+    CopiedPaths, DEFAULT_THROTTLE, MAX_COPY_PATHS, MAX_KEPT_SELECTION, RequestId,
+    ResultsController, SearchRequest,
 };
 use crate::daily_save::daily_save_due;
 use crate::file_glyph::FileKind;
@@ -89,6 +99,9 @@ use crate::frame_stats::FrameStats;
 use crate::gate_probe::{Observed, ProbeAction, ProbeRun};
 use crate::main_layout::{Rect, window};
 use crate::onboarding::{IndexScope, OnboardingEvent, ScopeNote};
+use crate::quick_look::{
+    MAX_PREVIEW_ITEMS, PreviewCommand, PreviewItems, preview_command, preview_rows,
+};
 use crate::quit::{QuitStep, quit_steps};
 use crate::source::{ResultPage, ResultsSource};
 use crate::status_view::{StatusInput, status_view};
@@ -99,6 +112,11 @@ type Source = Arc<dyn ResultsSource>;
 
 /// How often the status bar is refreshed while the source is indexing.
 const STATUS_REFRESH: Duration = Duration::from_secs(1);
+
+/// How long typing must pause before VoiceOver hears the result count:
+/// long enough to skip the counts of a word being typed, short enough to
+/// follow the last key.
+const ANNOUNCE_DELAY: Duration = Duration::from_millis(500);
 
 thread_local! {
     /// The window's controller, reachable from the table view and the
@@ -166,6 +184,13 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let (key, mods) = key_of(event);
+            // Space opens or closes Quick Look, and Escape closes it, before
+            // Escape's usual meaning (clear the search, hide the window).
+            let mut previewed = false;
+            with_controller(|c| previewed = c.preview_key(key, mods));
+            if previewed {
+                return;
+            }
             if let Some(action) = action_for_key(key, mods) {
                 with_controller(|c| c.perform(action, None));
                 return;
@@ -487,6 +512,14 @@ pub(crate) struct WinIvars {
     copy_note: Cell<Option<usize>>,
     /// Whether the source was indexing at the last status refresh.
     was_indexing: Cell<Option<bool>>,
+    /// The files the Quick Look panel shows.
+    preview: RefCell<PreviewItems>,
+    /// The window controls the Quick Look panel (between its
+    /// `beginPreviewPanelControl:` and `endPreviewPanelControl:`).
+    previewing: Cell<bool>,
+    /// The next page shown answers a new query or new options: VoiceOver
+    /// hears its result count.
+    announce_on_apply: Cell<bool>,
     #[cfg(feature = "measure")]
     autoscroll: bool,
     #[cfg(feature = "measure")]
@@ -662,10 +695,13 @@ define_class!(
             }
         }
 
+        /// The user's changes and the controller's own (after a refresh):
+        /// an open Quick Look panel follows either.
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_did_change(&self, _notification: &NSNotification) {
             self.selection_changed();
             self.update_status();
+            self.refresh_preview();
         }
     }
 
@@ -674,6 +710,44 @@ define_class!(
         #[unsafe(method(search:))]
         fn search_action(&self, _sender: Option<&AnyObject>) {
             self.query_changed();
+        }
+
+        // The Quick Look panel's data source and delegate
+        // (`QLPreviewPanelDataSource`, `QLPreviewPanelDelegate`; informal
+        // here, as the panel only asks whether each method is answered).
+
+        /// How many files the panel shows.
+        #[unsafe(method(numberOfPreviewItemsInPreviewPanel:))]
+        fn number_of_preview_items(&self, _panel: &AnyObject) -> isize {
+            isize::try_from(self.ivars().preview.borrow().len()).unwrap_or(0)
+        }
+
+        /// The `index`th file, as a file URL (`NSURL` is a `QLPreviewItem`).
+        #[unsafe(method_id(previewPanel:previewItemAtIndex:))]
+        fn preview_item(&self, _panel: &AnyObject, index: isize) -> Option<Retained<NSURL>> {
+            self.preview_url(index)
+        }
+
+        /// Key presses the panel doesn't use itself go to the results, so
+        /// the arrow keys move the selection (and the panel follows), Space
+        /// and Escape close it, and Return opens, as with the results
+        /// focused.
+        #[unsafe(method(previewPanel:handleEvent:))]
+        fn preview_handle_event(&self, _panel: &AnyObject, event: &NSEvent) -> bool {
+            self.preview_event(event)
+        }
+
+        /// The panel zooms out of the file's row when the row is in view.
+        #[unsafe(method(previewPanel:sourceFrameOnScreenForPreviewItem:))]
+        fn preview_source_frame(&self, _panel: &AnyObject, item: &AnyObject) -> NSRect {
+            self.preview_frame(item).unwrap_or(NSRect::ZERO)
+        }
+
+        /// Reads out the result count of the search just shown (after a
+        /// pause in typing; see `announce_results`).
+        #[unsafe(method(announceResults:))]
+        fn announce_results_sel(&self, _arg: Option<&AnyObject>) {
+            self.announce_results();
         }
 
         /// Double action of the table: open the clicked row (with the rest
@@ -866,6 +940,9 @@ impl WinController {
             focus: Cell::new(Focus::SearchField),
             copy_note: Cell::new(None),
             was_indexing: Cell::new(None),
+            preview: RefCell::new(PreviewItems::default()),
+            previewing: Cell::new(false),
+            announce_on_apply: Cell::new(false),
             #[cfg(feature = "measure")]
             autoscroll: config.autoscroll,
             #[cfg(feature = "measure")]
@@ -1076,7 +1153,7 @@ impl WinController {
     /// Runs the next scripted step; `false` when none is left.
     #[cfg(debug_assertions)]
     fn debug_step(&self) -> bool {
-        use super::debug_script::{Arrow, Step};
+        use super::debug_script::{Arrow, NamedKey, Step};
         let Some(step) = self.ivars().debug_steps.borrow_mut().pop_front() else {
             return false;
         };
@@ -1167,6 +1244,44 @@ impl WinController {
                 };
                 let flags = NSEventModifierFlags::NumericPad | NSEventModifierFlags::Function;
                 debug_key(&ui.window, ch, code, flags);
+            }
+            Step::Key(key) => {
+                let (ch, code) = match key {
+                    NamedKey::Space => (' ', 49),
+                    NamedKey::Escape => ('\u{1b}', 53),
+                };
+                debug_key(&ui.window, ch, code, NSEventModifierFlags::empty());
+            }
+            Step::Activate => {
+                super::resident::activate(&NSApplication::sharedApplication(self.mtm()));
+                ui.window.makeKeyAndOrderFront(None);
+            }
+            Step::Announce => self.announce_results(),
+            Step::Ax => {
+                let table: &ResultsTableView = &ui.table;
+                for name in ["AXVisibleRows", "AXSelectedRows", "AXRows"] {
+                    let (count, took) = super::debug_script::ax_count(table.as_ref(), name);
+                    eprintln!("debug ax {name}: {count:?} in {took:?}");
+                }
+                let results = self.ivars().results.borrow();
+                eprintln!(
+                    "debug ax announcement: {:?}",
+                    results_announcement(
+                        !results.query().trim().is_empty(),
+                        results.row_count(),
+                        results.invalid_regex(),
+                    )
+                );
+                drop(results);
+                let preview = self.ivars().preview.borrow();
+                eprintln!(
+                    "debug quick look: open {}, controlled {}, files {:?}",
+                    quick_look::is_open(),
+                    self.ivars().previewing.get(),
+                    (0..preview.len())
+                        .filter_map(|i| preview.get(i))
+                        .collect::<Vec<_>>(),
+                );
             }
             Step::Type(text) => {
                 // 80 ms apart, a fast typist, with the run loop turning in
@@ -1276,7 +1391,9 @@ impl WinController {
         iv.restoring_selection.set(true);
         ui.table.reloadData();
         let rows = iv.results.borrow().row_count();
+        let mut announce = false;
         if iv.reset_on_apply.replace(false) {
+            announce = iv.announce_on_apply.replace(false);
             iv.results.borrow_mut().forget_selection();
             ui.table
                 .selectRowIndexes_byExtendingSelection(&NSIndexSet::new(), false);
@@ -1301,6 +1418,9 @@ impl WinController {
         self.note_page_applied(ui, rows);
         self.show_body();
         self.update_status();
+        if announce {
+            self.schedule_announcement();
+        }
     }
 
     /// Shows the rows, "No matches" or the invalid regular expression.
@@ -1359,6 +1479,7 @@ impl WinController {
             results.set_query(&text)
         };
         self.ivars().reset_on_apply.set(true);
+        self.ivars().announce_on_apply.set(true);
         self.ivars().copy_note.set(None);
         self.prepare_highlighter();
         self.sync_clear_button();
@@ -1371,6 +1492,7 @@ impl WinController {
         let req = self.ivars().results.borrow_mut().set_options(options);
         let Some(req) = req else { return };
         self.ivars().reset_on_apply.set(true);
+        self.ivars().announce_on_apply.set(true);
         self.prepare_highlighter();
         if let Some(ui) = self.ui() {
             ui.top.set_options(options);
@@ -1611,12 +1733,20 @@ impl WinController {
     /// never read from newer results than the table shows: while a refresh
     /// is on its way such an action does nothing (see
     /// `CopiedPaths::outdated`).
+    ///
+    /// Quick Look closes the panel when it is open; otherwise it shows the
+    /// first [`MAX_PREVIEW_ITEMS`] rows in it.
     fn perform(&self, action: Action, rows: Option<Vec<Range<usize>>>) {
         let limit = match action {
             Action::Open | Action::RevealInFinder => MAX_OPEN,
             // One row past the cap, so the controller reports truncation.
             Action::CopyPath => MAX_COPY_PATHS + 1,
+            Action::QuickLook => MAX_PREVIEW_ITEMS,
         };
+        if action == Action::QuickLook && quick_look::is_open() {
+            quick_look::close();
+            return;
+        }
         let (ranges, selected) = match rows {
             Some(rows) => (take_rows(rows, limit), None),
             None => {
@@ -1635,6 +1765,10 @@ impl WinController {
             }
         };
         self.schedule_tick_if_pending();
+        if action == Action::QuickLook {
+            self.show_preview(copied);
+            return;
+        }
         let paths = copied.paths;
         if paths.is_empty() {
             return;
@@ -1661,6 +1795,218 @@ impl WinController {
                     self.update_status();
                 }
             }
+            // Shown above, before the paths were taken.
+            Action::QuickLook => {}
+        }
+    }
+
+    // --------------------------------------------------------- Quick Look
+
+    /// Space or Escape in the results, as [`preview_command`] decides from
+    /// whether the panel is open: open or close Quick Look. Returns whether
+    /// the key was handled.
+    pub(super) fn preview_key(&self, key: Key, mods: Modifiers) -> bool {
+        match preview_command(key, mods, quick_look::is_open()) {
+            Some(PreviewCommand::Open) => {
+                self.perform(Action::QuickLook, None);
+                true
+            }
+            Some(PreviewCommand::Close) => {
+                quick_look::close();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Opens the panel on `resolved`, the selection's files (nothing to
+    /// show, or an outdated answer, opens nothing).
+    fn show_preview(&self, resolved: CopiedPaths) {
+        if resolved.paths.is_empty() {
+            return;
+        }
+        let changed = self.ivars().preview.borrow_mut().update(resolved);
+        // Still its controller (the panel was closed without ending
+        // control): it must read the new files.
+        let controlled = changed && self.ivars().previewing.get();
+        if let Some(panel) = quick_look::existing().filter(|_| controlled) {
+            quick_look::reload(&panel);
+        }
+        // The panel asks the responder chain for its controller (the
+        // search window, which hands it to `begin_preview`).
+        quick_look::open();
+    }
+
+    /// The selection's files for the panel ([`preview_rows`]), resolved as
+    /// the other actions resolve it.
+    fn selection_for_preview(&self) -> CopiedPaths {
+        let Some(ui) = self.ui() else {
+            return CopiedPaths::default();
+        };
+        let ranges = preview_rows(&self.selected_ranges(MAX_PREVIEW_ITEMS));
+        if ranges.is_empty() {
+            return CopiedPaths::default();
+        }
+        let selected = usize::try_from(ui.table.numberOfSelectedRows()).unwrap_or(0);
+        let copied = self
+            .ivars()
+            .results
+            .borrow_mut()
+            .paths_of_selection(&ranges, selected);
+        self.schedule_tick_if_pending();
+        copied
+    }
+
+    /// The selection changed: an open panel shows the new selection,
+    /// reloading only when its files changed. Costs nothing while the
+    /// panel is closed.
+    fn refresh_preview(&self) {
+        if !self.ivars().previewing.get() || !quick_look::is_open() {
+            return;
+        }
+        let resolved = self.selection_for_preview();
+        let changed = self.ivars().preview.borrow_mut().update(resolved);
+        if let Some(panel) = quick_look::existing().filter(|_| changed) {
+            quick_look::reload(&panel);
+        }
+    }
+
+    /// The search window took control of the panel: the controller becomes
+    /// its data source and delegate.
+    pub(super) fn begin_preview(&self, panel: &NSWindow) {
+        self.ivars().previewing.set(true);
+        let controller: &AnyObject = self.as_ref();
+        quick_look::set_controller(panel, Some(controller));
+        // Opened by Space, the files are known; taken over another way
+        // (the window became key again), show the selection.
+        if self.ivars().preview.borrow().is_empty() {
+            let resolved = self.selection_for_preview();
+            self.ivars().preview.borrow_mut().update(resolved);
+        }
+        quick_look::reload(panel);
+    }
+
+    /// The panel closed or found another controller.
+    pub(super) fn end_preview(&self, panel: &NSWindow) {
+        self.ivars().previewing.set(false);
+        quick_look::set_controller(panel, None);
+        self.ivars().preview.borrow_mut().clear();
+    }
+
+    /// The panel's `index`th file as a file URL.
+    fn preview_url(&self, index: isize) -> Option<Retained<NSURL>> {
+        let index = usize::try_from(index).ok()?;
+        self.ivars().preview.borrow().get(index).map(file_url)
+    }
+
+    /// A key press the panel passed on: the results take it, as if they
+    /// had the focus. Returns whether it was handled.
+    fn preview_event(&self, event: &NSEvent) -> bool {
+        if event.r#type() != NSEventType::KeyDown {
+            return false;
+        }
+        let Some(ui) = self.ui() else { return false };
+        ui.table.keyDown(event);
+        true
+    }
+
+    /// Where on screen the panel's `item` comes from: the glyph of its row,
+    /// when the row is in view.
+    fn preview_frame(&self, item: &AnyObject) -> Option<NSRect> {
+        let ui = self.ui()?;
+        let path = item.downcast_ref::<NSURL>()?.path()?.to_string();
+        let index = {
+            let preview = self.ivars().preview.borrow();
+            (0..preview.len()).find(|&i| preview.get(i) == Some(path.as_str()))?
+        };
+        // The panel's files are the selected rows' in row order.
+        let row = self
+            .selected_ranges(index + 1)
+            .into_iter()
+            .flatten()
+            .nth(index)?;
+        let row = isize::try_from(row).ok()?;
+        let cell = ui.table.frameOfCellAtColumn_row(0, row);
+        let visible = ui.table.visibleRect();
+        let in_view = cell.size.height > 0.0
+            && cell.origin.y < visible.origin.y + visible.size.height
+            && cell.origin.y + cell.size.height > visible.origin.y;
+        if !in_view {
+            return None;
+        }
+        let g = metrics::GLYPH_SIZE;
+        let glyph = NSRect::new(
+            NSPoint::new(cell.origin.x, cell.origin.y + (cell.size.height - g) / 2.0),
+            objc2_foundation::NSSize::new(g, g),
+        );
+        let in_window = ui.table.convertRect_toView(glyph, None);
+        Some(ui.window.convertRectToScreen(in_window))
+    }
+
+    // ----------------------------------------------------------- VoiceOver
+
+    /// After a pause, announces the search just shown
+    /// ([`announce_results`](Self::announce_results)); each new page
+    /// restarts the wait, so typing announces only the last count. Nothing
+    /// is scheduled while VoiceOver is off.
+    fn schedule_announcement(&self) {
+        if !NSWorkspace::sharedWorkspace().isVoiceOverEnabled() {
+            return;
+        }
+        let target: &AnyObject = self.as_ref();
+        // SAFETY: `announceResults:` is implemented above as
+        // `-(void)announceResults:(id)arg`; the run loop retains the target
+        // until the delayed message is sent, and cancelling takes the same
+        // target, selector and (nil) argument.
+        unsafe {
+            let _: () = msg_send![
+                NSObject::class(),
+                cancelPreviousPerformRequestsWithTarget: target,
+                selector: sel!(announceResults:),
+                object: None::<&AnyObject>
+            ];
+            let _: () = msg_send![
+                target,
+                performSelector: sel!(announceResults:),
+                withObject: None::<&AnyObject>,
+                afterDelay: ANNOUNCE_DELAY.as_secs_f64()
+            ];
+        }
+    }
+
+    /// Asks VoiceOver to read the search's result count
+    /// ([`results_announcement`]).
+    fn announce_results(&self) {
+        let Some(ui) = self.ui() else { return };
+        let text = {
+            let results = self.ivars().results.borrow();
+            results_announcement(
+                !results.query().trim().is_empty(),
+                results.row_count(),
+                results.invalid_regex(),
+            )
+        };
+        let Some(text) = text else { return };
+        let text = NSString::from_str(&text);
+        // Medium: it interrupts nothing VoiceOver is reading at a higher
+        // priority, and comes after the echo of the last key typed.
+        let priority = NSNumber::new_isize(NSAccessibilityPriorityLevel::Medium.0);
+        // SAFETY: reading immutable AppKit string constants.
+        let keys = unsafe { [NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey] };
+        let values: [&AnyObject; 2] = [text.as_ref(), priority.as_ref()];
+        let info = NSDictionary::from_slices(&keys, &values);
+        let window: &SearchWindow = &ui.window;
+        let element: &AnyObject = window.as_ref();
+        // SAFETY: the notification name is an immutable AppKit constant;
+        // the user info holds the announcement (an NSString) and its
+        // priority (an NSNumber), the types those keys take; the element is
+        // the search window.
+        unsafe {
+            NSAccessibilityPostNotificationWithUserInfo(
+                element,
+                NSAccessibilityAnnouncementRequestedNotification,
+                Some(&info),
+            );
         }
     }
 
@@ -1896,10 +2242,12 @@ impl WinController {
         let mut buf = iv.buf.borrow_mut();
         buf.clear();
         let mut kind = None;
+        let mut is_folder = false;
         let mut ranges: Vec<Range<usize>> = Vec::new();
         if let Ok(i) = usize::try_from(row) {
             let mut results = iv.results.borrow_mut();
             if let Some(r) = results.row(i) {
+                is_folder = r.is_folder;
                 // The interface's formats: "~" for the home folder (copied
                 // paths stay full), "182 KB" and "—" for folders, local dates.
                 match col {
@@ -1938,6 +2286,9 @@ impl WinController {
         } else {
             label.setAttributedStringValue(&highlighted(&buf, style, token, &ranges));
         }
+        // What VoiceOver reads for the text: the same in words ("Home" for
+        // "~", the month in full), nothing for a folder's "—".
+        views::set_speech(&label, cell_speech(col, &buf, is_folder).as_deref());
         if let Some(kind) = kind {
             cell.set_glyph(&views::glyph(kind.glyph(), metrics::GLYPH_SIZE));
             cell.set_selected(table.isRowSelected(row));

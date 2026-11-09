@@ -70,7 +70,8 @@ fn the_result_hints_match_the_key_map() {
             (&["⌥", "⌘", "C"][..], "Copy path"),
         ]
     );
-    // No Quick Look hint: Quick Look is not built.
+    // No Quick Look hint yet: Space works, but the hint waits for the
+    // owner to confirm its place on the Main board.
     assert!(RESULT_HINTS.iter().all(|h| !h.label.contains("Quick Look")));
 
     let plain = Modifiers::default();
