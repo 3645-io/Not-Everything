@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fx_engine::{ENGINE_SORT_KEYS, Engine, EngineConfig, EngineSnapshot};
+use fx_engine::{ENGINE_SORT_KEYS, Engine, EngineConfig, EngineHealth, EngineSnapshot};
 use fx_fs::{ChangeSource, VolumeEnumerator};
 use fx_fs_macos::enumerator::MacScanner;
 use fx_fs_macos::fsevents::source::FsEventsSource;
@@ -126,6 +126,11 @@ struct Probe {
     root_enumerations: AtomicUsize,
     /// Enumerations of folders below the root (subtree rescans).
     subtree_enumerations: AtomicUsize,
+    /// Changes the real source handed out that ask for the whole root:
+    /// `RescanVolume`, or `RescanSubtree` of the root or a folder above it.
+    /// FSEvents sends those when it coalesces or drops events (a busy
+    /// machine), and a full enumeration then is right.
+    root_rescans_asked: AtomicUsize,
 }
 
 impl Probe {
@@ -141,6 +146,8 @@ impl Probe {
 /// returned in a shared [`Probe`].
 struct ProbedSource {
     inner: FsEventsSource,
+    /// The watched root, to recognise the rescans that cover it.
+    root: PathBuf,
     probe: Arc<Probe>,
 }
 
@@ -163,6 +170,19 @@ impl ChangeSource for ProbedSource {
         self.probe
             .history_done
             .store(self.inner.history_done(), Ordering::SeqCst);
+        if let Ok(changes) = &batch {
+            let whole_root = changes
+                .iter()
+                .filter(|c| match c {
+                    Change::RescanVolume => true,
+                    Change::RescanSubtree(p) => self.root.starts_with(p),
+                    _ => false,
+                })
+                .count();
+            self.probe
+                .root_rescans_asked
+                .fetch_add(whole_root, Ordering::SeqCst);
+        }
         batch
     }
 
@@ -200,6 +220,7 @@ fn open(root: &Path, store: &Path, probe: &Arc<Probe>) -> Engine {
         .with_checkpoint_idle(Duration::from_secs(3600));
     let source = ProbedSource {
         inner: source(root),
+        root: root.to_path_buf(),
         probe: Arc::clone(probe),
     };
     let enumerator = ProbedScanner {
@@ -734,13 +755,25 @@ fn offline_catch_up_from_saved_cursor_equals_a_fresh_scan() {
 
     // The catch-up came from the replayed history, not from a full rescan:
     // the second run never enumerated the whole root (subtree rescans of
-    // changed folders are fine).
-    assert_eq!(
-        probe.root_enumerations.load(Ordering::SeqCst),
-        0,
-        "the resumed run enumerated the root in full ({} subtree rescans)",
-        probe.subtree_enumerations.load(Ordering::SeqCst)
-    );
+    // changed folders are fine), unless FSEvents itself asked for it. On a
+    // busy machine it coalesces events into MustScanSubDirs on a folder
+    // above the root, or drops them, and since run 2.1 the source passes
+    // those on instead of losing them.
+    let asked = probe.root_rescans_asked.load(Ordering::SeqCst);
+    if asked == 0 {
+        assert_eq!(
+            probe.root_enumerations.load(Ordering::SeqCst),
+            0,
+            "the resumed run enumerated the root in full ({} subtree rescans)",
+            probe.subtree_enumerations.load(Ordering::SeqCst)
+        );
+    } else {
+        eprintln!(
+            "offline catch-up: FSEvents asked for {asked} rescan(s) of the whole root; \
+             {} full enumeration(s)",
+            probe.root_enumerations.load(Ordering::SeqCst)
+        );
+    }
     assert_eq!(
         probe.outcomes(),
         vec![StartOutcome::Resumed],
@@ -765,4 +798,645 @@ fn assert_orders_match(snap: &EngineSnapshot) {
             "merged {k:?} order != Order::build"
         );
     }
+}
+
+// ------------------------------------- run 2.1: gaps at start, end to end
+
+/// The real `FsEventsSource`, except that `cursor()` reports a tampered
+/// copy of the real cursor, so the engine's checkpoint stores it: the
+/// next run then starts from a stored cursor the volume cannot resume.
+struct TamperedCursorSource {
+    inner: FsEventsSource,
+    tamper: fn(ResumeCursor) -> ResumeCursor,
+}
+
+impl ChangeSource for TamperedCursorSource {
+    fn start(&mut self, from: Option<&ResumeCursor>) -> fx_fs::Result<StartOutcome> {
+        self.inner.start(from)
+    }
+
+    fn next_batch(&mut self, deadline: Instant) -> fx_fs::Result<Vec<Change>> {
+        self.inner.next_batch(deadline)
+    }
+
+    fn cursor(&self) -> ResumeCursor {
+        (self.tamper)(self.inner.cursor())
+    }
+}
+
+/// First run with a tampered cursor checkpointed, offline changes, then a
+/// second, honest run: the stored cursor is a gap, so the second run
+/// rescans the root in full and ends equal to a fresh scan (0 lost
+/// changes).
+fn stored_cursor_gap_rescans_and_catches_up(name: &str, tamper: fn(ResumeCursor) -> ResumeCursor) {
+    let tmp = TempDir::new(name);
+    let store_dir = TempDir::new(&format!("{name}-store"));
+    let root = &tmp.path;
+    let store = store_dir.path.join("index.fxdb");
+    initial_tree(root);
+
+    let cfg = config(root)
+        .with_store_path(&store)
+        .with_checkpoint_idle(Duration::from_secs(3600));
+    let first = Engine::open(
+        cfg,
+        TamperedCursorSource {
+            inner: source(root),
+            tamper,
+        },
+        MacPathStat::new(),
+        scanner(),
+    )
+    .expect("first engine opens");
+    wait_for_fresh_scan(&first, root, "first run initial scan");
+    first.checkpoint().expect("checkpoint saves");
+    let stored = first.snapshot().cursor();
+    assert!(
+        matches!(stored, Some(ResumeCursor::FsEvents { .. })),
+        "the checkpointed snapshot carries the tampered FSEvents cursor, got {stored:?}"
+    );
+    first.shutdown();
+
+    let ops = scripted_changes(root);
+    assert!(ops >= 180, "about 200 scripted changes, ran {ops}");
+    let want = fresh_scan(root);
+
+    let probe = Arc::new(Probe::default());
+    let engine = open(root, &store, &probe);
+    assert_eq!(
+        probe.outcomes(),
+        vec![StartOutcome::GapDetected],
+        "{name}: the stored cursor cannot resume"
+    );
+    let after = wait_for_fresh_scan(&engine, root, name);
+    assert_eq!(indexed(&after, root), want);
+    assert_orders_match(&after);
+    assert!(
+        probe.root_enumerations.load(Ordering::SeqCst) >= 1,
+        "{name}: a gap rescans the root in full"
+    );
+    assert!(
+        matches!(after.cursor(), Some(ResumeCursor::FsEvents { .. })),
+        "{name}: the rescanned snapshot carries an FSEvents cursor, got {:?}",
+        after.cursor()
+    );
+    assert_ne!(
+        after.cursor(),
+        stored,
+        "{name}: the rescanned index carries a fresh cursor, not the stored one"
+    );
+
+    // The engine keeps watching live after the rescan.
+    touch(&root.join("fresh/after_gap.txt"), 4);
+    wait_for_search(&engine, root, "after_gap", &["fresh/after_gap.txt"], SETUP);
+    engine.shutdown();
+}
+
+#[test]
+fn stored_event_id_ahead_of_the_volume_rescans_and_catches_up() {
+    stored_cursor_gap_rescans_and_catches_up("id-too-high", |c| match c {
+        ResumeCursor::FsEvents { event_id, db_uuid } => ResumeCursor::FsEvents {
+            // Far above any ID the volume can have reached (a store restored
+            // from another machine, or an FSEvents database that was reset).
+            event_id: event_id.saturating_add(1 << 50),
+            db_uuid,
+        },
+        other => other,
+    });
+}
+
+#[test]
+fn stored_cursor_of_another_fsevents_database_rescans_and_catches_up() {
+    stored_cursor_gap_rescans_and_catches_up("uuid-changed", |c| match c {
+        ResumeCursor::FsEvents {
+            event_id,
+            mut db_uuid,
+        } => {
+            // The volume's FSEvents database was recreated: same IDs, new UUID.
+            db_uuid[0] ^= 0xFF;
+            db_uuid[15] ^= 0x5A;
+            ResumeCursor::FsEvents { event_id, db_uuid }
+        }
+        other => other,
+    });
+}
+
+// ----------------------------------- run 2.1: every rescan flag, end to end
+//
+// FSEvents cannot be made to send MustScanSubDirs, a dropped-events flag,
+// EventIdsWrapped, RootChanged or Mount on demand. These tests mute the
+// real stream while they change the tree, check that the index really
+// missed the changes, then inject the one raw event FSEvents would send,
+// routed exactly as `FsEventsSource` routes it (`map_event` with the
+// stream's scope root, then `coalesce`). The index must then equal a fresh
+// scan: the flag's change alone recovers every muted change.
+
+use fx_fs_macos::fsevents::change::{coalesce, map_event};
+use fx_fs_macos::fsevents::flags::EventFlags;
+
+/// How long the muted stream must stay quiet before its reports of the
+/// changes count as all discarded.
+const QUIET: Duration = Duration::from_millis(700);
+
+/// Shared between a [`FlagSource`] and its test.
+#[derive(Default)]
+struct FlagControl {
+    /// While set, every change the real stream reports is discarded.
+    muted: AtomicBool,
+    /// When the muted stream last reported (and lost) a change.
+    last_discard: Mutex<Option<Instant>>,
+    /// Raw events to route and hand out with the next batch.
+    inject: Mutex<Vec<(PathBuf, EventFlags)>>,
+}
+
+impl FlagControl {
+    fn inject(&self, events: Vec<(PathBuf, EventFlags)>) {
+        self.inject
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(events);
+    }
+
+    /// Waits until the muted stream reported the changes and then stayed
+    /// quiet for [`QUIET`].
+    fn wait_until_discarded(&self, what: &str) {
+        let end = Instant::now() + SETUP;
+        loop {
+            let last = *self
+                .last_discard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.is_some_and(|t| t.elapsed() >= QUIET) {
+                return;
+            }
+            assert!(
+                Instant::now() < end,
+                "{what}: the muted stream never reported the changes"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// The real `FsEventsSource` with mute and inject controls.
+struct FlagSource {
+    inner: FsEventsSource,
+    /// The stream's scope root (its path filter), as `FsEventsSource`
+    /// passes it to `map_event`.
+    scope: PathBuf,
+    ctl: Arc<FlagControl>,
+}
+
+impl FlagSource {
+    fn injected(&self) -> Vec<Change> {
+        let raw: Vec<(PathBuf, EventFlags)> = std::mem::take(
+            &mut *self
+                .ctl
+                .inject
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let changes: Vec<Change> = raw
+            .iter()
+            .filter_map(|(path, flags)| map_event(path, *flags, false, &self.scope))
+            .collect();
+        coalesce(changes)
+    }
+}
+
+impl ChangeSource for FlagSource {
+    fn start(&mut self, from: Option<&ResumeCursor>) -> fx_fs::Result<StartOutcome> {
+        self.inner.start(from)
+    }
+
+    fn next_batch(&mut self, deadline: Instant) -> fx_fs::Result<Vec<Change>> {
+        let injected = self.injected();
+        if !injected.is_empty() {
+            return Ok(injected);
+        }
+        let mut batch = self.inner.next_batch(deadline)?;
+        if self.ctl.muted.load(Ordering::SeqCst) && !batch.is_empty() {
+            batch.clear();
+            *self
+                .ctl
+                .last_discard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        }
+        Ok(batch)
+    }
+
+    fn cursor(&self) -> ResumeCursor {
+        self.inner.cursor()
+    }
+}
+
+/// What enumeration the injected event must cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// The root in full (`RescanVolume`, or `RescanSubtree` of the root).
+    Root,
+    /// Folders below the root only (`RescanSubtree` of a folder).
+    Subtree,
+    /// No enumeration at all (`CheckPath` only).
+    Check,
+}
+
+/// Starts an engine over `initial_tree`, mutes the stream, runs `change`,
+/// asserts the index missed it, injects `inject(root)` and waits until the
+/// index equals a fresh scan again, then checks the enumeration `expect`s.
+fn muted_changes_are_recovered_by(
+    name: &str,
+    change: fn(&Path),
+    inject: fn(&Path) -> Vec<(PathBuf, EventFlags)>,
+    expect: Expect,
+) {
+    let tmp = TempDir::new(name);
+    let root = &tmp.path;
+    initial_tree(root);
+    let probe = Arc::new(Probe::default());
+    let ctl = Arc::new(FlagControl::default());
+    let engine = Engine::start(
+        Index::new(),
+        config(root),
+        FlagSource {
+            inner: source(root),
+            scope: root.clone(),
+            ctl: Arc::clone(&ctl),
+        },
+        MacPathStat::new(),
+        ProbedScanner {
+            inner: scanner(),
+            root: root.clone(),
+            probe: Arc::clone(&probe),
+        },
+    )
+    .expect("engine starts");
+    wait_for_fresh_scan(&engine, root, &format!("{name}: initial scan"));
+
+    ctl.muted.store(true, Ordering::SeqCst);
+    change(root);
+    ctl.wait_until_discarded(name);
+    let want = fresh_scan(root);
+    assert_ne!(
+        indexed(&engine.snapshot(), root),
+        want,
+        "{name}: the muted changes must be missing from the index before the injected event"
+    );
+
+    let roots = probe.root_enumerations.load(Ordering::SeqCst);
+    let subtrees = probe.subtree_enumerations.load(Ordering::SeqCst);
+    // The stream stays muted: only the injected event can repair the index.
+    ctl.inject(inject(root));
+    let after = wait_for_fresh_scan(&engine, root, name);
+    assert_orders_match(&after);
+
+    let roots = probe.root_enumerations.load(Ordering::SeqCst) - roots;
+    let subtrees = probe.subtree_enumerations.load(Ordering::SeqCst) - subtrees;
+    match expect {
+        Expect::Root => assert!(roots >= 1, "{name}: the root was not rescanned"),
+        Expect::Subtree => {
+            assert_eq!(roots, 0, "{name}: the root was rescanned in full");
+            assert!(subtrees >= 1, "{name}: no folder was rescanned");
+        }
+        Expect::Check => assert_eq!(
+            (roots, subtrees),
+            (0, 0),
+            "{name}: a path check enumerated folders"
+        ),
+    }
+    engine.shutdown();
+}
+
+/// Creates, renames, writes and deletes inside `d3`, including a new
+/// nested folder.
+fn change_inside_d3(root: &Path) {
+    let d = root.join("d3");
+    touch(&d.join("new_a.txt"), 5);
+    touch(&d.join("new_b.txt"), 6);
+    fs::rename(d.join("f0.txt"), d.join("f0_renamed.txt")).unwrap();
+    fs::remove_file(d.join("f1.txt")).unwrap();
+    fs::create_dir_all(d.join("nested/deeper")).unwrap();
+    touch(&d.join("nested/deeper/leaf.txt"), 7);
+}
+
+/// Changes in `d3` and in `d7`, so a rescan of only one of them is not
+/// enough.
+fn change_in_two_folders(root: &Path) {
+    change_inside_d3(root);
+    let d = root.join("d7");
+    touch(&d.join("other_new.txt"), 9);
+    fs::remove_file(d.join("f4.txt")).unwrap();
+    fs::rename(d.join("f5.txt"), root.join("d2/f5_moved.txt")).unwrap();
+}
+
+fn at(root: &Path, rel: &str, flags: EventFlags) -> Vec<(PathBuf, EventFlags)> {
+    vec![(root.join(rel), flags)]
+}
+
+#[test]
+fn must_scan_sub_dirs_rescans_the_folder() {
+    muted_changes_are_recovered_by(
+        "flag-must-scan",
+        change_inside_d3,
+        |root| at(root, "d3", EventFlags::MUST_SCAN_SUB_DIRS),
+        Expect::Subtree,
+    );
+}
+
+#[test]
+fn must_scan_sub_dirs_above_the_root_rescans_the_root() {
+    // Hierarchical coalescing reported on a folder above the indexed root:
+    // the stream's filter used to drop it.
+    muted_changes_are_recovered_by(
+        "flag-must-scan-above",
+        change_in_two_folders,
+        |root| {
+            vec![(
+                root.parent().expect("root has a parent").to_path_buf(),
+                EventFlags::MUST_SCAN_SUB_DIRS,
+            )]
+        },
+        Expect::Root,
+    );
+}
+
+#[test]
+fn user_dropped_rescans_everything_watched() {
+    // Reported on d3 only, but the changes in d7 must come back too.
+    muted_changes_are_recovered_by(
+        "flag-user-dropped",
+        change_in_two_folders,
+        |root| {
+            at(
+                root,
+                "d3",
+                EventFlags::MUST_SCAN_SUB_DIRS | EventFlags::USER_DROPPED,
+            )
+        },
+        Expect::Root,
+    );
+}
+
+#[test]
+fn kernel_dropped_on_the_volume_root_rescans_everything_watched() {
+    muted_changes_are_recovered_by(
+        "flag-kernel-dropped",
+        change_in_two_folders,
+        |_| {
+            vec![(
+                PathBuf::from("/"),
+                EventFlags::MUST_SCAN_SUB_DIRS | EventFlags::KERNEL_DROPPED,
+            )]
+        },
+        Expect::Root,
+    );
+}
+
+#[test]
+fn event_ids_wrapped_rescans_the_volume() {
+    muted_changes_are_recovered_by(
+        "flag-ids-wrapped",
+        change_in_two_folders,
+        |_| vec![(PathBuf::from("/"), EventFlags::EVENT_IDS_WRAPPED)],
+        Expect::Root,
+    );
+}
+
+#[test]
+fn root_changed_rescans_the_volume() {
+    muted_changes_are_recovered_by(
+        "flag-root-changed",
+        change_in_two_folders,
+        |root| vec![(root.to_path_buf(), EventFlags::ROOT_CHANGED)],
+        Expect::Root,
+    );
+}
+
+#[test]
+fn unmount_of_the_root_rescans_the_volume() {
+    muted_changes_are_recovered_by(
+        "flag-unmount-root",
+        change_in_two_folders,
+        |root| {
+            vec![(
+                root.to_path_buf(),
+                EventFlags::UNMOUNT | EventFlags::ITEM_IS_DIR,
+            )]
+        },
+        Expect::Root,
+    );
+}
+
+#[test]
+fn mount_on_the_root_rescans_the_root() {
+    muted_changes_are_recovered_by(
+        "flag-mount-root",
+        change_in_two_folders,
+        |root| {
+            vec![(
+                root.to_path_buf(),
+                EventFlags::MOUNT | EventFlags::ITEM_IS_DIR,
+            )]
+        },
+        Expect::Root,
+    );
+}
+
+#[test]
+fn flag_word_none_rescans_the_folder() {
+    // kFSEventStreamEventFlagNone: "some change in the directory".
+    muted_changes_are_recovered_by(
+        "flag-none",
+        change_inside_d3,
+        |root| at(root, "d3", EventFlags::NONE),
+        Expect::Subtree,
+    );
+}
+
+#[test]
+#[ignore = "engine follow-up (run 2.1): Writer::rescan_subtree on a path that is a file \
+            does nothing, because the scanner refuses to enumerate a non-folder and the \
+            writer drops any walk error other than NotFound; the source only asks for \
+            subtree rescans of folders, so this is not reached today"]
+fn subtree_rescan_of_a_file_path_updates_the_file() {
+    muted_changes_are_recovered_by(
+        "flag-none-on-file",
+        |root| {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(root.join("d1/f5.txt"))
+                .unwrap();
+            f.write_all(b"grown").unwrap();
+        },
+        // A flag word with no item bit names a folder in FSEvents.h; on a
+        // file path the subtree rescan it maps to must still update it.
+        |root| at(root, "d1/f5.txt", EventFlags::NONE),
+        Expect::Subtree,
+    );
+}
+
+#[test]
+fn folder_rename_pair_rescans_both_names() {
+    muted_changes_are_recovered_by(
+        "flag-folder-rename",
+        |root| {
+            fs::rename(root.join("d3"), root.join("d3_renamed")).unwrap();
+            touch(&root.join("d3_renamed/inside_after.txt"), 3);
+            fs::remove_file(root.join("d3_renamed/f2.txt")).unwrap();
+        },
+        |root| {
+            let renamed = EventFlags::ITEM_RENAMED | EventFlags::ITEM_IS_DIR;
+            vec![
+                (root.join("d3"), renamed),
+                (root.join("d3_renamed"), renamed),
+            ]
+        },
+        Expect::Subtree,
+    );
+}
+
+#[test]
+fn file_rename_pairs_check_each_side() {
+    muted_changes_are_recovered_by(
+        "flag-file-rename",
+        |root| {
+            fs::rename(root.join("d4/f2.txt"), root.join("d4/f2_renamed.txt")).unwrap();
+            fs::rename(root.join("d4/f3.txt"), root.join("d5/f3_moved.txt")).unwrap();
+        },
+        |root| {
+            let renamed = EventFlags::ITEM_RENAMED | EventFlags::ITEM_IS_FILE;
+            [
+                "d4/f2.txt",
+                "d4/f2_renamed.txt",
+                "d4/f3.txt",
+                "d5/f3_moved.txt",
+            ]
+            .iter()
+            .map(|rel| (root.join(rel), renamed))
+            .collect()
+        },
+        Expect::Check,
+    );
+}
+
+#[test]
+fn coalesced_create_and_remove_checks_the_path() {
+    muted_changes_are_recovered_by(
+        "flag-create-remove",
+        |root| {
+            // Gone again within the latency window: nothing to index.
+            touch(&root.join("d2/transient.txt"), 1);
+            fs::remove_file(root.join("d2/transient.txt")).unwrap();
+            // Removed and created again: a new file at an old path.
+            fs::remove_file(root.join("d2/f6.txt")).unwrap();
+            touch(&root.join("d2/f6.txt"), 66);
+            // Created, removed, created: present at the end.
+            touch(&root.join("d2/kept.txt"), 2);
+            fs::remove_file(root.join("d2/kept.txt")).unwrap();
+            touch(&root.join("d2/kept.txt"), 3);
+        },
+        |root| {
+            let both =
+                EventFlags::ITEM_CREATED | EventFlags::ITEM_REMOVED | EventFlags::ITEM_IS_FILE;
+            ["d2/transient.txt", "d2/f6.txt", "d2/kept.txt"]
+                .iter()
+                .map(|rel| (root.join(rel), both))
+                .collect()
+        },
+        Expect::Check,
+    );
+}
+
+#[test]
+fn own_event_and_modified_check_the_path() {
+    muted_changes_are_recovered_by(
+        "flag-own-event",
+        |root| {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(root.join("d1/f5.txt"))
+                .unwrap();
+            f.write_all(b"grown by this process").unwrap();
+        },
+        |root| {
+            at(
+                root,
+                "d1/f5.txt",
+                EventFlags::OWN_EVENT | EventFlags::ITEM_MODIFIED | EventFlags::ITEM_IS_FILE,
+            )
+        },
+        Expect::Check,
+    );
+}
+
+#[test]
+fn cloned_file_checks_the_path() {
+    muted_changes_are_recovered_by(
+        "flag-cloned",
+        |root| {
+            // `fs::copy` clones on APFS (`fclonefileat`).
+            fs::copy(root.join("d1/f1.txt"), root.join("d1/f1_clone.txt")).unwrap();
+        },
+        |root| {
+            at(
+                root,
+                "d1/f1_clone.txt",
+                EventFlags::ITEM_CREATED | EventFlags::ITEM_CLONED | EventFlags::ITEM_IS_FILE,
+            )
+        },
+        Expect::Check,
+    );
+}
+
+// ------------------- run 2.1: a folder above the root moves away and back
+
+/// The live entries of the latest snapshot.
+fn live_count(engine: &Engine) -> usize {
+    engine.snapshot().index().live_ids().count()
+}
+
+#[test]
+fn renaming_a_folder_above_the_root_empties_then_restores_the_index() {
+    // The indexed root is outer/inner. Renaming outer moves the root away:
+    // FSEvents reports only `outer` (above the stream's filter), which the
+    // filter used to drop, so the index kept listing paths that no longer
+    // existed. No muting here: real FSEvents end to end.
+    let tmp = TempDir::new("above-root");
+    let outer = tmp.path.join("outer");
+    let root = outer.join("inner");
+    fs::create_dir_all(&root).unwrap();
+    initial_tree(&root);
+    let engine = Engine::start(
+        Index::new(),
+        config(&root),
+        source(&root),
+        MacPathStat::new(),
+        scanner(),
+    )
+    .expect("engine starts");
+    wait_for_fresh_scan(&engine, &root, "initial scan");
+    assert!(live_count(&engine) > 100);
+
+    let moved = tmp.path.join("outer_moved");
+    fs::rename(&outer, &moved).unwrap();
+    // The move empties the index. If FSEvents also dropped events on a busy
+    // machine, the volume rescan that follows cannot enumerate a missing
+    // root: the engine then keeps the last index and reports `Recovering`
+    // until the root is back, which also shows the move was seen.
+    let end = Instant::now() + SETUP;
+    while live_count(&engine) != 0 && engine.health() == EngineHealth::Live {
+        assert!(
+            Instant::now() < end,
+            "the index still lists {} entries under a root that moved away",
+            live_count(&engine)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    fs::rename(&moved, &outer).unwrap();
+    touch(&root.join("d0/back_again.txt"), 8);
+    let after = wait_for_fresh_scan(&engine, &root, "root moved back");
+    assert_orders_match(&after);
+    engine.shutdown();
 }
