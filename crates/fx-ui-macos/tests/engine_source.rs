@@ -922,3 +922,25 @@ fn the_windows_search_applies_the_chips() {
         Err(SearchError::InvalidRegex { .. })
     ));
 }
+
+#[test]
+fn one_snapshot_is_pinned_while_shown_and_none_while_hidden() {
+    // Run 2.17: each pinned snapshot keeps its own sort orders (16 B per
+    // entry); 0.3.2 kept four.
+    let (_dir, source) = scanned("pinned");
+    for query in ["a", "b", "notes", ""] {
+        let _ = rows_by_path(&source, query);
+        assert!(source.pinned_count() <= 1, "at most one pinned snapshot");
+    }
+    source.set_window_visible(false);
+    assert_eq!(source.pinned_count(), 0, "none once the window hides");
+    let _ = rows_by_path(&source, "a");
+    assert_eq!(
+        source.pinned_count(),
+        0,
+        "a search while hidden pins nothing"
+    );
+    source.set_window_visible(true);
+    let _ = rows_by_path(&source, "a");
+    assert!(source.pinned_count() <= 1);
+}

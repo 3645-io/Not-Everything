@@ -34,6 +34,7 @@ pub use synthetic::SyntheticSource;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -667,8 +668,11 @@ impl ResultsSource for Engine {
     }
 }
 
-/// How many searched snapshots an [`EngineSource`] keeps for row reads.
-const PINNED_SNAPSHOTS: usize = 4;
+/// How many searched snapshots an [`EngineSource`] keeps for row reads
+/// while the window shows: the page on screen's. Each keeps its own sort
+/// orders (16 B per entry), so 0.3.2's four could hold four copies; none
+/// is kept while the window is hidden (run 2.17).
+const PINNED_SNAPSHOTS: usize = 1;
 
 /// An [`Engine`] plus the root path it watches.
 ///
@@ -680,6 +684,8 @@ pub struct EngineSource {
     engine: Arc<Engine>,
     root_parent: Option<String>,
     pinned: Mutex<VecDeque<Arc<EngineSnapshot>>>,
+    /// The window shows the results; while it doesn't, nothing is pinned.
+    visible: AtomicBool,
 }
 
 impl EngineSource {
@@ -695,12 +701,19 @@ impl EngineSource {
             engine,
             root_parent,
             pinned: Mutex::new(VecDeque::with_capacity(PINNED_SNAPSHOTS)),
+            visible: AtomicBool::new(true),
         }
     }
 
     /// The wrapped engine.
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
+    }
+
+    /// How many searched snapshots are pinned now (at most one while the
+    /// window shows, none while it is hidden), for tests and measurements.
+    pub fn pinned_count(&self) -> usize {
+        self.pinned().len()
     }
 
     fn pinned(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<EngineSnapshot>>> {
@@ -711,7 +724,9 @@ impl EngineSource {
 
     fn pin(&self, snap: Arc<EngineSnapshot>) {
         let mut pinned = self.pinned();
-        if pinned.iter().any(|s| s.generation() == snap.generation()) {
+        if !self.visible.load(Ordering::Acquire)
+            || pinned.iter().any(|s| s.generation() == snap.generation())
+        {
             return;
         }
         if pinned.len() == PINNED_SNAPSHOTS {
@@ -839,7 +854,13 @@ impl ResultsSource for EngineSource {
         ResultsSource::request_save(&*self.engine);
     }
 
+    /// Also pins nothing while the window is hidden, and lets go of the
+    /// pinned snapshot when it hides.
     fn set_window_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+        if !visible {
+            self.pinned().clear();
+        }
         ResultsSource::set_window_visible(&*self.engine, visible);
     }
 }
