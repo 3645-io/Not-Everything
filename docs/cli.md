@@ -29,6 +29,8 @@ with `-export-*`:
   a read-only folder works.
 - Nothing is rescanned and no file is opened or downloaded; results come
   from the saved index only, so they are as fresh as the app's last save.
+  The app saves its index once a day, when it quits and after a full
+  rescan, so while it runs the results can be up to a day old.
 - There is no option to delete, rename, move or trash a file.
 
 ## Which store is read

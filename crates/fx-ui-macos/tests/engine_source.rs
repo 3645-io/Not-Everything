@@ -770,8 +770,8 @@ fn synthetic_source_has_no_index_to_save() {
 }
 
 /// `EngineSource::save_for_quit` (called when the app quits) leaves a store
-/// the next launch can resume from as it is: the save after the first scan
-/// already holds the resume cursor, so quitting writes nothing.
+/// that already holds the latest snapshot as it is: after the save that
+/// follows the first scan, with no change since, quitting writes nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn quit_after_the_saved_first_scan_leaves_the_store_unchanged() {

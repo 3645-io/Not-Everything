@@ -2,10 +2,13 @@
 //! (Carbon `RegisterEventHotKey`, so no Accessibility prompt).
 //!
 //! [`SummonHotkey::register`] maps a [`HotkeySpec`] onto `global-hotkey`'s
-//! key code and modifiers and registers it; the window controller polls
-//! [`SummonHotkey::poll_pressed`] from a main-thread timer. The manager must
-//! be created on the main thread and live as long as the hotkey should; it
-//! unregisters when dropped.
+//! key code and modifiers and registers it. The crate hands each event to a
+//! handler the window controller installs, which wakes the main thread; the
+//! controller then asks [`SummonHotkey::is_press`] whether it was this
+//! hotkey going down. Until 0.3.1 a timer polled for events 10 times a
+//! second, which kept waking the app. The manager must be created on the
+//! main thread and live as long as the hotkey should; it unregisters when
+//! dropped.
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -34,16 +37,9 @@ impl SummonHotkey {
         Ok(SummonHotkey { manager, hotkey })
     }
 
-    /// Drains the pending hotkey events and returns whether this hotkey was
-    /// pressed (key-down) at least once since the last call.
-    pub fn poll_pressed(&self) -> bool {
-        let mut pressed = false;
-        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.id() == self.hotkey.id() && event.state() == HotKeyState::Pressed {
-                pressed = true;
-            }
-        }
-        pressed
+    /// Whether `event` is this hotkey going down.
+    pub fn is_press(&self, event: &GlobalHotKeyEvent) -> bool {
+        event.id() == self.hotkey.id() && event.state() == HotKeyState::Pressed
     }
 }
 

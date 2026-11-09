@@ -658,6 +658,94 @@ fn throttle_interval_is_configurable() {
     assert!(ctl.tick(t0 + 600 * MS).is_some());
 }
 
+// ---------------------------------------------------------------------------
+// The window off screen
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_hidden_window_remembers_new_generations_without_searching() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("alp");
+    refresh(&mut ctl, req);
+    assert!(
+        ctl.set_visible(false, t0).is_none(),
+        "hiding never searches"
+    );
+
+    let searches = fake.search_count();
+    assert!(ctl.on_generation(fake.bump(), t0).is_none());
+    assert!(ctl.has_pending_rerun(), "the change is remembered");
+    assert!(!ctl.wants_tick(), "no timer while hidden");
+    assert!(ctl.tick(t0 + 1000 * MS).is_none(), "no re-run while hidden");
+    assert!(ctl.on_generation(fake.bump(), t0 + 2000 * MS).is_none());
+    assert_eq!(fake.search_count(), searches, "hidden: no search at all");
+}
+
+#[test]
+fn showing_the_window_reruns_once_at_once() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("alp");
+    refresh(&mut ctl, req);
+    // A re-run at t0, so the throttle interval has not passed at t0 + 30 ms.
+    let r = ctl
+        .on_generation(fake.bump(), t0)
+        .expect("visible: re-runs");
+    refresh(&mut ctl, r);
+    assert!(ctl.set_visible(false, t0 + 10 * MS).is_none());
+    fake.lock().entries.push(file("/Users/me/alps.jpg", 1, 1));
+    assert!(ctl.on_generation(fake.bump(), t0 + 20 * MS).is_none());
+
+    let r = ctl
+        .set_visible(true, t0 + 30 * MS)
+        .expect("showing the window re-runs without waiting out the throttle");
+    refresh(&mut ctl, r);
+    assert_eq!(ctl.row_count(), 4);
+    assert!(!ctl.has_pending_rerun());
+    assert!(
+        ctl.set_visible(true, t0 + 40 * MS).is_none(),
+        "already visible"
+    );
+    assert!(ctl.tick(t0 + 1000 * MS).is_none());
+}
+
+#[test]
+fn showing_the_window_without_a_newer_generation_does_not_rerun() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("");
+    refresh(&mut ctl, req);
+    assert!(ctl.set_visible(false, t0).is_none());
+    assert!(ctl.on_generation(Generation(1), t0).is_none(), "not newer");
+    assert!(ctl.set_visible(true, t0 + 500 * MS).is_none());
+}
+
+#[test]
+fn the_throttle_applies_again_once_visible() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("");
+    refresh(&mut ctl, req);
+    assert!(ctl.set_visible(false, t0).is_none());
+    assert!(ctl.on_generation(fake.bump(), t0).is_none());
+    let r = ctl
+        .set_visible(true, t0 + 10 * MS)
+        .expect("re-runs when shown");
+    refresh(&mut ctl, r);
+    assert!(
+        ctl.on_generation(fake.bump(), t0 + 50 * MS).is_none(),
+        "inside the interval"
+    );
+    assert!(ctl.wants_tick());
+    assert!(ctl.tick(t0 + 80 * MS).is_none());
+    assert!(ctl.tick(t0 + 120 * MS).is_some());
+}
+
 #[test]
 fn new_page_invalidates_cached_rows() {
     let fake = sample();

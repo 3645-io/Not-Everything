@@ -1,6 +1,7 @@
 //! The resident menu-bar side of the product window: the status
-//! item and its menu, the global summon hotkey, Launch at Login and the
-//! Full Disk Access onboarding.
+//! item and its menu, the global summon hotkey, the daily save of the
+//! index ([`crate::daily_save`]), Launch at Login and the Full Disk Access
+//! onboarding.
 //!
 //! All of it runs on the main thread from [`WinController`] methods. The
 //! menu is rendered from [`crate::menu::build_menu`]; each action item's tag
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use fx_fs::AccessState;
 use fx_fs_macos::fda::FdaProbe;
+use global_hotkey::GlobalHotKeyEvent;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, sel};
@@ -34,6 +36,7 @@ use crate::actions::{HideMode, hide_mode};
 use crate::appkit::login_item::{self, LoginItemStatus};
 use crate::appkit::summon::SummonHotkey;
 use crate::build_info::BuildInfo;
+use crate::daily_save::DAILY_SAVE_CHECK;
 use crate::hotkey::{HotkeySpec, Key};
 use crate::menu::{MenuAction, MenuItem, MenuState, build_menu};
 use crate::onboarding::{IndexScope, Onboarding, OnboardingEvent, OnboardingOutput, ScopeNote};
@@ -41,8 +44,29 @@ use crate::settings::Settings;
 use crate::source::ResultsSource;
 use crate::switchable::SwitchableSource;
 
-/// How often the summon hotkey's event receiver is polled.
-const HOTKEY_POLL: Duration = Duration::from_millis(100);
+/// How late the daily-save check may fire, so macOS can batch it with
+/// other timers.
+const DAILY_SAVE_TOLERANCE: Duration = Duration::from_secs(60);
+
+// CoreGraphics: how long ago the last event of a type came in.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+}
+
+/// `kCGEventSourceStateCombinedSessionState`.
+const COMBINED_SESSION_STATE: i32 = 0;
+/// `kCGAnyInputEventType`.
+const ANY_INPUT_EVENT: u32 = !0;
+
+/// How long nobody has used the keyboard, mouse or trackpad in this login
+/// session.
+pub(super) fn input_idle() -> Duration {
+    // SAFETY: a pure query with a documented state and event type.
+    let secs =
+        unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, ANY_INPUT_EVENT) };
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO)
+}
 
 /// What the app needs to run resident, prepared by `app::launch`.
 pub struct ResidentConfig {
@@ -230,24 +254,26 @@ impl WinController {
             match SummonHotkey::register(&spec) {
                 Ok(hk) => {
                     self.with_resident(|r| r.hotkey = Some(hk));
-                    let target: &AnyObject = self.as_ref();
-                    // SAFETY: `hotkeyTick:` is implemented as
-                    // `-(void)hotkeyTick:(NSTimer *)timer`; the run loop
-                    // retains the repeating timer, which retains its target.
-                    let timer = unsafe {
-                        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                            HOTKEY_POLL.as_secs_f64(),
-                            target,
-                            sel!(hotkeyTick:),
-                            None,
-                            true,
-                        )
-                    };
-                    timer.setTolerance(HOTKEY_POLL.as_secs_f64() / 2.0);
+                    GlobalHotKeyEvent::set_event_handler(Some(self.hotkey_sender()));
                 }
                 Err(e) => eprintln!("{APP_NAME}: global hotkey not available: {e}"),
             }
         }
+
+        let target: &AnyObject = self.as_ref();
+        // SAFETY: `dailySaveTick:` is implemented as
+        // `-(void)dailySaveTick:(NSTimer *)timer`; the run loop retains the
+        // repeating timer, which retains its target.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                DAILY_SAVE_CHECK.as_secs_f64(),
+                target,
+                sel!(dailySaveTick:),
+                None,
+                true,
+            )
+        };
+        timer.setTolerance(DAILY_SAVE_TOLERANCE.as_secs_f64());
 
         let status_bar = NSStatusBar::systemStatusBar();
         let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -461,9 +487,15 @@ impl WinController {
         }
     }
 
-    pub(crate) fn poll_hotkey(&self) {
+    /// Hotkey events handed over from the `global-hotkey` handler: the
+    /// summon hotkey going down toggles the window.
+    pub(crate) fn hotkey_events(&self, events: &[GlobalHotKeyEvent]) {
         let pressed = self
-            .with_resident(|r| r.hotkey.as_ref().is_some_and(SummonHotkey::poll_pressed))
+            .with_resident(|r| {
+                r.hotkey
+                    .as_ref()
+                    .is_some_and(|hk| events.iter().any(|e| hk.is_press(e)))
+            })
             .unwrap_or(false);
         if pressed {
             self.toggle_window();
