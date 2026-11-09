@@ -3,7 +3,8 @@
 //!
 //! Cmd+Q quits at once: the windows and the menu-bar item disappear
 //! first, so the quit looks instant whatever follows; then the index is
-//! saved only when the next launch could not load it otherwise.
+//! saved when it has changes the store lacks, since the app saves it only
+//! once a day while it runs.
 //! That decision is the engine's (`fx_engine::Engine::checkpoint_for_quit`,
 //! through [`ResultsSource::save_for_quit`](crate::source::ResultsSource::save_for_quit)),
 //! because it has to be taken under the engine's save lock.
@@ -17,7 +18,7 @@ pub enum QuitStep {
     RemoveStatusItem,
     /// Order out every window and show that on screen at once.
     HideWindows,
-    /// Save the index if the next launch needs it
+    /// Save the changes the stored index lacks
     /// ([`ResultsSource::save_for_quit`](crate::source::ResultsSource::save_for_quit)).
     SaveIndex,
 }

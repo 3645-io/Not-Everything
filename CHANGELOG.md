@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.2: less background work (November 2026)
+
+A small update that makes Not-Everything far lighter while it waits in the background. Signed and notarized. Apple silicon only, macOS 13 or later.
+
+### Before you update
+
+- **Nothing to do.** Full Disk Access, Launch at Login, your hotkey, your settings and your index carry over from 0.3.1.
+
+### Changed
+
+- **No searching while the window is out of sight.** When the window is hidden, behind other windows, on another Space or the screen is locked, the results no longer refresh with every file change; they refresh once when the window shows again.
+- **The index is saved once a day instead of every 5 minutes**, at a moment you are not using the keyboard or mouse, and when you quit. 0.3.1 rewrote the whole index (about 250 MB for a whole disk) every 5 minutes while files kept changing. After a crash, the next launch still catches up on everything that changed.
+- **The index is no longer copied into Time Machine backups.** The app rebuilds it from the disk when needed.
+- **The hotkey no longer wakes the app 10 times a second** to check whether it was pressed.
+- **Background work runs at a lower priority**, so macOS can keep it on the efficiency cores.
+- **The `not-everything` command reads the last saved index**, which can now be up to a day old while the app runs.
+
+### For testers
+
+Release candidates install as **Not-Everything Preview**, with its own settings, index, hotkey (Option-Shift-Space) and command (`not-everything-preview`). It runs next to your everyday Not-Everything without touching it.
+
+### Install
+
+Open `Not-Everything-0.3.2-macos-arm64.dmg` and drag Not-Everything to Applications, replacing the old copy. The zip, `Not-Everything-0.3.2-macos-arm64.zip`, holds the same signed app. `not-everything-cli-0.3.2-macos-arm64.tar.gz` holds the `not-everything` command, its manual (`cli.md`), the license and the third-party notices.
+
 ## v0.3.1: Copy path moves to Option-Command-C (November 2026)
 
 A small update that frees ⌘C for copying files, as in Finder. Signed and notarized. Apple silicon only, macOS 13 or later.

@@ -34,8 +34,9 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fx_engine::{Generation, SearchError};
+use fx_engine::{Generation, SearchError, qos};
 use fx_query::{Highlighter, Highlights};
+use global_hotkey::GlobalHotKeyEvent;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
@@ -47,7 +48,7 @@ use objc2_app_kit::{
     NSForegroundColorAttributeName, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
     NSPasteboardWriting, NSResponder, NSSearchFieldDelegate, NSTableColumn, NSTableRowView,
     NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextFieldDelegate,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWorkspace,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowOcclusionState, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSDictionary, NSIndexSet, NSMutableAttributedString, NSMutableIndexSet, NSNotFound,
@@ -79,6 +80,7 @@ use crate::controller::{
     DEFAULT_THROTTLE, MAX_COPY_PATHS, MAX_KEPT_SELECTION, RequestId, ResultsController,
     SearchRequest,
 };
+use crate::daily_save::daily_save_due;
 use crate::file_glyph::FileKind;
 use crate::formats::{write_date, write_folder, write_size_cell};
 #[cfg(feature = "measure")]
@@ -338,11 +340,13 @@ fn key_of(event: &NSEvent) -> (Key, Modifiers) {
 /// A finished search: its request, its answer and how long it took.
 type Answer = (RequestId, Result<ResultPage, SearchError>, Duration);
 
-/// Pages and generations posted by the background threads.
+/// Pages, generations and hotkey events posted by the background threads
+/// and the `global-hotkey` handler.
 #[derive(Default)]
 struct Inbox {
     pages: Vec<Answer>,
     generation: Option<Generation>,
+    hotkey: Vec<GlobalHotKeyEvent>,
 }
 
 /// State shared with the background threads.
@@ -351,6 +355,9 @@ pub(crate) struct Shared {
     inbox: Mutex<Inbox>,
     /// Set while a wake-up is queued, so bursts post one message.
     wake_pending: AtomicBool,
+    /// The window is off screen: a new generation is only recorded in the
+    /// inbox, without waking the main thread, until it shows again.
+    hidden: AtomicBool,
 }
 
 impl Shared {
@@ -778,10 +785,16 @@ define_class!(
             self.onboarding_event(OnboardingEvent::Dismissed);
         }
 
-        /// Repeating timer: poll the summon hotkey.
-        #[unsafe(method(hotkeyTick:))]
-        fn hotkey_tick(&self, _timer: &NSTimer) {
-            self.poll_hotkey();
+        /// Repeating timer: the daily save, when it is due.
+        #[unsafe(method(dailySaveTick:))]
+        fn daily_save_tick_sel(&self, _timer: &NSTimer) {
+            self.daily_save_tick();
+        }
+
+        /// The results window went on or off screen.
+        #[unsafe(method(occlusionChanged:))]
+        fn occlusion_changed(&self, _note: &NSNotification) {
+            self.sync_visibility();
         }
 
         /// One-shot timer: re-probe Full Disk Access while the banner shows.
@@ -909,6 +922,72 @@ impl WinController {
                 None,
             );
         }
+        if let Some(ui) = self.ui() {
+            // SAFETY: `occlusionChanged:` is implemented above as
+            // `-(void)occlusionChanged:(NSNotification *)note`; the name is
+            // an immutable framework constant; the controller and the window
+            // live until the app quits, so the observer never outlives them.
+            unsafe {
+                NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                    self,
+                    sel!(occlusionChanged:),
+                    Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
+                    Some(&ui.window),
+                );
+            }
+        }
+        // A window that has never been shown posts no change: read its state.
+        self.sync_visibility();
+    }
+
+    /// Tells the results controller whether the window is on screen: no
+    /// search re-runs while it is not, and one when it shows again.
+    fn sync_visibility(&self) {
+        let Some(ui) = self.ui() else { return };
+        let visible = ui
+            .window
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible);
+        self.ivars()
+            .shared
+            .hidden
+            .store(!visible, Ordering::Release);
+        if visible {
+            // Take in the generations recorded while hidden.
+            self.drain();
+        }
+        let req = self
+            .ivars()
+            .results
+            .borrow_mut()
+            .set_visible(visible, Instant::now());
+        if let Some(req) = req {
+            self.submit(req);
+        }
+        self.schedule_tick_if_pending();
+    }
+
+    /// The daily-save check: once a day, at a moment nobody uses the
+    /// keyboard or mouse, the engine saves the index in the background.
+    fn daily_save_tick(&self) {
+        let results = self.ivars().results.borrow();
+        let source = results.source();
+        if daily_save_due(source.saved_ago(), super::resident::input_idle()) {
+            source.request_save();
+        }
+    }
+
+    /// A `global-hotkey` event handler: queues each event for the main
+    /// thread and wakes it, so no timer polls for events.
+    pub(super) fn hotkey_sender(&self) -> impl Fn(GlobalHotKeyEvent) + Send + Sync + 'static {
+        let waker = MainWaker {
+            waker: Waker::new(),
+            shared: Arc::clone(&self.ivars().shared),
+        };
+        move |event| {
+            waker.shared.inbox().hotkey.push(event);
+            waker.wake();
+        }
     }
 
     pub(super) fn ui(&self) -> Option<&WinUi> {
@@ -931,6 +1010,9 @@ impl WinController {
         std::thread::Builder::new()
             .name("fx-ui-search".into())
             .spawn(move || {
+                // Someone waits for these searches; the engine's own threads
+                // run at utility.
+                qos::set_current_thread_class(qos::ThreadClass::UserInitiated);
                 while let Ok(mut request) = rx.recv() {
                     // Only the newest request matters.
                     while let Ok(newer) = rx.try_recv() {
@@ -962,7 +1044,9 @@ impl WinController {
                         let mut inbox = waker.shared.inbox();
                         inbox.generation = Some(inbox.generation.map_or(g, |old| old.max(g)));
                     }
-                    waker.wake();
+                    if !waker.shared.hidden.load(Ordering::Acquire) {
+                        waker.wake();
+                    }
                 }
             })
             .expect("spawn the generation listener");
@@ -1137,10 +1221,17 @@ impl WinController {
     fn drain(&self) {
         let iv = self.ivars();
         iv.shared.wake_pending.store(false, Ordering::Release);
-        let (pages, generation) = {
+        let (pages, generation, hotkey) = {
             let mut inbox = iv.shared.inbox();
-            (std::mem::take(&mut inbox.pages), inbox.generation.take())
+            (
+                std::mem::take(&mut inbox.pages),
+                inbox.generation.take(),
+                std::mem::take(&mut inbox.hotkey),
+            )
         };
+        if !hotkey.is_empty() {
+            self.hotkey_events(&hotkey);
+        }
         // Read before the rows change under the table.
         let first_in_view = !pages.is_empty() && self.first_selected_in_view();
         let mut changed = false;
@@ -1228,7 +1319,7 @@ impl WinController {
 
     fn schedule_tick_if_pending(&self) {
         let iv = self.ivars();
-        if iv.tick_scheduled.get() || !iv.results.borrow().has_pending_rerun() {
+        if iv.tick_scheduled.get() || !iv.results.borrow().wants_tick() {
             return;
         }
         iv.tick_scheduled.set(true);
