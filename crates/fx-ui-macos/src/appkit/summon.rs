@@ -5,7 +5,10 @@
 //! [`SummonHotkey`] slot: it maps a [`HotkeySpec`] onto `global-hotkey`'s
 //! key code and modifiers and registers it, so a shortcut picked in
 //! Settings replaces the old one at once ([`crate::hotkey_slot`]). The
-//! window controller polls [`poll_pressed`] from a main-thread timer. The
+//! crate hands each event to a handler the window controller installs,
+//! which wakes the main thread; the controller then asks [`is_press`]
+//! whether it was the registered shortcut going down. Until 0.3.1 a timer
+//! polled for events 10 times a second, which kept waking the app. The
 //! manager must be created on the main thread and live as long as the
 //! hotkey should; the slot unregisters its shortcut when dropped.
 //!
@@ -56,18 +59,10 @@ impl Registrar for GlobalRegistrar {
     }
 }
 
-/// Drains the pending hotkey events and returns whether the registered
-/// shortcut was pressed (key-down) at least once since the last call.
-/// Events of a shortcut replaced since are dropped.
-pub fn poll_pressed(slot: &SummonHotkey) -> bool {
-    let id = slot.handle().map(HotKey::id);
-    let mut pressed = false;
-    while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-        if Some(event.id()) == id && event.state() == HotKeyState::Pressed {
-            pressed = true;
-        }
-    }
-    pressed
+/// Whether `event` is the registered shortcut going down. Events of a
+/// shortcut replaced since are not.
+pub fn is_press(slot: &SummonHotkey, event: &GlobalHotKeyEvent) -> bool {
+    slot.handle().map(HotKey::id) == Some(event.id()) && event.state() == HotKeyState::Pressed
 }
 
 /// The `global-hotkey` form of `spec`.

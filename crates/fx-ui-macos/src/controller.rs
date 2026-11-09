@@ -17,7 +17,10 @@
 //!    current query at most once per throttle interval (default
 //!    [`DEFAULT_THROTTLE`]); a generation arriving sooner is deferred, and
 //!    [`tick`](ResultsController::tick) fires it once the interval has
-//!    passed. Time is passed in, so tests control it.
+//!    passed. While the window is off screen
+//!    ([`set_visible`](ResultsController::set_visible)) nothing re-runs: a
+//!    new generation is only remembered, and showing the window re-runs
+//!    once, at once. Time is passed in, so tests control it.
 //! 3. [`run`](ResultsController::run) executes a request (or
 //!    [`search_request`](ResultsController::search_request) captures it for
 //!    a worker thread) and [`apply`](ResultsController::apply) installs the
@@ -247,6 +250,8 @@ pub struct ResultsController<S: ResultsSource> {
     options: QueryOptions,
     /// The request shown failed: its regular expression does not compile.
     invalid_regex: bool,
+    /// The window is on screen (see [`set_visible`](Self::set_visible)).
+    visible: bool,
 }
 
 impl<S: ResultsSource> ResultsController<S> {
@@ -273,6 +278,7 @@ impl<S: ResultsSource> ResultsController<S> {
             kept: KeptSelection::Nothing,
             options: QueryOptions::default(),
             invalid_regex: false,
+            visible: true,
         }
     }
 
@@ -393,15 +399,16 @@ impl<S: ResultsSource> ResultsController<S> {
     }
 
     /// A newly published generation `g`. Returns the re-run request when
-    /// `g` is newer than any seen and the throttle interval has passed since
-    /// the last re-run; a newer `g` inside the interval is deferred to
-    /// [`tick`](Self::tick).
+    /// `g` is newer than any seen, the window is on screen and the throttle
+    /// interval has passed since the last re-run; a newer `g` inside the
+    /// interval is deferred to [`tick`](Self::tick), and one that arrives
+    /// while the window is off screen to [`set_visible`](Self::set_visible).
     pub fn on_generation(&mut self, g: Generation, now: Instant) -> Option<RequestId> {
         if g <= self.seen {
             return None;
         }
         self.seen = g;
-        if self.throttle_passed(now) {
+        if self.visible && self.throttle_passed(now) {
             Some(self.rerun(now))
         } else {
             self.pending = true;
@@ -409,18 +416,42 @@ impl<S: ResultsSource> ResultsController<S> {
         }
     }
 
-    /// Fires a deferred re-run once the throttle interval has passed.
+    /// Fires a deferred re-run once the throttle interval has passed, while
+    /// the window is on screen.
     pub fn tick(&mut self, now: Instant) -> Option<RequestId> {
-        if self.pending && self.throttle_passed(now) {
+        if self.wants_tick() && self.throttle_passed(now) {
             Some(self.rerun(now))
         } else {
             None
         }
     }
 
-    /// Whether a deferred re-run is waiting for [`tick`](Self::tick).
+    /// The window went on screen (`visible`) or off it: ordered out, the
+    /// app hidden, covered by other windows, on another Space, or the
+    /// screen locked. Off screen, no generation re-runs the search: in 0.3.1
+    /// those re-runs took about 85% of the app's background CPU. Coming
+    /// back on screen with a re-run pending returns it at once, without
+    /// waiting out the throttle interval, so the rows are current when they
+    /// show; otherwise `None`.
+    pub fn set_visible(&mut self, visible: bool, now: Instant) -> Option<RequestId> {
+        let was = std::mem::replace(&mut self.visible, visible);
+        if visible && !was && self.pending {
+            Some(self.rerun(now))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a deferred re-run is waiting, for [`tick`](Self::tick) or,
+    /// while the window is off screen, for it to show again.
     pub fn has_pending_rerun(&self) -> bool {
         self.pending
+    }
+
+    /// Whether [`tick`](Self::tick) has a re-run to fire: one is pending
+    /// and the window is on screen. The window sets a timer only then.
+    pub fn wants_tick(&self) -> bool {
+        self.pending && self.visible
     }
 
     fn throttle_passed(&self, now: Instant) -> bool {
