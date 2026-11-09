@@ -11,7 +11,7 @@ Every change that ships is measured before its pull request against the metrics 
 | Tier | When | Where | Time | What runs | On a failure |
 | --- | --- | --- | --- | --- | --- |
 | `quick` | After each change to a crate on the hot path | The owner's Mac | 1–3 min | The crate's benchmarks at small scale (200,000 entries), against the quick baseline; targets are not checked at small scale | Fixed before the next change |
-| `pr` | When the checks in `.agents/rules/runs.md` pass, before pushing | The M4 Pro, plugged in, nothing heavy running | About 35 min | Every metric marked P below at gate scale; 10 min with the window hidden and 10 min showing a search, under 20 file operations a second (`fx-bench churn`) | Re-run the step alone; still failing → fix it, or ask the owner. The summary goes in the PR |
+| `pr` | When the checks in `.agents/rules/runs.md` pass, before pushing | The M4 Pro, plugged in, nothing heavy running | About 30 min | Every metric marked P below at gate scale; 10 min with the window hidden and 10 min showing a search, under 20 file operations a second (`fx-bench churn`) | Re-run the step alone; still failing → fix it, or ask the owner. The summary goes in the PR |
 | CI | Every pull request | GitHub | Seconds | `scripts/check-perf-report.sh`: a PR that changes shipped code must carry a passing `pr` summary, or the owner's approval to skip | The PR can't merge |
 | `rc` | Each release candidate | The M4 Pro, and the 8 GB Mac when there is one | About 1.5 h | As `pr`, with 20 launches, 30 min hidden and 30 min showing a search on the whole-disk index of a Mac in daily use, and the DMG size; plus `scripts/phase1-gate.sh` warm and cold | No release |
 
@@ -19,7 +19,7 @@ GitHub's shared macOS runners vary more between runs than the allowances, and ha
 
 ## Allowances
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. Until a metric reaches its target, the allowance alone holds it, so it can't get worse while its fix is pending.
+A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.3.1's CPU, energy, disk writes and memory, and its first scan), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
 
 | Class | Metrics | Allowance |
 | --- | --- | --- |
@@ -28,6 +28,7 @@ A metric fails when it misses its target or is worse than the baseline by more t
 | Timings | S1–S7, F1, F3–F6 | 10% of the median of the runs, and at least the floor below |
 | Launch | F2 | 10% of the median of the launches |
 | Background | B1, B2, B4–B6 | 10%, and at least 0.05 points of a core, 5 mW or 0.5 wakeups a second |
+| Busiest interval | B3 | 25% |
 
 Small numbers vary a lot between identical runs: in 0.3.0, idle CPU ranged from 0.24% to 0.42% across three runs of one build, and engine search at 2M took 16.7 ms p95 in one run and 7.5 ms in another. So a failing step is re-run alone once, and only a second failure counts.
 
@@ -41,7 +42,7 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 | --- | --- | --- | --- | --- | --- |
 | B1 | CPU, window hidden, average % of one core | `hidden_cpu_pct` | ≤1% | 10%, ≥0.05 points | P R |
 | B2 | CPU, window showing a search | `search_cpu_pct` | ≤5% | 10%, ≥0.05 points | P R |
-| B3 | CPU, busiest 10 s interval | `cpu_max_interval_pct` | ≤100% | target only | P R |
+| B3 | CPU, busiest 10 s interval | `cpu_max_interval_pct` | ≤100% | 25% (it varies a lot between runs) | P R |
 | B4 | CPU energy, window hidden | `hidden_energy_mw` | ≤50 mW | 10%, ≥5 mW | P R |
 | B5 | CPU energy, window showing a search | `search_energy_mw` | ≤250 mW | 10%, ≥5 mW | P R |
 | B6 | Wakeups a second, window hidden | `hidden_wakeups_per_s` | ≤2 | 10%, ≥0.5 | P R |

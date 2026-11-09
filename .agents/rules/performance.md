@@ -19,7 +19,7 @@ Speed, a small footprint and a quiet background are the product. Every change th
 
   `matcher` is `matcher_bench` (S1, S3, S4); `startup` is `startup_bench` (M4, M5); `catchup` is `catchup_bench` (F6, C2); `freshness` is `freshness_bench` (F1, C1); `gate-probe`, `summon` and `sort` are the app's probes (F2, S5, S7; F3; S6); `cli` times the `not-everything` command (O2). Any other crate: run the quick tier without `--only`.
 
-- **Before the PR.** When every check in `runs.md` passes, run `scripts/perf-check.sh --tier pr --out <new dir>` on the M4 Pro, plugged in, with nothing heavy running. It takes about 35 minutes. Push only when it passes, and paste its `summary.md`, including the `perf-compare: …` line, into the PR description. CI fails a PR that changes shipped code without it (`scripts/check-perf-report.sh`).
+- **Before the PR.** When every check in `runs.md` passes, run `scripts/perf-check.sh --tier pr --out <new dir>` on the M4 Pro, plugged in, with nothing heavy running. It takes about 30 minutes. Push only when it passes, and paste its `summary.md`, including the `perf-compare: …` line, into the PR description. CI fails a PR that changes shipped code without it (`scripts/check-perf-report.sh`).
 - **Each release candidate.** `scripts/perf-check.sh --tier rc --dmg <the RC's DMG> --out <new dir>` (`branches-and-releases.md`).
 - A change that touches no shipped code (docs, rules, scripts, CI, tests, benchmarks) skips the first two and says so in the PR.
 

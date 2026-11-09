@@ -7,7 +7,7 @@
 #   quick  while building: small-scale benchmarks for the crates named with
 #          --only, or for all of them, in 1 to 3 minutes. Compared with the
 #          quick baseline; targets are not checked at small scale.
-#   pr     before a PR: every metric marked P at gate scale, about 35
+#   pr     before a PR: every metric marked P at gate scale, about 30
 #          minutes, including 10 minutes with the window hidden and 10 with
 #          it showing a search, under scripted file activity (fx-bench churn).
 #   rc     each release candidate: as pr, with 20 launches and 30 minutes
