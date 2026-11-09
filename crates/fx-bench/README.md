@@ -105,7 +105,7 @@ cargo run --release -p fx-bench -- perf-release \
     perf/metrics.txt
 ```
 
-The section is a summary table of the IDs in the baseline's `[meta]`
+The section, headed `### Performance` like the other sections of the notes, is a summary table of the IDs in the baseline's `[meta]`
 `summary` (by name, without IDs), the `--notes` file's lines, and then every
 metric of the baseline in a `<details>` block, grouped by the first letter
 of its ID. GitHub strips text colour from release notes, so each row has a

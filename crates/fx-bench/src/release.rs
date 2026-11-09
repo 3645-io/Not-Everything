@@ -46,7 +46,8 @@ const SAME_PCT: f64 = 1.0;
 pub fn render(input: &ReleaseInput) -> String {
     let b = input.baseline;
     let (prev, cur) = (input.previous_label, input.label);
-    let mut out = String::from("## Performance\n\n");
+    // The level of a release note's sections (`### Changed`, `### Install`).
+    let mut out = String::from("### Performance\n\n");
     let mut measured = format!(
         "{cur} compared with {prev} and the targets, measured with `scripts/perf-check.sh`"
     );

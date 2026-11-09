@@ -268,7 +268,7 @@ fn cells(text: &str, prefix: &str) -> Vec<String> {
 #[test]
 fn has_a_heading_a_legend_a_summary_and_a_folded_detail_table() {
     let text = section();
-    assert!(text.starts_with("## Performance\n"), "{text}");
+    assert!(text.starts_with("### Performance\n"), "{text}");
     assert!(
         text.contains("0.3.2 compared with 0.3.1 and the targets"),
         "{text}"
