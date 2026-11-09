@@ -20,6 +20,9 @@
 //!   position lookups ("Your files first") and the quit save included;
 //!   positions are asked by path and answered with a tagged generation, so
 //!   a lookup from after a switch reads as newer than the page shown;
+//! - the window's visibility goes to the current source and, at a switch,
+//!   to the next one, so an engine opened while the window is hidden
+//!   batches its changes in the background from the start;
 //! - subscribers are told about the switch with the new source's current
 //!   generation and then receive only the new source's generations.
 //!
@@ -68,6 +71,9 @@ struct State {
     subscribers: Vec<Sender<Generation>>,
     /// A next source is opening or waiting for its first snapshot.
     switching: bool,
+    /// The window's last `set_window_visible`, passed on to the next source
+    /// at a switch (`None` before the first call).
+    window_visible: Option<bool>,
 }
 
 impl Shared {
@@ -100,6 +106,7 @@ impl SwitchableSource {
                 current: initial,
                 subscribers: Vec::new(),
                 switching: false,
+                window_visible: None,
             }),
         });
         forward(&shared, 0, generations);
@@ -225,6 +232,11 @@ fn switch(shared: &Arc<Shared>, next: Arc<dyn ResultsSource>) -> Arc<dyn Results
         let mut state = shared.lock();
         state.epoch = state.epoch.saturating_add(1);
         state.switching = false;
+        // A source opened while the window is hidden starts in the
+        // background too.
+        if let Some(visible) = state.window_visible {
+            next.set_window_visible(visible);
+        }
         let previous = std::mem::replace(&mut state.current, next);
         let g = tag(state.epoch, state.current.generation());
         state.notify(g);
@@ -403,6 +415,16 @@ impl ResultsSource for SwitchableSource {
     /// The current source's.
     fn request_save(&self) {
         self.current().1.request_save();
+    }
+
+    /// The current source's; remembered for the next source at a switch.
+    fn set_window_visible(&self, visible: bool) {
+        let current = {
+            let mut state = self.shared.lock();
+            state.window_visible = Some(visible);
+            Arc::clone(&state.current)
+        };
+        current.set_window_visible(visible);
     }
 }
 

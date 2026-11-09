@@ -33,6 +33,12 @@ const MIN_COMPACT_ROWS: usize = 1024;
 /// `resume` and `shutdown`).
 const PAUSE_POLL: Duration = Duration::from_millis(20);
 
+/// While collecting a background batch, the writer waits on the source in
+/// slices this long, so a window that shows ends the batch within one
+/// slice. Only a batch in progress is sliced: the wait for its first change
+/// is not, since nothing is pending then.
+const BACKGROUND_SLICE: Duration = Duration::from_millis(250);
+
 /// A removal postponed to the end of the batch, so that an entry that only
 /// moved (reported at its old path first) is found at its new path before
 /// anything is removed.
@@ -50,6 +56,8 @@ pub(crate) struct Writer<C, P, V> {
     pub(crate) orders: Arc<Vec<Order>>,
     pub(crate) root: PathBuf,
     pub(crate) window: Duration,
+    /// The batch window while no window shows the results.
+    pub(crate) background_window: Duration,
     pub(crate) source: C,
     pub(crate) stat: P,
     pub(crate) enumerator: V,
@@ -180,10 +188,22 @@ where
         self.shared.stop.load(Ordering::Acquire)
     }
 
+    /// Whether a window shows the results.
+    fn foreground(&self) -> bool {
+        self.shared.foreground.load(Ordering::Acquire)
+    }
+
     /// Waits up to one window for a first change, then keeps collecting
-    /// for one more window. `None` if nothing arrived.
+    /// for one more window. `None` if nothing arrived. The window is the
+    /// background one while no window shows the results; such a batch ends
+    /// early once a window shows.
     fn collect(&mut self) -> Option<Vec<Change>> {
-        let mut changes = match self.source.next_batch(Instant::now() + self.window) {
+        let window = if self.foreground() {
+            self.window
+        } else {
+            self.background_window
+        };
+        let mut changes = match self.source.next_batch(Instant::now() + window) {
             Ok(batch) => {
                 self.recovery.errors = 0;
                 if batch.is_empty() {
@@ -199,9 +219,20 @@ where
                 return None;
             }
         };
-        let deadline = Instant::now() + self.window;
+        let background = !self.foreground();
+        let window = if background {
+            self.background_window
+        } else {
+            self.window
+        };
+        let deadline = Instant::now() + window;
         while Instant::now() < deadline && !self.stopping() {
-            match self.source.next_batch(deadline) {
+            let until = if background {
+                deadline.min(Instant::now() + BACKGROUND_SLICE)
+            } else {
+                deadline
+            };
+            match self.source.next_batch(until) {
                 Ok(batch) => {
                     self.recovery.errors = 0;
                     changes.extend(batch);
@@ -210,6 +241,10 @@ where
                     self.source_error();
                     break;
                 }
+            }
+            if background && self.foreground() {
+                // A window shows the results now: publish what is pending.
+                break;
             }
         }
         Some(changes)
@@ -572,43 +607,67 @@ where
     }
 
     /// Merges the batch into the orders, compacts the index if due and
-    /// publishes the new snapshot with `cursor`.
+    /// publishes the new snapshot with `cursor`. A batch that changed
+    /// nothing in the index (changes reported for entries that are already
+    /// as the disk has them, or for excluded paths) makes no new
+    /// generation: the newer cursor is published silently, so no window
+    /// re-runs its search and no idle save is started for it.
     fn commit(&mut self, cursor: Option<ResumeCursor>) {
-        if !self.batch.is_empty() {
-            let snap = self.index.snapshot();
-            let rebuild = self.batch.len() > self.tree.len() / 2;
-            let mut orders: Vec<Order> = if rebuild {
-                self.orders
-                    .iter()
-                    .map(|o| Order::build(&*snap, o.key))
-                    .collect()
-            } else {
-                self.orders
-                    .iter()
-                    .map(|o| {
-                        let mut o = o.clone();
-                        o.apply(&*snap, &self.batch);
-                        o
-                    })
-                    .collect()
-            };
-            self.batch.clear();
-            if self.compaction_due() {
-                // Compaction keeps live entries in ID order, so remapping an
-                // order keeps it sorted.
-                let remap = self.index.compact();
-                for order in &mut orders {
-                    for id in &mut order.ids {
-                        *id = remap[*id as usize].0;
-                    }
-                    debug_assert!(order.ids.iter().all(|&id| id != EntryId::NONE.0));
-                }
-            }
-            self.orders = Arc::new(orders);
-            self.group_stale = true;
+        if self.batch.is_empty() {
+            self.publish_cursor(cursor);
+            return;
         }
+        let snap = self.index.snapshot();
+        let rebuild = self.batch.len() > self.tree.len() / 2;
+        let mut orders: Vec<Order> = if rebuild {
+            self.orders
+                .iter()
+                .map(|o| Order::build(&*snap, o.key))
+                .collect()
+        } else {
+            // The published snapshot shares `self.orders`, so each order is
+            // read, not changed: `applied` copies it once into the new one.
+            self.orders
+                .iter()
+                .map(|o| o.applied(&*snap, &self.batch))
+                .collect()
+        };
+        self.batch.clear();
+        if self.compaction_due() {
+            // Compaction keeps live entries in ID order, so remapping an
+            // order keeps it sorted.
+            let remap = self.index.compact();
+            for order in &mut orders {
+                for id in &mut order.ids {
+                    *id = remap[*id as usize].0;
+                }
+                debug_assert!(order.ids.iter().all(|&id| id != EntryId::NONE.0));
+            }
+        }
+        self.orders = Arc::new(orders);
+        self.group_stale = true;
         self.generation += 1;
         self.publish(cursor);
+    }
+
+    /// Publishes `cursor` with the snapshot already published, without a
+    /// new generation and without telling subscribers. A save keeps the
+    /// cursor of the generation it saved, so a relaunch may replay a few
+    /// changes that changed nothing: harmless, since applying them again
+    /// changes nothing either.
+    fn publish_cursor(&mut self, cursor: Option<ResumeCursor>) {
+        let current = self.shared.current.load_full();
+        if current.cursor == cursor {
+            return;
+        }
+        let snap = EngineSnapshot {
+            index: current.index.clone(),
+            orders: Arc::clone(&current.orders),
+            cursor,
+            generation: current.generation,
+            priority: current.priority.clone(),
+        };
+        self.shared.current.store(Arc::new(snap));
     }
 
     fn compaction_due(&self) -> bool {

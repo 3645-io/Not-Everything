@@ -246,6 +246,11 @@ pub trait ResultsSource: Send + Sync {
     /// (the daily save). Sources without a saved index do nothing.
     fn request_save(&self) {}
 
+    /// The search window went on screen (`true`) or off it. An engine
+    /// collects changes in longer batches while nobody watches the results
+    /// (`fx_engine::Engine::set_foreground`); other sources do nothing.
+    fn set_window_visible(&self, _visible: bool) {}
+
     /// The search window's search: `query.text` under the search
     /// field's options, in the order of
     /// [`search_grouped`](Self::search_grouped), at positions
@@ -389,6 +394,10 @@ impl<T: ResultsSource + ?Sized> ResultsSource for Arc<T> {
 
     fn request_save(&self) {
         (**self).request_save();
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        (**self).set_window_visible(visible);
     }
 }
 
@@ -651,6 +660,11 @@ impl ResultsSource for Engine {
     fn request_save(&self) {
         self.request_checkpoint();
     }
+
+    /// [`Engine::set_foreground`]: longer batches while hidden.
+    fn set_window_visible(&self, visible: bool) {
+        self.set_foreground(visible);
+    }
 }
 
 /// How many searched snapshots an [`EngineSource`] keeps for row reads.
@@ -823,6 +837,10 @@ impl ResultsSource for EngineSource {
 
     fn request_save(&self) {
         ResultsSource::request_save(&*self.engine);
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        ResultsSource::set_window_visible(&*self.engine, visible);
     }
 }
 

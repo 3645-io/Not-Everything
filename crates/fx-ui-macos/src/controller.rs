@@ -15,7 +15,10 @@
 //! 2. A new snapshot generation from the source goes to
 //!    [`on_generation`](ResultsController::on_generation), which re-runs the
 //!    current query at most once per throttle interval (default
-//!    [`DEFAULT_THROTTLE`]); a generation arriving sooner is deferred, and
+//!    [`DEFAULT_THROTTLE`], stretched to [`RERUN_COST_FACTOR`] times the
+//!    last search's time, up to [`MAX_RERUN_SPACING`]: see
+//!    [`note_search_time`](ResultsController::note_search_time)); a
+//!    generation arriving sooner is deferred, and
 //!    [`tick`](ResultsController::tick) fires it once the interval has
 //!    passed. While the window is off screen
 //!    ([`set_visible`](ResultsController::set_visible)) nothing re-runs: a
@@ -78,6 +81,19 @@ use crate::source::{ResultPage, ResultsSource, Row, SearchQuery};
 
 /// The default minimum interval between re-runs caused by new generations.
 pub const DEFAULT_THROTTLE: Duration = Duration::from_millis(100);
+
+/// Re-runs caused by new generations wait at least this many times the
+/// last search's time ([`ResultsController::note_search_time`]). A search
+/// spreads over every core, so its CPU time is several times its wall
+/// time; spacing re-runs by 32 times the wall time keeps them to a fraction
+/// of a core however long the search takes. 0.3.2 re-ran every 100 ms
+/// whatever the search cost: 141% of a core while showing a search under
+/// steady file activity.
+pub const RERUN_COST_FACTOR: u32 = 32;
+
+/// The longest the spacing grows for a slow search, so a change still shows
+/// in an open result list well within Goal 3's second.
+pub const MAX_RERUN_SPACING: Duration = Duration::from_millis(500);
 
 /// The default number of rows fetched per window.
 pub const DEFAULT_ROW_WINDOW: usize = 256;
@@ -228,6 +244,8 @@ pub struct ResultsController<S: ResultsSource> {
     /// Whether your files come first under every sort.
     your_files_first: bool,
     throttle: Duration,
+    /// How long the last search took ([`note_search_time`](Self::note_search_time)).
+    search_time: Duration,
     row_window: usize,
     /// The newest request handed out.
     request: RequestId,
@@ -265,6 +283,7 @@ impl<S: ResultsSource> ResultsController<S> {
             sort: SortState::default(),
             your_files_first: false,
             throttle: DEFAULT_THROTTLE,
+            search_time: Duration::ZERO,
             row_window: DEFAULT_ROW_WINDOW,
             request: RequestId(0),
             basis: RequestId(0),
@@ -433,8 +452,15 @@ impl<S: ResultsSource> ResultsController<S> {
     /// back on screen with a re-run pending returns it at once, without
     /// waiting out the throttle interval, so the rows are current when they
     /// show; otherwise `None`.
+    ///
+    /// Each change is passed on to the source
+    /// ([`ResultsSource::set_window_visible`]), so the engine collects
+    /// changes in longer batches while nobody watches the results.
     pub fn set_visible(&mut self, visible: bool, now: Instant) -> Option<RequestId> {
         let was = std::mem::replace(&mut self.visible, visible);
+        if was != visible {
+            self.source.set_window_visible(visible);
+        }
         if visible && !was && self.pending {
             Some(self.rerun(now))
         } else {
@@ -454,9 +480,25 @@ impl<S: ResultsSource> ResultsController<S> {
         self.pending && self.visible
     }
 
+    /// The window reports how long a search took (the latest one whose
+    /// page was shown). Re-runs caused by new generations are then spaced
+    /// by [`RERUN_COST_FACTOR`] times that, at least the throttle interval
+    /// and at most [`MAX_RERUN_SPACING`] (or the throttle, if longer). A
+    /// typed query, a sort or a chip still searches at once.
+    pub fn note_search_time(&mut self, took: Duration) {
+        self.search_time = took;
+    }
+
+    /// The interval between generation re-runs now.
+    fn rerun_spacing(&self) -> Duration {
+        let by_cost = self.search_time.saturating_mul(RERUN_COST_FACTOR);
+        by_cost.min(MAX_RERUN_SPACING).max(self.throttle)
+    }
+
     fn throttle_passed(&self, now: Instant) -> bool {
+        let spacing = self.rerun_spacing();
         self.last_rerun
-            .is_none_or(|t| now.saturating_duration_since(t) >= self.throttle)
+            .is_none_or(|t| now.saturating_duration_since(t) >= spacing)
     }
 
     /// A re-run of the same query and sort. Searches in flight are not

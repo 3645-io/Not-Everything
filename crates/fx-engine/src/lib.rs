@@ -109,9 +109,9 @@ use fx_sort::{Batch, Direction, MatchSet, Order, SortKey};
 
 pub use checkpoint::{CheckpointError, QuitSave};
 pub use config::{
-    DEFAULT_BATCH_WINDOW, DEFAULT_CHECKPOINT_IDLE, DEFAULT_CHECKPOINT_MAX_DELAY,
-    DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_THRESHOLD, EngineConfig, MAX_BATCH_WINDOW,
-    MAX_RESTART_BACKOFF, MIN_BATCH_WINDOW,
+    DEFAULT_BACKGROUND_BATCH_WINDOW, DEFAULT_BATCH_WINDOW, DEFAULT_CHECKPOINT_IDLE,
+    DEFAULT_CHECKPOINT_MAX_DELAY, DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_THRESHOLD, EngineConfig,
+    MAX_BACKGROUND_BATCH_WINDOW, MAX_BATCH_WINDOW, MAX_RESTART_BACKOFF, MIN_BATCH_WINDOW,
 };
 pub use fx_query::QueryOptions;
 pub use health::EngineHealth;
@@ -132,6 +132,8 @@ pub(crate) struct Shared {
     subscribers: Mutex<Vec<Sender<Generation>>>,
     health: HealthState,
     paused: AtomicBool,
+    /// A window shows the results ([`Engine::set_foreground`]).
+    foreground: AtomicBool,
     stop: AtomicBool,
     checkpoints: Checkpoints,
 }
@@ -300,6 +302,7 @@ impl Engine {
                 EngineHealth::Live
             }),
             paused: AtomicBool::new(false),
+            foreground: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             checkpoints: Checkpoints::new(
                 config.store_path().map(Into::into),
@@ -314,6 +317,7 @@ impl Engine {
             orders,
             root: config.root().to_path_buf(),
             window: config.batch_window(),
+            background_window: config.background_batch_window(),
             source,
             stat,
             enumerator,
@@ -668,6 +672,23 @@ impl Engine {
     /// Whether monitoring is paused.
     pub fn is_paused(&self) -> bool {
         self.shared.paused.load(Ordering::Acquire)
+    }
+
+    /// Tells the engine whether a window shows the results (`true`, the
+    /// default) or none does. Without one, nobody watches the results, so
+    /// the writer collects changes for the background batch window
+    /// ([`EngineConfig::with_background_batch_window`], 2 s by default)
+    /// instead of the batch window, and publishes up to 20 times less
+    /// often. Back in the foreground, a batch being collected ends within a
+    /// quarter of a second, so a window that shows gets the pending changes
+    /// at once.
+    pub fn set_foreground(&self, on: bool) {
+        self.shared.foreground.store(on, Ordering::Release);
+    }
+
+    /// Whether a window shows the results ([`set_foreground`](Self::set_foreground)).
+    pub fn is_foreground(&self) -> bool {
+        self.shared.foreground.load(Ordering::Acquire)
     }
 
     /// Orderly shutdown: stops the writer thread and waits for it to exit,
