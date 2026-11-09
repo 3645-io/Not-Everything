@@ -84,8 +84,11 @@
 //! virtual row model over synthetic names from `fx-bench`), `frame_stats`
 //! (per-frame scroll timings and the frame-time gate), `spike_args` (the
 //! command line of the `table_spike` example), `gate_probe` (the Phase 1
-//! gate probe behind `--gate-probe <out>`) and `source::SyntheticSource`
-//! (millions of synthetic rows, for measuring the window without an index).
+//! gate probe behind `--gate-probe <out>`), `summon_probe` and `sort_probe`
+//! (the shortcut-to-ready-window and re-sort-to-repaint probes behind
+//! `--summon-probe <out>` and `--sort-probe <out>`), `latency_probe` (their
+//! report) and `source::SyntheticSource` (millions of synthetic rows, for
+//! measuring the window without an index).
 //!
 //! On macOS, `appkit` (built only for `target_os = "macos"`) is the AppKit
 //! layer: the product window (`appkit::window`: search field, sortable
@@ -122,6 +125,8 @@ pub mod gate_probe;
 pub mod hotkey;
 pub mod hotkey_slot;
 pub mod key_caps;
+#[cfg(feature = "measure")]
+pub mod latency_probe;
 pub mod limited;
 pub mod main_layout;
 pub mod main_menu;
@@ -134,10 +139,14 @@ pub mod quit;
 pub mod settings;
 pub mod settings_view;
 pub mod shortcut_recorder;
+#[cfg(feature = "measure")]
+pub mod sort_probe;
 pub mod source;
 #[cfg(feature = "measure")]
 pub mod spike_args;
 pub mod status_view;
+#[cfg(feature = "measure")]
+pub mod summon_probe;
 pub mod surface;
 pub mod switchable;
 pub mod theme;
