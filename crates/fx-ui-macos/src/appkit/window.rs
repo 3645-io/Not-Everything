@@ -31,8 +31,9 @@
 //! AppKit never sorts.
 //!
 //! Actions are read-only (see [`crate::actions`]): Enter opens, Cmd+Enter
-//! reveals in Finder, Cmd+C copies full paths, double-click opens, and
-//! dragging rows out offers file URLs with copy and link operations only.
+//! reveals in Finder, Option+Cmd+C copies full paths, double-click opens,
+//! and dragging rows out offers file URLs with copy and link operations
+//! only.
 //! In the resident app Escape clears the search, then hides the window and
 //! hands the focus back to the previous app, as the summon hotkey does.
 //!
