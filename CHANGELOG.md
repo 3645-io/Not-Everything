@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.1: Copy path moves to Option-Command-C (November 2026)
+
+A small update that frees ⌘C for copying files, as in Finder. Signed and notarized. Apple silicon only, macOS 13 or later.
+
+### Before you update
+
+- **Nothing to do.** Full Disk Access, Launch at Login, your hotkey and your settings carry over from 0.3.0.
+
+### Changed
+
+- **Copy path is now Option-Command-C (⌥⌘C)**, the shortcut Finder uses to copy a pathname. It copies the selected results' full paths, one per line, as ⌘C did, and the status bar's hint shows the new keys.
+- **⌘C in the results no longer copies paths**, and Edit > Copy is unavailable while the results have the focus: ⌘C will copy the files themselves, as in Finder, in a later version. In the search field, ⌘C still copies the selected text.
+
+### For testers
+
+Release candidates install as **Not-Everything Preview**, with its own settings, index, hotkey (Option-Shift-Space) and command (`not-everything-preview`). It runs next to your everyday Not-Everything without touching it.
+
+### Install
+
+Open `Not-Everything-0.3.1-macos-arm64.dmg` and drag Not-Everything to Applications, replacing the old copy. The zip, `Not-Everything-0.3.1-macos-arm64.zip`, holds the same signed app. `not-everything-cli-0.3.1-macos-arm64.tar.gz` holds the `not-everything` command, its manual (`cli.md`), the license and the third-party notices.
+
 ## v0.3.0: a new look, search as you type (November 2026)
 
 The search window and Settings are redrawn in the new 3645 design, results follow each key you type, and full-path search is ten times faster. The first release published from this repository. Signed and notarized. Apple silicon only, macOS 13 or later.

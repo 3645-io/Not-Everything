@@ -18,8 +18,9 @@
 //! stderr and exit with code 2 before any window opens. On hosts other than
 //! macOS the binary says it is macOS-only and exits 0.
 //!
-//! The app is read-only: Enter opens, Cmd+Enter reveals in Finder, Cmd+C
-//! copies full paths and dragging out offers copy and link only.
+//! The app is read-only: Enter opens, Cmd+Enter reveals in Finder,
+//! Option+Cmd+C copies full paths and dragging out offers copy and link
+//! only.
 //!
 //! It runs as a resident menu-bar app (status item, global summon hotkey,
 //! Launch at Login, Full Disk Access onboarding); closing the window hides
