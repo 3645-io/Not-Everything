@@ -13,7 +13,7 @@ Every change that ships is measured before its pull request against the metrics 
 | `quick` | After each change to a crate on the hot path | The owner's Mac | 1–3 min | The crate's benchmarks at small scale (200,000 entries), against the quick baseline; targets are not checked at small scale | Fixed before the next change |
 | `pr` | When the checks in `.agents/rules/runs.md` pass, before pushing | The M4 Pro, plugged in, nothing heavy running | About 30 min | Every metric marked P below at gate scale; 10 min with the window hidden and 10 min showing a search, under 20 file operations a second (`fx-bench churn`) | Re-run the step alone; still failing → fix it, or ask the owner. The summary goes in the PR |
 | CI | Every pull request | GitHub | Seconds | `scripts/check-perf-report.sh`: a PR that changes shipped code must carry a passing `pr` summary, or the owner's approval to skip | The PR can't merge |
-| `rc` | Each release candidate | The M4 Pro, and the 8 GB Mac when there is one | About 1.5 h | As `pr`, with 20 launches, 30 min hidden and 30 min showing a search on the whole-disk index of a Mac in daily use, and the DMG size; plus `scripts/phase1-gate.sh` warm and cold | No release |
+| `rc` | Each release candidate, before it is built | The M4 Pro, and the 8 GB Mac when there is one | About 1.5 h | As `pr`, with 20 launches, and 30 min hidden and 30 min showing a search on the whole-disk index of a Mac in daily use; plus `scripts/phase1-gate.sh` warm and cold. The release script adds the DMG size after its build | No release |
 
 GitHub's shared macOS runners vary more between runs than the allowances, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
 
@@ -99,7 +99,7 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 
 ## In release notes
 
-Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes, refusing to publish a release candidate or a release without a passing check of the same commit.
+Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes. The script refuses to publish a release candidate or a release without an rc-tier run of the same code (the same commit, or one with the same tree, so a release can use its candidate's run) that has no failing metric. Once it has built the DMG, it adds the DMG's size (O1) and judges the whole rc tier again, so a failing or unmeasured metric stops the release then.
 
 GitHub strips text colour from release notes, so each row carries a dot next to its words:
 

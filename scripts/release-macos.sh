@@ -90,10 +90,16 @@
 # published; a beta takes none.
 # Before fetching or building anything, the script refuses a PERF_DIR
 # without metrics.txt, summary.md or run.txt, one of another tier, one whose
-# run.txt git: line is another commit (for --resume, the build's recorded
-# one) or says (uncommitted changes), and one whose last perf-compare: line
-# in summary.md has a failing or unmeasured metric (a regression the owner
-# approved is an exception in docs/gates/perf-baseline.toml, so it passes).
+# run.txt git: line says (uncommitted changes) or names a commit whose code
+# (its tree) differs from the commit being built (for --resume, the build's
+# recorded one), and one whose last perf-compare: line in summary.md has a
+# failing metric (a regression the owner approved is an exception in
+# docs/gates/perf-baseline.toml, so it passes). A release built from the
+# merged release PR can use its release candidate's run: same tree, same
+# code. The run comes before the build, so it has no DMG size yet: once the
+# disk image is built, its size is added and the whole rc tier is judged
+# again (fx-bench perf-compare), so a failing or unmeasured metric stops the
+# release then.
 # The table compares with the previous release, the highest release/vX.Y.Z
 # tag below the version (release candidates' tags don't count), so the
 # script also refuses, before building, a version with no earlier release or
@@ -409,10 +415,13 @@ need_perf() {
     fi
 }
 
-# Stops unless $PERF_DIR is a finished scripts/perf-check.sh --tier rc run
-# of the commit $1, from a clean tree, whose last perf-compare: line has no
-# failing or unmeasured metric (a regression the owner approved is an
-# exception in the baseline, so it passes). Sets PERF_DIR to its full path.
+# Stops unless $PERF_DIR is a finished scripts/perf-check.sh --tier rc run,
+# from a clean tree, of the commit $1 or of a commit with the same tree,
+# whose last perf-compare: line has no failing metric (a regression the
+# owner approved is an exception in the baseline, so it passes). Unmeasured
+# metrics are allowed here, because the DMG size can't be measured before
+# the build; perf_section judges the whole tier once it is. Sets PERF_DIR
+# to its full path.
 check_perf() {
     [ -d "$PERF_DIR" ] ||
         fail "--perf $PERF_DIR is not a folder; give the output folder of scripts/perf-check.sh --tier rc"
@@ -430,11 +439,16 @@ check_perf() {
         fail "the performance run in $PERF_DIR measured uncommitted changes; run scripts/perf-check.sh --tier rc again on a clean checkout of $1"
         ;;
     esac
-    [ "$perf_git" = "$1" ] ||
-        fail "the performance run in $PERF_DIR measured commit ${perf_git:-unknown}, not $1, the commit being built; run scripts/perf-check.sh --tier rc on it"
+    if [ "$perf_git" != "$1" ]; then
+        # The same code under another commit, such as the release PR's
+        # merge of the release candidate, needs no second run.
+        perf_tree=$(git -C "$ROOT" rev-parse -q --verify "${perf_git:-none}^{tree}" 2>/dev/null) || perf_tree=
+        [ -n "$perf_tree" ] && [ "$perf_tree" = "$(git -C "$ROOT" rev-parse "$1^{tree}")" ] ||
+            fail "the performance run in $PERF_DIR measured commit ${perf_git:-unknown}, not $1, the commit being built, and its code differs; run scripts/perf-check.sh --tier rc on it"
+    fi
     perf_line=$(grep '^perf-compare: ' "$PERF_DIR/summary.md" | tail -n 1)
     case $perf_line in
-    *", 0 fail, 0 not measured"*) ;;
+    *", 0 fail,"*) ;;
     *) fail "the performance run in $PERF_DIR did not pass every metric (${perf_line:-summary.md has no perf-compare: line}); fix the failures and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml" ;;
     esac
 }
@@ -667,6 +681,11 @@ perf_section() {
         awk '{ print }' "$PERF_DIR/metrics.txt"
         echo "dmg_bytes=$dmg_bytes"
     } >"$OUT/perf-metrics.txt"
+    # The whole rc tier again, now with the disk image's size (O1): a
+    # failing or unmeasured metric stops the release here.
+    "$TARGET/release/fx-bench" perf-compare --baseline "$ROOT/docs/gates/perf-baseline.toml" \
+        --tier rc "$OUT/perf-metrics.txt" >"$OUT/perf-gate.md" ||
+        fail "with the disk image's size added, the release's metrics don't pass the gate (see $OUT/perf-gate.md); fix them and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml"
     set --
     [ ! -f "$PERF_DIR/notes.md" ] || set -- --notes "$PERF_DIR/notes.md"
     "$TARGET/release/fx-bench" perf-release --baseline "$ROOT/docs/gates/perf-baseline.toml" \

@@ -2658,9 +2658,11 @@ esac"#;
     }
 
     /// Without `--publish`, `--perf` is optional and checked the same way.
-    /// A run is refused unless it is a finished rc-tier run of the commit
-    /// being built, from a clean tree, whose last `perf-compare:` line has
-    /// no failing or unmeasured metric.
+    /// A run is refused unless it is a finished rc-tier run, from a clean
+    /// tree, of the commit being built or one with the same tree, whose last
+    /// `perf-compare:` line has no failing metric. Unmeasured metrics pass
+    /// here: the DMG size is measured only after the build, when
+    /// `perf_section` judges the whole tier.
     #[test]
     fn perf_refuses_a_run_that_is_not_a_passing_run_of_the_commit() {
         let (repo, head) = rc_with_previous_release("perf-run");
@@ -2715,14 +2717,6 @@ esac"#;
             ("a failing metric", head, line(1, 0), None, DID_NOT_PASS),
             ("ten failing metrics", head, line(10, 0), None, DID_NOT_PASS),
             (
-                "a metric not measured",
-                head,
-                line(0, 1),
-                None,
-                DID_NOT_PASS,
-            ),
-            ("ten not measured", head, line(0, 10), None, DID_NOT_PASS),
-            (
                 "no perf-compare line",
                 head,
                 "No verdicts.".to_owned(),
@@ -2738,6 +2732,16 @@ esac"#;
             }
             let out = plan(&repo, &["--rc", "--perf", &perf]);
             assert_refused(&out, 1, phrase, &format!("a run with {what}"));
+        }
+
+        // Unmeasured metrics (the DMG size, before the build) pass here.
+        for not_measured in [1, 10] {
+            let dir = repo
+                .dir
+                .join(format!("target/perf-unmeasured-{not_measured}"));
+            let perf = write_perf_run(&dir, head, &line(0, not_measured));
+            let out = plan(&repo, &["--rc", "--perf", &perf]);
+            assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
         }
 
         // Another tier.
@@ -2789,6 +2793,22 @@ esac"#;
         );
     }
 
+    /// A run of another commit with the same code (its tree) passes, so a
+    /// release built from the merged release PR can use its candidate's
+    /// run; a run of other code is refused.
+    #[test]
+    fn perf_accepts_a_run_of_a_commit_with_the_same_code() {
+        let (repo, measured) = rc_with_previous_release("perf-same-tree");
+        let perf = perf_run(&repo, "perf-same", &measured);
+        repo.git(&["commit", "--quiet", "--allow-empty", "-m", "same code"]);
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        repo.write("src/changed.rs", "// changed\n");
+        repo.commit_all("other code");
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, "its code differs", "a run of other code");
+    }
+
     /// The table compares with the previous release, the highest
     /// `release/vX.Y.Z` tag below the version (by version, not text; release
     /// candidates' tags don't count), whose measured values must be in
@@ -2831,10 +2851,12 @@ esac"#;
         assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.10");
     }
 
-    /// A release builds `main` after the release PR, so its run is of
-    /// main's merge commit, not the release candidate's.
+    /// A release builds `main` after the release PR. Its release
+    /// candidate's run passes while main's merge has the same code (tree),
+    /// so the release needs no second 30-minute run; once the code differs,
+    /// it needs a run of its own.
     #[test]
-    fn a_release_s_run_is_of_main_s_commit() {
+    fn a_release_can_use_its_candidate_s_run_for_the_same_code() {
         let repo = released_main("perf-release");
         repo.git(&["tag", "-a", "release/v0.1.3", "-m", "0.1.3", "main~1"]);
         repo.git(&["checkout", "--quiet", "rc/0.2.0"]);
@@ -2851,18 +2873,28 @@ esac"#;
             "rc/0.2.0",
         ]);
         let main = repo.git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD^{tree}"]),
+            repo.git(&["rev-parse", &format!("{rc}^{{tree}}")]),
+            "the release PR's merge has the candidate's code"
+        );
 
-        let perf = perf_run(&repo, "perf-rc", &rc);
-        let out = plan(&repo, &["--perf", &perf]);
+        let rc_run = perf_run(&repo, "perf-rc", &rc);
+        let out = plan(&repo, &["--perf", &rc_run]);
+        assert_planned_with_perf(&out, "release/v0.2.0", "0.2.0", "0.1.3");
+        let main_run = perf_run(&repo, "perf-main", &main);
+        let out = plan(&repo, &["--perf", &main_run]);
+        assert_planned_with_perf(&out, "release/v0.2.0", "0.2.0", "0.1.3");
+
+        repo.write("src/late.rs", "// a change after the candidate\n");
+        repo.commit_all("late change");
+        let out = plan(&repo, &["--perf", &rc_run]);
         assert_refused(
             &out,
             1,
-            "the commit being built",
-            "the RC's run for the release",
+            "its code differs",
+            "the candidate's run for different code",
         );
-        let perf = perf_run(&repo, "perf-main", &main);
-        let out = plan(&repo, &["--perf", &perf]);
-        assert_planned_with_perf(&out, "release/v0.2.0", "0.2.0", "0.1.3");
     }
 
     /// `--resume --publish` of a release or an RC needs `--perf` too, and
@@ -2979,15 +3011,20 @@ esac"#;
         // No final newline, as a hand-edited file may have.
         fs::write(perf.join("metrics.txt"), "startup_ms=210\ndmg_bytes=999").unwrap();
         let fake = target.join("release/fx-bench");
+        // perf-compare (the gate, with the DMG size) records its arguments
+        // apart and exits with FAKE_GATE_EXIT; perf-release with FAKE_EXIT.
         fs::write(
             &fake,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$FAKE_ARGS\"\n\
+            "#!/bin/sh\nif [ \"$1\" = perf-compare ]; then printf '%s\\n' \"$@\" >\"$FAKE_GATE_ARGS\"; \
+             echo 'perf-compare: 30 pass, 0 fail, 0 not measured'; exit \"${FAKE_GATE_EXIT:-0}\"; fi\n\
+             printf '%s\\n' \"$@\" >\"$FAKE_ARGS\"\n\
              [ \"${FAKE_EXIT:-0}\" = 0 ] || { echo 'fx-bench: perf-release: bad input' >&2; exit \"$FAKE_EXIT\"; }\n\
              printf '## Performance\\n\\n| Metric | 0.2.0-RC-1 |\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         let args_file = dir.join("args");
+        let gate_args_file = dir.join("gate-args");
         let body = format!(
             "PERF_DIR='{}'\nDMG='{}'\nOUT='{}'\nTARGET='{}'\nROOT='{}'\nPREV=0.1.3\nLABEL=0.2.0-RC-1\nperf_section",
             perf.display(),
@@ -2996,16 +3033,19 @@ esac"#;
             target.display(),
             root.display()
         );
-        let run = |exit: &str| {
+        let run_gated = |exit: &str, gate_exit: &str| {
             run_functions(
                 &["perf_section"],
                 &body,
                 &[
                     ("FAKE_ARGS", args_file.to_str().unwrap()),
                     ("FAKE_EXIT", exit),
+                    ("FAKE_GATE_ARGS", gate_args_file.to_str().unwrap()),
+                    ("FAKE_GATE_EXIT", gate_exit),
                 ],
             )
         };
+        let run = |exit: &str| run_gated(exit, "0");
         let read = |p: PathBuf| fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
         let metrics = out.join("perf-metrics.txt").display().to_string();
         let expected_args = |notes: bool| {
@@ -3038,6 +3078,15 @@ esac"#;
         assert_eq!(read(out.join("perf-metrics.txt")), values);
         assert_eq!(read(out.join("metrics-0.2.0-RC-1.txt")), values);
         assert_eq!(read(args_file.clone()), expected_args(false));
+        // The whole rc tier is judged again with the DMG size.
+        assert_eq!(
+            read(gate_args_file.clone()),
+            format!(
+                "perf-compare\n--baseline\n{}\n--tier\nrc\n{metrics}\n",
+                root.join("docs/gates/perf-baseline.toml").display()
+            )
+        );
+        assert!(read(out.join("perf-gate.md")).contains("0 fail, 0 not measured"));
         let table = "## Performance\n\n| Metric | 0.2.0-RC-1 |\n";
         assert_eq!(read(out.join("performance.md")), table);
         assert!(String::from_utf8_lossy(&done.stdout).contains(table));
@@ -3047,6 +3096,18 @@ esac"#;
         let done = run("0");
         assert_eq!(done.status.code(), Some(0), "{}", describe(&done));
         assert_eq!(read(args_file.clone()), expected_args(true));
+
+        // A metric that fails, or isn't measured, once the DMG size is in
+        // stops the release before the table is made.
+        fs::remove_file(&args_file).unwrap();
+        let gated = run_gated("0", "1");
+        assert_refused(
+            &gated,
+            1,
+            "don't pass the gate",
+            "a release whose metrics fail with the DMG size",
+        );
+        assert!(!args_file.exists(), "no table is made for a failing gate");
 
         let failed = run("2");
         assert_refused(
