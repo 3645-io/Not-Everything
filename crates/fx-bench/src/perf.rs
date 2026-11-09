@@ -839,8 +839,8 @@ pub struct Row {
     pub target: Option<f64>,
     /// Whether the target was checked at this tier.
     pub target_checked: bool,
-    /// The baseline itself misses the target, so only the allowance holds
-    /// the metric until a change meets the target ([`target_pending`]).
+    /// The baseline itself misses the target and so does the value: only
+    /// the allowance holds the metric until a change meets the target.
     pub target_pending: bool,
     pub verdict: Verdict,
     pub gated: bool,
