@@ -22,8 +22,9 @@
 //! It prints one line per check, then `key=value` metrics:
 //! `soak_differences` (paths that differed plus sort orders that differed:
 //! C3, which must be 0), its parts, the operations, checks and restarts,
-//! settle times, modification times that differed on otherwise equal
-//! entries (`soak_metadata_differences`, reported, not counted), and the
+//! settle times, the most entries at one check that were otherwise equal
+//! but had another modification time (`soak_metadata_differences`, with
+//! the folders among them; reported, not counted), and the
 //! process's memory footprint from the first check with the tree near its
 //! cap to the end (`soak_memory_growth_pct`; the plan allows 5%).
 //!
@@ -529,8 +530,10 @@ usage: soak [--duration D] [--seed N] [--rate OPS] [--check-every D]
         resyncs: u64,
         index_differences: u64,
         order_differences: u64,
-        metadata_files: u64,
-        metadata_dirs: u64,
+        /// The most equal entries with different modification times at one
+        /// check, and how many of those were folders.
+        metadata_max: usize,
+        metadata_max_dirs: usize,
         unsettled: u64,
         settle: Vec<Duration>,
         entries_max: usize,
@@ -651,8 +654,11 @@ usage: soak [--duration D] [--seed N] [--rate OPS] [--check-every D]
             }
             tally.entries_max = tally.entries_max.max(check.entries);
             tally.entries_end = check.entries;
-            tally.metadata_files += check.metadata.0 as u64;
-            tally.metadata_dirs += check.metadata.1 as u64;
+            let (files, dirs) = check.metadata;
+            if files + dirs > tally.metadata_max {
+                tally.metadata_max = files + dirs;
+                tally.metadata_max_dirs = dirs;
+            }
             let differences = check.diff.count() + check.orders.len();
             match check.settled {
                 Some(d) => tally.settle.push(d),
@@ -701,11 +707,11 @@ usage: soak [--duration D] [--seed N] [--rate OPS] [--check-every D]
         metric("differences", differences.to_string());
         metric("index_differences", tally.index_differences.to_string());
         metric("order_differences", tally.order_differences.to_string());
+        metric("metadata_differences", tally.metadata_max.to_string());
         metric(
-            "metadata_differences",
-            (tally.metadata_files + tally.metadata_dirs).to_string(),
+            "metadata_dir_differences",
+            tally.metadata_max_dirs.to_string(),
         );
-        metric("metadata_dir_differences", tally.metadata_dirs.to_string());
         metric("unsettled_checks", tally.unsettled.to_string());
         metric("ops", tally.ops.to_string());
         metric("steps", tally.steps.to_string());

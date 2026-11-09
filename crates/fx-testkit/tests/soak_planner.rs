@@ -219,6 +219,54 @@ fn caps_hold_and_names_stay_apart_in_any_letter_case() {
     }
 }
 
+/// The soak needs a tree near its cap (compaction, long sort orders), so
+/// whole-folder deletes must not keep the tree small. The first planner,
+/// which deleted any folder, had at most 924 entries after 3,000 steps with
+/// a cap of 10,000 (seeds 1, 51 and 54); this one has over 2,000. Then the
+/// tree reaches 90% of its cap and stays above half of it on average.
+#[test]
+fn the_tree_grows_towards_its_cap_and_stays_near_it() {
+    // (seed, cap, steps, at least this many entries after them)
+    for (seed, cap, steps, least) in [
+        (51, 10_000, 3_000, 1_500),
+        (54, 10_000, 3_000, 1_500),
+        (52, 2_000, 2_000, 1_000),
+        (53, 300, 1_000, 200),
+    ] {
+        let mut planner = Planner::new(seed, limits(cap));
+        for _ in 0..steps {
+            planner.next_step();
+        }
+        assert!(
+            planner.live_entries() >= least,
+            "seed {seed}: {} entries after {steps} steps, cap {cap}",
+            planner.live_entries()
+        );
+        let mut more = 0;
+        while planner.live_entries() * 10 < cap * 9 {
+            planner.next_step();
+            more += 1;
+            assert!(
+                more < cap * 2,
+                "seed {seed}: {} entries after {} steps, cap {cap}",
+                planner.live_entries(),
+                steps + more
+            );
+        }
+        let after = 4_000;
+        let mut sum = 0;
+        for _ in 0..after {
+            planner.next_step();
+            sum += planner.live_entries();
+        }
+        assert!(
+            sum / after * 2 >= cap,
+            "seed {seed}: {} entries on average after reaching the cap of {cap}",
+            sum / after
+        );
+    }
+}
+
 /// A short name for each operation kind, for the coverage check.
 fn op_label(op: &Op, case_only: bool) -> &'static str {
     match op {

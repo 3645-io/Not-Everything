@@ -24,7 +24,9 @@
 //!
 //! [`Limits`] caps the number of entries (a step that would pass the cap
 //! deletes instead) and the depth of every path, so paths stay well inside
-//! `PATH_MAX` on macOS.
+//! `PATH_MAX` on macOS. Until the tree holds 90% of its cap, a folder to
+//! delete or move out is the smallest of four drawn, so whole-folder
+//! deletes don't keep the tree small; from there on any folder may go.
 //!
 //! Every new name starts with a counter (`17-report.txt`), so no two
 //! entries ever have names that differ only in letter case or Unicode
@@ -669,6 +671,51 @@ impl Planner {
         ROOT
     }
 
+    /// Entries in the subtree of `id`, itself included.
+    fn subtree_size(&self, id: u64) -> usize {
+        let mut count = 0;
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            count += 1;
+            stack.extend(self.node(cur).children.iter().copied());
+        }
+        count
+    }
+
+    /// Whether the tree is still below 90% of its cap.
+    fn growing(&self) -> bool {
+        self.live_entries() * 10 < self.limits.max_entries * 9
+    }
+
+    /// The smallest subtree of four drawn by `draw` while the tree grows;
+    /// the first one drawn once it is near its cap.
+    fn smallest_of(&mut self, draw: fn(&mut Planner) -> u64) -> u64 {
+        let mut best = draw(self);
+        if !self.growing() {
+            return best;
+        }
+        let mut size = self.subtree_size(best);
+        for _ in 0..3 {
+            let other = draw(self);
+            let s = self.subtree_size(other);
+            if s < size {
+                best = other;
+                size = s;
+            }
+        }
+        best
+    }
+
+    /// A folder to delete (see [`smallest_of`](Self::smallest_of)).
+    fn dir_to_remove(&mut self) -> u64 {
+        self.smallest_of(Planner::random_dir)
+    }
+
+    /// A file or folder to move out or re-create.
+    fn entry_to_remove(&mut self) -> u64 {
+        self.smallest_of(Planner::random_entry)
+    }
+
     fn headroom(&self) -> usize {
         self.limits.max_entries.saturating_sub(self.live_entries())
     }
@@ -767,14 +814,14 @@ impl Planner {
                 Op::Delete { path, dir: false }
             }
             Pick::DeleteDir => {
-                let d = self.random_dir();
+                let d = self.dir_to_remove();
                 let path = self.path(d);
                 self.remove_subtree(d);
                 Op::Delete { path, dir: true }
             }
             Pick::Import => self.import(),
             Pick::Export => {
-                let e = self.random_entry();
+                let e = self.entry_to_remove();
                 let path = self.path(e);
                 let dir = self.node(e).kind == Kind::Dir;
                 self.remove_subtree(e);
@@ -973,7 +1020,7 @@ impl Planner {
         if self.live_entries() == 0 {
             return None;
         }
-        let e = self.random_entry();
+        let e = self.entry_to_remove();
         let path = self.path(e);
         let (parent, name, dir) = {
             let n = self.node(e);

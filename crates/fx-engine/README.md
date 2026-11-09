@@ -44,7 +44,15 @@ cargo test -p fx-engine
   or with folder renames as plain path checks. It runs in lockstep, so it
   is deterministic, and whenever no event is left to deliver the index
   must equal a fresh enumeration exactly and every order a fresh build.
-  `FX_ENGINE_FUZZ_SEEDS` and `FX_ENGINE_FUZZ_ROUNDS` make a longer run.
+  `FX_ENGINE_FUZZ_SEEDS` and `FX_ENGINE_FUZZ_ROUNDS` make a longer run,
+  `FX_ENGINE_FUZZ_SEED` one seed alone. Two ignored tests there show a
+  writer bug the fuzz test found (a change reported under a folder's old
+  path in the same batch as the folder's move removes the entry); see the
+  file's documentation.
+- `tests/case_rename.rs` (macOS only, ignored) shows a bug the soak found:
+  after a case-only rename on a case-insensitive volume, an event for the
+  old spelling puts the old name back, because `MacPathStat` names an
+  entry after the path it is given.
 
 fx-fs-macos is a dev-dependency under
 `[target.'cfg(target_os = "macos")'.dev-dependencies]` only; the library
