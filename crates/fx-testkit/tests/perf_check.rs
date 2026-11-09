@@ -12,9 +12,11 @@
 //! - it validates its arguments before taking the lock, building or
 //!   creating anything, and never touches an existing `--out`;
 //! - it deletes nothing but its own lock, runs only the app and `fx-bench
-//!   churn` in the background (the app has to run while it is sampled), and
+//!   churn` in the background (the app has to run while it is sampled),
 //!   gives every app launch its own `--data-dir`, so the daily app's and the
-//!   Preview app's data folders are never touched;
+//!   Preview app's data folders are never touched, and runs the file
+//!   activity in a scratch folder the app indexes even without Full Disk
+//!   Access;
 //! - its quick-tier map from crates to steps is the one the agent rule
 //!   (`.agents/rules/performance.md`) lists;
 //! - `check-perf-report.sh` passes a pull request that changes no shipped
@@ -90,7 +92,9 @@ fn perf_check_builds_with_the_measure_feature_and_compares() {
 /// folder.
 #[test]
 fn perf_check_deletes_nothing_but_its_lock() {
-    let forbidden = ["rm", "rmdir", "unlink", "mv", "purge", "-delete", "srm", "sudo"];
+    let forbidden = [
+        "rm", "rmdir", "unlink", "mv", "purge", "-delete", "srm", "sudo",
+    ];
     let hits: Vec<String> = code()
         .into_iter()
         .filter(|line| {
@@ -151,6 +155,30 @@ fn perf_check_gives_every_app_launch_its_own_data_folder() {
     }
 }
 
+/// The scripted file activity goes to the scratch folder in `$TMPDIR`: an app
+/// without Full Disk Access skips Documents, Desktop and Downloads, where
+/// `--out` may be, so activity there would cost the app nothing.
+#[test]
+fn perf_check_runs_file_activity_where_the_app_indexes_it() {
+    let text = code().join("\n");
+    assert!(
+        text.contains("SCRATCH=\"${TMPDIR:-/tmp}/not-everything-perf-"),
+        "{SCRIPT} must make its scratch folder in $TMPDIR"
+    );
+    let churns: Vec<String> = code()
+        .into_iter()
+        .filter(|l| l.contains("\"$BIN/fx-bench\" churn"))
+        .collect();
+    assert!(!churns.is_empty(), "{SCRIPT} must run fx-bench churn");
+    for line in &churns {
+        assert!(
+            line.contains("--dir \"$SCRATCH/"),
+            "{SCRIPT}: churn must write in the scratch folder: {}",
+            line.trim()
+        );
+    }
+}
+
 /// The quick tier's crate-to-steps map in the script and the table in the
 /// agent rule are the same, so the rule never promises a step the script
 /// doesn't run.
@@ -198,7 +226,10 @@ fn quick_steps_match_the_agent_rule() {
         }
     }
     from_rule.sort();
-    assert!(!from_rule.is_empty(), "{RULE} must list the quick steps per crate");
+    assert!(
+        !from_rule.is_empty(),
+        "{RULE} must list the quick steps per crate"
+    );
     assert_eq!(
         from_script, from_rule,
         "{SCRIPT}'s steps_for_crate and the table in {RULE} must match"
@@ -226,12 +257,27 @@ mod refusals {
         let out = out_dir.to_str().unwrap();
         let cases: [(&[&str], &str); 7] = [
             (&["--out", out], "--tier is required"),
-            (&["--tier", "nightly", "--out", out], "--tier must be quick, pr or rc"),
+            (
+                &["--tier", "nightly", "--out", out],
+                "--tier must be quick, pr or rc",
+            ),
             (&["--tier", "pr"], "--out is required"),
-            (&["--tier", "pr", "--out", out, "--only", "fx-query"], "--only is for the quick tier"),
-            (&["--tier", "pr", "--out", out, "--step", "everything"], "unknown --step"),
-            (&["--tier", "pr", "--out", out, "--bg-minutes", "ten"], "--bg-minutes must be a whole number"),
-            (&["--tier", "pr", "--out", out, "--cache", "lukewarm"], "--cache must be warm or cold"),
+            (
+                &["--tier", "pr", "--out", out, "--only", "fx-query"],
+                "--only is for the quick tier",
+            ),
+            (
+                &["--tier", "pr", "--out", out, "--step", "everything"],
+                "unknown --step",
+            ),
+            (
+                &["--tier", "pr", "--out", out, "--bg-minutes", "ten"],
+                "--bg-minutes must be a whole number",
+            ),
+            (
+                &["--tier", "pr", "--out", out, "--cache", "lukewarm"],
+                "--cache must be warm or cold",
+            ),
         ];
         for (args, phrase) in cases {
             let res = run(args);
@@ -329,7 +375,10 @@ mod report {
 
     #[test]
     fn passes_shipped_code_with_a_summary_or_the_owners_approval() {
-        assert_passed(&check(&repo("report-pass", "crates/fx-query/src/lib.rs"), PASSING));
+        assert_passed(&check(
+            &repo("report-pass", "crates/fx-query/src/lib.rs"),
+            PASSING,
+        ));
         assert_passed(&check(
             &repo("report-lock", "Cargo.lock"),
             "Bump a crate.\nPerformance: skipped, approved by the owner (lock file only)\n",
@@ -341,7 +390,10 @@ mod report {
     fn never_runs_the_description() {
         let marker = temp_path("report-injection");
         let body = format!("$(touch {m}) `touch {m}` ; touch {m}", m = marker.display());
-        let out = check(&repo("report-injection", "crates/fx-query/src/lib.rs"), &body);
+        let out = check(
+            &repo("report-injection", "crates/fx-query/src/lib.rs"),
+            &body,
+        );
         assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
         assert!(!marker.exists(), "the description must never run as shell");
     }

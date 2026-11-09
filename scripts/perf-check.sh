@@ -20,11 +20,15 @@
 # every gated metric passes, 1 when one fails or was not measured, 2 for bad
 # arguments.
 #
-# Safety: the script creates only <out> and a lock folder in $TMPDIR.
-# Everything the app and the benchmarks write goes inside <out> (the app's
-# --data-dir, the churn folders, the startup store), so the daily app's and
-# the Preview app's data folders are never touched. It never deletes, runs
-# sudo or flushes the disk cache, and it stops only processes it started.
+# Safety: the script creates only <out>, a lock folder and a scratch folder
+# in $TMPDIR. The app's data (--data-dir) and the startup store go inside
+# <out>, so the daily app's and the Preview app's data folders are never
+# touched. The scripted file activity (fx-bench churn) and the quick tier's
+# copy of crates/ go in the scratch folder, because an app without Full Disk
+# Access skips Documents, Desktop and Downloads, where <out> may be: activity
+# there would cost the app nothing. The scratch folder is left for macOS to
+# clear with the rest of $TMPDIR. The script never deletes, runs sudo or
+# flushes the disk cache, and it stops only processes it started.
 #
 # One benchmark at a time (.agents/rules/conventions.md): the lock makes a
 # second run, for example an agent's working in parallel, wait for this one,
@@ -201,7 +205,9 @@ case "$TIER" in
         FRESH_OPS=100
         LAUNCHES=3
         PROBE_ROWS=200000
-        SCAN_ROOT="$ROOT/crates"
+        # A copy of crates/ in the scratch folder (made below): the
+        # repository itself may sit in a folder the app skips.
+        SCAN_ROOT=quick-copy
         ;;
     pr)
         MATCHER_ENTRIES=2000000
@@ -321,6 +327,12 @@ echo $$ >"$LOCK/pid"
 
 mkdir -p "$(dirname "$OUT")"
 mkdir "$OUT"
+SCRATCH="${TMPDIR:-/tmp}/not-everything-perf-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+mkdir "$SCRATCH"
+if [ "$SCAN_ROOT" = quick-copy ]; then
+    SCAN_ROOT="$SCRATCH/crates"
+    cp -R "$ROOT/crates" "$SCAN_ROOT"
+fi
 
 note() {
     printf '%s\n' "$*" >>"$OUT/run.txt"
@@ -340,6 +352,7 @@ note() {
     echo "git: $(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet 2>/dev/null || echo ' (uncommitted changes)')"
     echo "rustc: $(rustc --version 2>/dev/null || echo unknown)"
     echo "baseline: $BASELINE"
+    echo "scratch: $SCRATCH (scan root $SCAN_ROOT)"
     if wants background; then
         echo "background: $BG_MINUTES min per phase, churn $CHURN_RATE ops/s, query '$QUERY'"
     fi
@@ -556,7 +569,7 @@ background_phase() {
     # app time to settle before the samples count.
     sleep 30
     if [ "$CHURN_RATE" -gt 0 ]; then
-        "$BIN/fx-bench" churn --dir "$OUT/churn-$label" --duration "$BG_SECONDS" --rate "$CHURN_RATE" --seed 1 >>"$OUT/churn-$label.log" 2>&1 &
+        "$BIN/fx-bench" churn --dir "$SCRATCH/churn-$label" --duration "$BG_SECONDS" --rate "$CHURN_RATE" --seed 1 >>"$OUT/churn-$label.log" 2>&1 &
         CHURN_PID=$!
     fi
     run_step "sample_$label" "$BIN/fx-bench" sample --pid "$APP_PID" --interval 10 --duration "$BG_SECONDS" --label "$label" --out "$OUT/sample-$label"
