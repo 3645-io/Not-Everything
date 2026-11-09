@@ -91,8 +91,9 @@
 //! binary runs over an engine, and with `measure` the Phase 0 spike window
 //! of the `table_spike` example.
 //!
-//! The UI is read-only: Enter opens, Cmd+Enter reveals in Finder, Cmd+C
-//! copies full paths, and dragging a result out offers copy and link only.
+//! The UI is read-only: Enter opens, Cmd+Enter reveals in Finder,
+//! Option+Cmd+C copies full paths, and dragging a result out offers copy
+//! and link only.
 //! There is no delete, rename, move or trash action. Quick Look on Space is
 //! not built yet.
 

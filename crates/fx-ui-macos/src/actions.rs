@@ -65,17 +65,21 @@ pub struct Modifiers {
 ///
 /// - Return or Enter: [`Action::Open`].
 /// - Cmd+Return or Cmd+Enter: [`Action::RevealInFinder`].
-/// - Cmd+C: [`Action::CopyPath`].
+/// - Option+Cmd+C: [`Action::CopyPath`], Finder's shortcut for copying a
+///   pathname.
 ///
 /// Everything else, the delete keys with any modifiers included, gives
-/// `None`.
+/// `None`. Cmd+C alone copies nothing in the results: it is kept for
+/// copying the files themselves, as in Finder, which is not built yet, so
+/// the table doesn't answer Edit > Copy either.
 pub fn action_for_key(key: Key, mods: Modifiers) -> Option<Action> {
     let plain = !mods.command && !mods.shift && !mods.option && !mods.control;
     let cmd_only = mods.command && !mods.shift && !mods.option && !mods.control;
+    let option_cmd = mods.command && mods.option && !mods.shift && !mods.control;
     match key {
         Key::Return | Key::Enter if plain => Some(Action::Open),
         Key::Return | Key::Enter if cmd_only => Some(Action::RevealInFinder),
-        Key::Char(c) if cmd_only && c.eq_ignore_ascii_case(&'c') => Some(Action::CopyPath),
+        Key::Char(c) if option_cmd && c.eq_ignore_ascii_case(&'c') => Some(Action::CopyPath),
         _ => None,
     }
 }

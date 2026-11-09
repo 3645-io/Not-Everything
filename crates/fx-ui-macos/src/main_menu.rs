@@ -7,8 +7,9 @@
 //! sends a standard AppKit action down the responder chain, except About and
 //! Settings, which the window controller answers (About shows the standard
 //! About panel with the version label and build number,
-//! [`crate::build_info::BuildInfo::about`]); Copy copies full paths when the
-//! results table has focus.
+//! [`crate::build_info::BuildInfo::about`]). Copy copies selected text
+//! only: it is off while the results table has focus, where Option+Cmd+C
+//! copies full paths instead.
 //!
 //! The MVP is read-only: there is deliberately no delete, rename, move or
 //! trash command in [`Command`].
@@ -41,7 +42,7 @@ pub enum Command {
     Redo,
     /// Cut the selected text (the results table does not answer it).
     Cut,
-    /// Copy the selected text, or the selected results' full paths.
+    /// Copy the selected text (off while the results have the focus).
     Copy,
     /// Paste text.
     Paste,
