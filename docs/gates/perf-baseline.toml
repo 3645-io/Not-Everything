@@ -16,10 +16,11 @@
 [meta]
 machine = "Apple M4 Pro, 24 GB, macOS 27"
 cache = "warm"
-build = "0.3.1"
+build = "0.3.2"
 date = "2026-11-09"
-# Measured on dev at fc37995, whose app code is 0.3.1's plus
-# measurement-only flags, with scripts/perf-check.sh --tier pr and --tier quick.
+# Measured on the run 2.18 branch at c2622ca, whose app code is 0.3.2's
+# plus measurement-only flags, with scripts/perf-check.sh --tier pr and
+# --tier quick. The pr run started under load (about 9).
 
 # --- Background cost --------------------------------------------------------
 
@@ -33,8 +34,8 @@ allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 40.852
-baseline_build = "0.3.1"
+baseline = 10.389
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [B2]
@@ -47,8 +48,8 @@ allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 138.54
-baseline_build = "0.3.1"
+baseline = 141.16
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # The busiest interval varies a lot between runs, so its allowance is wide.
@@ -61,8 +62,8 @@ target = 100
 allow_pct = 25
 aggregate = "max"
 tiers = "pr rc"
-baseline = 144.809
-baseline_build = "0.3.1"
+baseline = 147.794
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [B4]
@@ -75,8 +76,8 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 741.654
-baseline_build = "0.3.1"
+baseline = 68.284
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [B5]
@@ -89,8 +90,8 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 2464.575
-baseline_build = "0.3.1"
+baseline = 2721.681
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [B6]
@@ -103,8 +104,8 @@ allow_pct = 10
 allow_floor = 0.5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 5.467
-baseline_build = "0.3.1"
+baseline = 3.032
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [B7]
@@ -117,8 +118,8 @@ allow_pct = 5
 allow_floor = 10
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 44057.1
-baseline_build = "0.3.1"
+baseline = 0
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # --- Memory -----------------------------------------------------------------
@@ -132,8 +133,8 @@ target = 200
 allow_pct = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 1318.4
-baseline_build = "0.3.1"
+baseline = 1280.6
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [M2]
@@ -145,8 +146,8 @@ target = 250
 allow_pct = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 1439.2
-baseline_build = "0.3.1"
+baseline = 1345.3
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [M3]
@@ -158,8 +159,8 @@ target = 500
 allow_pct = 5
 aggregate = "max"
 tiers = "pr rc"
-baseline = 2254.9
-baseline_build = "0.3.1"
+baseline = 2175
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [M4]
@@ -171,9 +172,9 @@ target = 100
 allow_pct = 5
 aggregate = "max"
 tiers = "quick pr rc"
-baseline = 87.6
+baseline = 87.63
 quick_baseline = 85.25
-baseline_build = "0.3.1"
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [M5]
@@ -189,7 +190,7 @@ scale_min = 2000000
 tiers = "quick pr rc"
 baseline = 79.8
 quick_baseline = 79.8
-baseline_build = "0.3.1"
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # --- Search speed -----------------------------------------------------------
@@ -206,9 +207,9 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 7.387
-quick_baseline = 1.012
-baseline_build = "0.3.1"
+baseline = 7.129
+quick_baseline = 0.987
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S2]
@@ -223,8 +224,8 @@ aggregate = "median"
 scale_key = "engine_5m_entries"
 scale_min = 5000000
 tiers = "pr rc"
-baseline = 17.313
-baseline_build = "0.3.1"
+baseline = 17.169
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S3]
@@ -239,9 +240,9 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 56.666
-quick_baseline = 5.768
-baseline_build = "0.3.1"
+baseline = 63.934
+quick_baseline = 6.798
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S4]
@@ -256,9 +257,9 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 31.228
-quick_baseline = 2.838
-baseline_build = "0.3.1"
+baseline = 26.235
+quick_baseline = 2.627
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S5]
@@ -273,9 +274,9 @@ aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 42.45
-quick_baseline = 23.66
-baseline_build = "0.3.1"
+baseline = 42.55
+quick_baseline = 24.96
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S6]
@@ -290,9 +291,9 @@ aggregate = "median"
 scale_key = "sort_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 20.97
-quick_baseline = 9.07
-baseline_build = "0.3.1"
+baseline = 20.06
+quick_baseline = 8.47
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [S7]
@@ -308,8 +309,8 @@ scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
 baseline = 1.14
-quick_baseline = 1.06
-baseline_build = "0.3.1"
+quick_baseline = 1.02
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # --- Freshness and start-up -------------------------------------------------
@@ -326,9 +327,9 @@ aggregate = "median"
 scale_key = "freshness_ops"
 scale_min = 1000
 tiers = "quick pr rc"
-baseline = 117.429
-quick_baseline = 117.387
-baseline_build = "0.3.1"
+baseline = 187.125
+quick_baseline = 187.083
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [F2]
@@ -342,9 +343,9 @@ aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 1030.15
-quick_baseline = 185.71
-baseline_build = "0.3.1"
+baseline = 1043.25
+quick_baseline = 190.93
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [F3]
@@ -359,9 +360,9 @@ aggregate = "median"
 scale_key = "summon_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 11.09
-quick_baseline = 10.69
-baseline_build = "0.3.1"
+baseline = 11.17
+quick_baseline = 10.54
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [F4]
@@ -375,8 +376,8 @@ aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
-baseline = 19702
-baseline_build = "0.3.1"
+baseline = 18959
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # Tracked until the first scan shows results as it goes.
@@ -390,8 +391,8 @@ aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
-baseline = 19702.337
-baseline_build = "0.3.1"
+baseline = 18959.41
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 gated = false
 
@@ -407,9 +408,9 @@ aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
-baseline = 432.358
-quick_baseline = 286.145
-baseline_build = "0.3.1"
+baseline = 514.649
+quick_baseline = 344.339
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 [F6u]
@@ -424,9 +425,9 @@ aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
-baseline = 12.758
-quick_baseline = 1.399
-baseline_build = "0.3.1"
+baseline = 13.032
+quick_baseline = 1.507
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 
 # --- Correctness: no allowance ------------------------------------------------
@@ -474,8 +475,8 @@ better = "lower"
 allow_pct = 5
 aggregate = "last"
 tiers = "rc"
-baseline = 4200412
-baseline_build = "0.3.1 release"
+baseline = 4200468
+baseline_build = "0.3.2 release"
 baseline_date = "2026-11-09"
 
 # Tracked only.
@@ -489,8 +490,8 @@ aggregate = "median"
 scale_key = "cli_entries"
 scale_min = 2000000
 tiers = "quick pr"
-baseline = 586.91
-quick_baseline = 32.48
-baseline_build = "0.3.1"
+baseline = 581.87
+quick_baseline = 33.32
+baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
 gated = false
