@@ -9,3 +9,4 @@ The project's instructions for coding agents live in [`.agents/CLAUDE.md`](.agen
 - [`.agents/rules/product.md`](.agents/rules/product.md): what the app and the command may do, and their names.
 - [`.agents/rules/licensing.md`](.agents/rules/licensing.md): licences, the dependency allowlist, third-party notices and attribution.
 - [`.agents/rules/conventions.md`](.agents/rules/conventions.md): Rust and the macOS interface, guards, measuring and benchmarks, agents.
+- [`.agents/rules/performance.md`](.agents/rules/performance.md): the performance gate: when to measure, the quick steps per crate, and what to do when a metric fails.

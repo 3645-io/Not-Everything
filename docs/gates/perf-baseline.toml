@@ -1,0 +1,399 @@
+# Performance gate baseline, read by `fx-bench perf-compare`.
+#
+# One table per metric of docs/gates/performance.md: the key that
+# scripts/perf-check.sh writes to metrics.txt, the target, the allowance, the
+# tiers that measure it and the baseline it is compared with. The quick tier
+# compares with `quick_baseline` (200,000 entries) and checks no targets; the
+# pr and rc tiers compare with `baseline` at gate scale.
+#
+# The baseline moves only at a release, from the release candidate's run
+# (`fx-bench perf-compare --print-values`), or by an exception the owner
+# approved, recorded in the metric's `exception` with the pull request. Never
+# edit it to make a check pass (.agents/rules/performance.md).
+#
+# MB is 1,048,576 bytes, as Activity Monitor counts them.
+
+[meta]
+machine = "Apple M4 Pro, 24 GB, macOS 27"
+cache = "warm"
+build = "0.3.1"
+date = "2026-11-09"
+
+# --- Background cost --------------------------------------------------------
+
+[B1]
+name = "CPU, window hidden"
+key = "hidden_cpu_pct"
+unit = "% of a core"
+better = "lower"
+target = 1
+allow_pct = 10
+allow_floor = 0.05
+aggregate = "mean"
+tiers = "pr rc"
+
+[B2]
+name = "CPU, window showing a search"
+key = "search_cpu_pct"
+unit = "% of a core"
+better = "lower"
+target = 5
+allow_pct = 10
+allow_floor = 0.05
+aggregate = "mean"
+tiers = "pr rc"
+
+# Target only: the busiest interval varies too much between runs for a
+# regression check, so it has no baseline.
+[B3]
+name = "CPU, busiest 10 s interval"
+key = "cpu_max_interval_pct"
+unit = "% of a core"
+better = "lower"
+target = 100
+aggregate = "max"
+tiers = "pr rc"
+
+[B4]
+name = "CPU energy, window hidden"
+key = "hidden_energy_mw"
+unit = "mW"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 5
+aggregate = "mean"
+tiers = "pr rc"
+
+[B5]
+name = "CPU energy, window showing a search"
+key = "search_energy_mw"
+unit = "mW"
+better = "lower"
+target = 250
+allow_pct = 10
+allow_floor = 5
+aggregate = "mean"
+tiers = "pr rc"
+
+[B6]
+name = "Wakeups a second, window hidden"
+key = "hidden_wakeups_per_s"
+unit = "per s"
+better = "lower"
+target = 2
+allow_pct = 10
+allow_floor = 0.5
+aggregate = "mean"
+tiers = "pr rc"
+
+[B7]
+name = "Disk writes, scaled to a day"
+key = "disk_written_per_day_mb"
+unit = "MB"
+better = "lower"
+target = 512
+allow_pct = 5
+allow_floor = 10
+aggregate = "mean"
+tiers = "pr rc"
+
+# --- Memory -----------------------------------------------------------------
+
+[M1]
+name = "Footprint, window hidden"
+key = "hidden_footprint_mb"
+unit = "MB"
+better = "lower"
+target = 200
+allow_pct = 5
+aggregate = "mean"
+tiers = "pr rc"
+
+[M2]
+name = "Footprint, window showing a search"
+key = "search_footprint_mb"
+unit = "MB"
+better = "lower"
+target = 250
+allow_pct = 5
+aggregate = "mean"
+tiers = "pr rc"
+
+[M3]
+name = "Footprint peak during the first scan"
+key = "first_scan_footprint_max_mb"
+unit = "MB"
+better = "lower"
+target = 500
+allow_pct = 5
+aggregate = "max"
+tiers = "pr rc"
+
+[M4]
+name = "Index columns per entry"
+key = "bytes_per_entry"
+unit = "B"
+better = "lower"
+target = 100
+allow_pct = 5
+aggregate = "max"
+tiers = "quick pr rc"
+
+[M5]
+name = "Saved index on disk per entry"
+key = "store_bytes_per_entry"
+unit = "B"
+better = "lower"
+target = 100
+allow_pct = 5
+aggregate = "max"
+scale_key = "startup_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+
+# --- Search speed -----------------------------------------------------------
+
+[S1]
+name = "Engine search p95 at 2M entries"
+key = "engine_ms"
+unit = "ms"
+better = "lower"
+target = 16
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+
+[S2]
+name = "Engine search p95 at 5M entries"
+key = "engine_5m_ms"
+unit = "ms"
+better = "lower"
+target = 30
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_5m_entries"
+scale_min = 5000000
+tiers = "pr rc"
+
+[S3]
+name = "Regex search p95 at 2M"
+key = "regex_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+
+[S4]
+name = "Full-path search p95 at 2M"
+key = "fullpath_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "engine_entries"
+scale_min = 2000000
+tiers = "quick pr rc"
+
+[S5]
+name = "Keystroke to repaint p95"
+key = "keystroke_p95_ms"
+unit = "ms"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+
+[S6]
+name = "Re-sort to repaint p95"
+key = "sort_p95_ms"
+unit = "ms"
+better = "lower"
+target = 50
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "sort_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+
+[S7]
+name = "Scroll frame time p95"
+key = "scroll_p95_ms"
+unit = "ms"
+better = "lower"
+target = 8.3
+allow_pct = 10
+allow_floor = 1
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+
+# --- Freshness and start-up -------------------------------------------------
+
+[F1]
+name = "Change shown in an open result list, p99"
+key = "freshness_p99_ms"
+unit = "ms"
+better = "lower"
+target = 1000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "freshness_ops"
+scale_min = 1000
+tiers = "quick pr rc"
+
+[F2]
+name = "Launch to first result painted"
+key = "launch_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+allow_pct = 10
+aggregate = "median"
+scale_key = "ui_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+
+[F3]
+name = "Shortcut to window ready, p95"
+key = "summon_p95_ms"
+unit = "ms"
+better = "lower"
+target = 100
+allow_pct = 10
+allow_floor = 2
+aggregate = "median"
+scale_key = "summon_entries"
+scale_min = 1000000
+tiers = "quick pr rc"
+
+[F4]
+name = "First scan of the whole disk"
+key = "first_run_ms"
+unit = "ms"
+better = "lower"
+target = 15000
+allow_pct = 10
+aggregate = "median"
+scale_key = "first_run_entries"
+scale_min = 1500000
+tiers = "pr rc"
+
+# Tracked until the first scan shows results as it goes.
+[F5]
+name = "First results shown during the first scan"
+key = "first_result_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+aggregate = "median"
+scale_key = "first_run_entries"
+scale_min = 1500000
+tiers = "pr rc"
+gated = false
+
+[F6]
+name = "Catch-up: index equal to a fresh scan"
+key = "catchup_ms"
+unit = "ms"
+better = "lower"
+target = 10000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "catchup_changes"
+scale_min = 10000
+tiers = "quick pr rc"
+
+[F6u]
+name = "Catch-up: search usable"
+key = "catchup_usable_ms"
+unit = "ms"
+better = "lower"
+target = 2000
+allow_pct = 10
+allow_floor = 10
+aggregate = "median"
+scale_key = "catchup_changes"
+scale_min = 10000
+tiers = "quick pr rc"
+
+# --- Correctness: no allowance ------------------------------------------------
+
+[C1]
+name = "Operations missed in the freshness test"
+key = "freshness_missed"
+unit = "count"
+better = "lower"
+target = 0
+aggregate = "max"
+tiers = "quick pr rc"
+baseline = 0
+quick_baseline = 0
+
+[C2]
+name = "Catch-up equals a fresh scan"
+key = "catchup_equal"
+unit = "bool"
+better = "higher"
+target = 1
+aggregate = "min"
+tiers = "quick pr rc"
+baseline = 1
+quick_baseline = 1
+
+# Tracked until the 24 h soak test is built.
+[C3]
+name = "Differences after a 24 h soak"
+key = "soak_differences"
+unit = "count"
+better = "lower"
+target = 0
+aggregate = "max"
+tiers = "rc"
+gated = false
+
+# --- Optional -----------------------------------------------------------------
+
+[O1]
+name = "DMG size"
+key = "dmg_bytes"
+unit = "bytes"
+better = "lower"
+allow_pct = 5
+aggregate = "last"
+tiers = "rc"
+baseline = 4200412
+baseline_build = "0.3.1 release"
+baseline_date = "2026-11-09"
+
+# Tracked only.
+[O2]
+name = "not-everything query over a 2M-entry index"
+key = "cli_query_ms"
+unit = "ms"
+better = "lower"
+target = 100
+aggregate = "median"
+scale_key = "cli_entries"
+scale_min = 2000000
+tiers = "quick pr"
+gated = false

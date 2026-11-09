@@ -23,10 +23,10 @@ The project lives on GitHub at `3645-io/Not-Everything`, a public repository. Ta
 
 1. `dev` already carries version X.Y.Z. Add its `CHANGELOG.md` entry on `dev`, then cut `rc/X.Y.Z` from `dev`.
 2. Only bugfix PRs (squashed) and merges of `main` go into the rc branch.
-3. Each release candidate is `scripts/release-macos.sh --rc --publish target/<label>` on that branch: it tags `release/vX.Y.Z-RC-N` and makes a GitHub pre-release.
+3. Each release candidate is `scripts/release-macos.sh --rc --publish target/<label>` on that branch: it tags `release/vX.Y.Z-RC-N` and makes a GitHub pre-release. Then run `scripts/perf-check.sh --tier rc --dmg <its DMG> --out <new dir>` on it (`performance.md`); a failing metric holds the release unless the owner approves it.
 4. The release PR `rc/X.Y.Z` → `main` passes CI only when its head is the latest RC tag and contains `main`, and the version is new (`scripts/check-release-pr.sh`).
 5. After it merges, `scripts/release-macos.sh --publish target/release-X.Y.Z` on `main` builds the release from the RC's tree: it tags `release/vX.Y.Z` and makes a full GitHub release with the `CHANGELOG.md` entry as notes.
-6. Then a back-merge PR `main` → `dev`, which also moves `dev` to the next minor version.
+6. Then a back-merge PR `main` → `dev`, which also moves `dev` to the next minor version, and the release's measured values become the new baseline in `docs/gates/perf-baseline.toml` (`docs/gates/performance.md`, "Changing the baseline").
 
 The first release from a fresh repository: `main` and `dev` start identical, so a PR from `rc/X.Y.Z` into `main` would have nothing to merge. Give `rc/X.Y.Z` one commit before RC-1 (for example the changelog entry's real date) so the release PR can exist.
 

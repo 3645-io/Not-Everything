@@ -13,7 +13,8 @@
 ## Measuring
 
 - The measurement flags (`--synthetic`, `--launch-probe`, `--gate-probe`, `--autoscroll`, `--page-cost-ms`) are compiled only with the cargo feature `measure`. It is off in release builds, so no shipped app carries them, and on in the gate scripts (`scripts/phase0-gate.sh`, `scripts/phase1-gate.sh`). Put any new flag that only measures or fakes data behind the same feature.
-- Run benchmarks one at a time, never in parallel, and record the machine and whether the cache was cold or warm next to every number.
+- Run benchmarks one at a time, never in parallel, and record the machine and whether the cache was cold or warm next to every number. `scripts/perf-check.sh` takes a lock in `$TMPDIR` for its whole run, so measurements started by agents working in parallel queue instead of overlapping.
+- `performance.md` says when to measure (while building, before a PR, for each release candidate), and the baseline every change is compared with.
 
 ## Agents
 
