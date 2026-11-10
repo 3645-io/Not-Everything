@@ -45,10 +45,10 @@ cargo test -p fx-engine
   is deterministic, and whenever no event is left to deliver the index
   must equal a fresh enumeration exactly and every order a fresh build.
   `FX_ENGINE_FUZZ_SEEDS` and `FX_ENGINE_FUZZ_ROUNDS` make a longer run,
-  `FX_ENGINE_FUZZ_SEED` one seed alone. Two ignored tests there show a
-  writer bug the fuzz test found (a change reported under a folder's old
-  path in the same batch as the folder's move removes the entry); see the
-  file's documentation.
+  `FX_ENGINE_FUZZ_SEED` one seed alone. It found a writer bug (a change
+  reported under a folder's old path in the same batch as the folder's
+  move removed the entry), which run 2.17 fixed; the bug's two tests now
+  run with the rest (see the file's documentation).
 - `tests/case_rename.rs` (macOS only, ignored) shows a bug the soak found:
   after a case-only rename on a case-insensitive volume, an event for the
   old spelling puts the old name back, because `MacPathStat` names an

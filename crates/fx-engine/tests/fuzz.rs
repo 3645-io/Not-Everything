@@ -27,21 +27,22 @@
 //! tree exactly (key, parent, name, kind, size and times) and every merged
 //! sort order must equal a fresh `Order::build`.
 //!
-//! # Known engine bug (run 2.2 follow-up)
+//! # The moved-folder bug (found here, fixed in run 2.17)
 //!
-//! When one batch holds a change reported under a folder's old path and
-//! then that folder's rename (or move), the writer removes the changed
-//! entry: its deferred removal checks only that the entry's own parent and
-//! name did not change, then finds nothing at the old path, although the
-//! entry is still there under the moved folder. A program that writes a
-//! file and renames its folder within one batch window (100 ms) triggers
-//! it. Until `fx-engine/src/writer.rs` is fixed, the test that runs in CI
-//! delivers every pending event before a folder moves (the writer then
-//! sees the change while the folder is still where it was), and two tests
-//! that show the bug are ignored:
+//! When one batch held a change reported under a folder's old path and
+//! then that folder's rename (or move), the writer removed the changed
+//! entry: its deferred removal checked only that the entry's own parent and
+//! name did not change, then found nothing at the old path, although the
+//! entry was still there under the moved folder. A program that writes a
+//! file and renames its folder within one batch window (100 ms) triggered
+//! it. Run 2.17 fixed it in `fx-engine/src/writer.rs` (a postponed removal
+//! is checked where the index has the entry), so all three tests run:
+//! [`random_operations_leave_the_index_equal_to_a_fresh_scan`] delivers
+//! every pending event before a folder moves,
+//! [`random_operations_with_events_pending_across_folder_moves`] leaves
+//! them pending across the move, and
 //! [`a_change_reported_under_a_renamed_folders_old_path_keeps_the_entry`]
-//! and [`random_operations_with_events_pending_across_folder_moves`].
-//! Run them with `cargo test -p fx-engine --test fuzz -- --ignored`.
+//! is the bug's smallest case.
 //!
 //! `FX_ENGINE_FUZZ_SEEDS` (default 48) and `FX_ENGINE_FUZZ_ROUNDS` (default
 //! 24) make a longer run, and `FX_ENGINE_FUZZ_SEED` runs one seed alone to
@@ -335,7 +336,7 @@ struct Failure {
     differences: Vec<String>,
 }
 
-/// A folder leaving its path: the moves that trigger the known bug.
+/// A folder leaving its path: the moves that triggered the moved-folder bug.
 fn moves_a_folder(op: &Op) -> bool {
     matches!(
         op,
@@ -375,7 +376,8 @@ fn deliver(
 
 /// Runs one seed. `Err` holds the first round whose index differed. With
 /// `flush_before_folder_moves`, every pending event is delivered (exactly)
-/// before an operation moves a folder, which keeps clear of the known bug.
+/// before an operation moves a folder, which kept clear of the moved-folder
+/// bug before run 2.17 fixed it.
 fn run_seed(seed: u64, rounds: usize, flush_before_folder_moves: bool) -> Result<usize, Failure> {
     let tree = FakeTree::new();
     let source = FakeSource::new(StartOutcome::Resumed);
@@ -512,19 +514,15 @@ fn random_operations_leave_the_index_equal_to_a_fresh_scan() {
 }
 
 #[test]
-#[ignore = "engine bug (run 2.2 follow-up): a change reported under a folder's old path \
-            in the same batch as the folder's move removes the entry; see the module docs"]
 fn random_operations_with_events_pending_across_folder_moves() {
     run_all(false);
 }
 
-/// The known bug at its smallest: a file is written, then its folder is
+/// The moved-folder bug at its smallest: a file is written, then its folder is
 /// renamed, and FSEvents reports both in one batch (the folder rename as
 /// subtree rescans of both paths, as the macOS source maps it). The file
 /// must stay in the index, under the folder's new name.
 #[test]
-#[ignore = "engine bug (run 2.2 follow-up): the writer's deferred removal checks only the \
-            entry's own parent and name, not whether a folder above it moved"]
 fn a_change_reported_under_a_renamed_folders_old_path_keeps_the_entry() {
     let tree = FakeTree::new();
     tree.mkdir("/vol/d");
