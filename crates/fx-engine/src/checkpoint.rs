@@ -19,7 +19,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -100,7 +100,9 @@ pub(crate) fn load(path: &Path) -> Option<Loaded> {
     let _ = fx_store::cleanup_stale_temps(path);
     let mapped = MappedIndex::open(path).ok()?;
     mapped.verify_checksums().ok()?;
-    let index = mapped.to_index().ok()?;
+    // The base columns stay in the file's map instead of being copied to
+    // the heap (run 2.17 step 2).
+    let index = mapped.share_index().ok()?;
     let (orders, cursor) = {
         let snap = index.snapshot();
         let cursor = root_volume(&snap)
@@ -268,6 +270,8 @@ struct State {
     /// Generation of the last snapshot saved (or loaded unchanged).
     saved: Option<u64>,
     stop: bool,
+    /// A snapshot to save as it is ([`Checkpoints::save_exact`]).
+    exact: Option<Arc<EngineSnapshot>>,
 }
 
 /// Checkpoint bookkeeping shared by the engine handle, the writer and the
@@ -282,6 +286,9 @@ pub(crate) struct Checkpoints {
     /// Serialises saves, so a later snapshot is never overwritten by an
     /// earlier one still being written.
     save_lock: Mutex<()>,
+    /// The index restored from the latest exact save, served from the
+    /// file's map, with the snapshot it saved; the writer takes it.
+    restored: Mutex<Option<(Arc<EngineSnapshot>, Index)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -306,9 +313,11 @@ impl Checkpoints {
                 requested: false,
                 saved,
                 stop: false,
+                exact: None,
             }),
             wake: Condvar::new(),
             save_lock: Mutex::new(()),
+            restored: Mutex::new(None),
         }
     }
 
@@ -335,6 +344,54 @@ impl Checkpoints {
         if self.enabled() {
             lock(&self.state).requested = true;
             self.wake.notify_all();
+        }
+    }
+
+    /// Saves `snap` as it is, soon, on the checkpoint thread: the writer
+    /// asks for this right after a first scan or a compaction, whose
+    /// snapshot holds exactly the new base. Once the file is written, the
+    /// index restored from its map waits in
+    /// [`take_restored`](Checkpoints::take_restored), so the writer can
+    /// serve the base from the file instead of the heap.
+    pub(crate) fn save_exact(&self, snap: Arc<EngineSnapshot>) {
+        if self.enabled() {
+            lock(&self.state).exact = Some(snap);
+            self.wake.notify_all();
+        }
+    }
+
+    /// The index restored from the latest exact save and the snapshot it
+    /// saved, once.
+    pub(crate) fn take_restored(&self) -> Option<(Arc<EngineSnapshot>, Index)> {
+        lock(&self.restored).take()
+    }
+
+    /// Writes `snap` and maps the file it wrote. Nothing is written once
+    /// the engine is stopping or a newer snapshot is saved (an exact save
+    /// never replaces a later one); a failed write leaves the usual saves
+    /// to catch up, and a file that doesn't map back leaves the base on the
+    /// heap.
+    fn save_exact_now(&self, current: &ArcSwap<EngineSnapshot>, snap: &Arc<EngineSnapshot>) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        // Held until the file is mapped, so no other save replaces it first.
+        let _guard = lock(&self.save_lock);
+        {
+            let st = lock(&self.state);
+            if st.stop || st.saved.is_some_and(|g| g > snap.generation) {
+                return;
+            }
+        }
+        if self.write_snapshot(path, snap, current, false).is_err() {
+            return;
+        }
+        let restored = MappedIndex::open(path)
+            .ok()
+            .filter(|mapped| mapped.verify_checksums().is_ok())
+            .and_then(|mapped| mapped.share_index().ok());
+        if let Some(index) = restored {
+            *lock(&self.restored) = Some((Arc::clone(snap), index));
         }
     }
 
@@ -434,6 +491,12 @@ impl Checkpoints {
         loop {
             if st.stop {
                 return;
+            }
+            if let Some(snap) = st.exact.take() {
+                drop(st);
+                self.save_exact_now(current, &snap);
+                st = lock(&self.state);
+                continue;
             }
             let generation = current.load().generation;
             if st.saved == Some(generation) {

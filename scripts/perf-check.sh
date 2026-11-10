@@ -26,9 +26,12 @@
 # touched. The scripted file activity (fx-bench churn) and the quick tier's
 # copy of crates/ go in the scratch folder, because an app without Full Disk
 # Access skips Documents, Desktop and Downloads, where <out> may be: activity
-# there would cost the app nothing. The scratch folder is left for macOS to
-# clear with the rest of $TMPDIR. The script never deletes, runs sudo or
-# flushes the disk cache, and it stops only processes it started.
+# there would cost the app nothing. When the script ends, however it ends,
+# it removes its scratch folder, by the exact path it made: the app scans
+# the whole disk, so a folder left behind would grow every later run's
+# index (a pr run leaves about 6,000 files). Apart from that folder and its
+# lock, the script never deletes; it never runs sudo or flushes the disk
+# cache, and it stops only processes it started.
 #
 # One benchmark at a time (.agents/rules/conventions.md): the lock makes a
 # second run, for example an agent's working in parallel, wait for this one,
@@ -290,6 +293,7 @@ LOCK="${TMPDIR:-/tmp}/not-everything-perf.lock"
 HAVE_LOCK=0
 APP_PID=""
 CHURN_PID=""
+SCRATCH=""
 
 # shellcheck disable=SC2329 # called by the EXIT trap
 cleanup() {
@@ -297,6 +301,17 @@ cleanup() {
     for p in $CHURN_PID $APP_PID; do
         kill -TERM "$p" 2>/dev/null || true
     done
+    # Churn writes in the scratch folder: let it stop before the folder goes.
+    if [ -n "$CHURN_PID" ]; then
+        wait "$CHURN_PID" 2>/dev/null || true
+    fi
+    # The run's own scratch folder, only by the path it made and only while
+    # that path is in $TMPDIR.
+    if [ -n "$SCRATCH" ] && [ -d "$SCRATCH" ] && [ ! -L "$SCRATCH" ]; then
+        case $SCRATCH in
+            "${TMPDIR:-/tmp}"/not-everything-perf-*) rm -rf "$SCRATCH" ;;
+        esac
+    fi
     if [ "$HAVE_LOCK" -eq 1 ]; then
         rm -f "$LOCK/pid"
         rmdir "$LOCK" 2>/dev/null || true
@@ -339,6 +354,19 @@ note() {
     printf 'perf-check: %s\n' "$*" >&2
 }
 
+# The displays, by size only (no names): pixels, the size the UI looks like
+# and its refresh rate, and which one is the main display, where the app's
+# window opens. The window's pixels cost every frame (S7) and the window's
+# memory (M2), so a different screen can move both.
+displays() {
+    system_profiler SPDisplaysDataType 2>/dev/null | awk '
+        function flush() { if (d != "") { out = out (out == "" ? "" : "; ") d; d = "" } }
+        /^ *Resolution:/ { flush(); sub(/^ *Resolution: /, ""); sub(/ \(.*/, ""); d = $0 " px" }
+        /^ *UI Looks like:/ && d != "" { sub(/^ *UI Looks like: /, ""); d = d " looks like " $0 }
+        /^ *Main Display: Yes/ && d != "" { d = d " (main)" }
+        END { flush(); print (out == "" ? "unknown" : out) }'
+}
+
 {
     echo "tier: $TIER"
     echo "steps:$STEPS"
@@ -348,6 +376,7 @@ note() {
     echo "macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown)"
     echo "model: $(sysctl -n hw.model 2>/dev/null || echo unknown)"
     echo "power: $(pmset -g batt 2>/dev/null | sed -n "1s/^Now drawing from '\\(.*\\)'.*/\\1/p")"
+    echo "displays: $(displays)"
     echo "load before: $(sysctl -n vm.loadavg 2>/dev/null || echo unknown)"
     echo "git: $(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet 2>/dev/null || echo ' (uncommitted changes)')"
     echo "rustc: $(rustc --version 2>/dev/null || echo unknown)"

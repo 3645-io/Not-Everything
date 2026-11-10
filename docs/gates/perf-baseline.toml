@@ -136,9 +136,10 @@ target = 200
 allow_pct = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 1280.6
-baseline_build = "0.3.2"
-baseline_date = "2026-11-09"
+baseline = 1368.4
+baseline_build = "run 2.14 (17e82ac)"
+baseline_date = "2026-11-10"
+exception = "Unchanged dev reads 1,317 to 1,383 MB on the same Mac (macOS 27.2.1), so run 2.14's 1,368 MB is the reading's spread, not its code; approved by the owner in #14"
 
 [M2]
 name = "Memory, window showing a search"

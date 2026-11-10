@@ -702,3 +702,93 @@ fn failed_write_in_read_only_dir_keeps_the_old_file() {
     m.verify_checksums().expect("old file still valid");
     assert!(!m.clean_shutdown());
 }
+
+/// Run 2.17 step 2: `share_index` restores the same index as `to_index`,
+/// with its base columns served from the file's map instead of the heap.
+#[test]
+fn a_shared_index_equals_the_copied_one_and_serves_its_columns_from_the_map() {
+    let dir = TempDir::new("shared");
+    let path = dir.file("index.fxdb");
+    let (_, parts, _) = save_rich(&path, false);
+    let mapped = open_ok(&path);
+    mapped.verify_checksums().expect("checksums");
+    let copied = mapped.to_index().expect("to_index");
+    let shared = mapped.share_index().expect("share_index");
+    assert_eq!(copied.mapped_bytes(), 0);
+    let n = parts.id_bound();
+    let columns = parts.name_bytes.len() + n * (4 + 4 + 4 + 8 + 8 + 8 + 8 + 2);
+    assert_eq!(
+        shared.mapped_bytes(),
+        columns,
+        "every per-entry column is mapped"
+    );
+    // The index keeps the map alive on its own.
+    drop(mapped);
+    let (a, b) = (copied.snapshot(), shared.snapshot());
+    assert_eq!(a.to_parts(), b.to_parts());
+    for id in a.live_ids() {
+        assert_eq!(a.name(id), b.name(id));
+        assert_eq!(a.path(id), b.path(id));
+        assert_eq!(b.lookup(a.key(id)), Some(id));
+    }
+}
+
+/// Names with characters of two, three and four bytes come out whole from
+/// the map, and a file whose names aren't UTF-8 is refused.
+#[test]
+fn shared_names_keep_their_characters_and_bad_text_is_refused() {
+    let dir = TempDir::new("shared-names");
+    let path = dir.file("index.fxdb");
+    let mut index = Index::new();
+    let names = [
+        "root",
+        "café",
+        "日本語のファイル.txt",
+        "🦀 crab.rs",
+        "plain",
+    ];
+    index
+        .upsert(dir_entry(ka(1), None, names[0]))
+        .expect("root");
+    for (i, name) in names.iter().enumerate().skip(1) {
+        index
+            .upsert(file(ka(i as u64 + 1), ka(1), name))
+            .expect("insert");
+    }
+    let parts = index.snapshot().to_parts();
+    let vols = cursors();
+    write_checkpoint(
+        &path,
+        &SaveInput {
+            parts: &parts,
+            volumes: &vols,
+            orders: &[],
+            clean_shutdown: false,
+        },
+    )
+    .expect("write");
+    let shared = open_ok(&path).share_index().expect("share_index");
+    let snap = shared.snapshot();
+    let mut got: Vec<&str> = snap.live_ids().map(|id| snap.name(id)).collect();
+    got.sort_unstable();
+    let mut want = names.to_vec();
+    want.sort_unstable();
+    assert_eq!(got, want);
+    drop(snap);
+    drop(shared);
+
+    // One name byte that isn't UTF-8 (opening checks only the header and
+    // the tables; the column checksums would catch it too).
+    let mut bytes = fs::read(&path).expect("read");
+    let at = bytes
+        .windows(5)
+        .position(|w| w == b"plain")
+        .expect("the name is in the file");
+    bytes[at] = 0xFF;
+    fs::write(&path, &bytes).expect("write");
+    assert!(open_ok(&path).share_index().is_err(), "bad text is refused");
+}
+
+fn dir_entry(key: FileKey, parent: Option<FileKey>, name: &str) -> Entry {
+    dir(key, parent, name)
+}
