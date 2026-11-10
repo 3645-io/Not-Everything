@@ -2,7 +2,6 @@
 //! applies the result to the index, merges the sort orders and publishes a
 //! new snapshot.
 
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, diff_subtree, reconcile_path};
+use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, reconcile_path};
 use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
 use fx_model::{Change, Entry, EntryId, FileKey, ResumeCursor, StartOutcome};
 use fx_sort::{Batch, MatchSet, Order};
@@ -79,6 +78,10 @@ pub(crate) struct Writer<C, P, V> {
     /// The index changed since `group` was built: rebuild it at the next
     /// publish.
     pub(crate) group_stale: bool,
+    /// The base was just built on the heap (a first scan or a compaction):
+    /// the next publish asks for that exact snapshot to be saved, so the
+    /// base can then be served from the saved file (run 2.17 step 2).
+    pub(crate) fresh_base: bool,
 }
 
 /// What the writer must do before it reads the change source again.
@@ -158,6 +161,7 @@ where
             self.try_rescan();
         }
         while !self.stopping() {
+            self.adopt_saved_base();
             if self.shared.paused.load(Ordering::Acquire) {
                 thread::park_timeout(PAUSE_POLL);
                 continue;
@@ -434,7 +438,10 @@ where
         }
     }
 
-    /// Re-enumerates the folder at `path` and applies `fx_fs::diff_subtree`.
+    /// Re-enumerates the folder at `path`: every listed entry is upserted
+    /// (and recorded in the batch only when it changed), then whatever the
+    /// folder holds that the walk didn't list is removed. A failed walk
+    /// removes nothing.
     fn rescan_subtree(&mut self, path: &Path, deferred: &mut Vec<Deferred>, depth: u32) {
         let top = paths::resolve(&self.index, &self.root, path, None).map(|id| self.index.key(id));
         let Some(top) = top else {
@@ -445,40 +452,66 @@ where
             }
             return;
         };
-        let fresh = match self.walk(path) {
-            Ok(fresh) => fresh,
+        // The folder's own entry: enumerators that list only what is below
+        // it (the macOS scanner) don't emit it.
+        let top_entry = match self.stat_at(path) {
+            Ok(Some(entry)) => Some(entry),
+            Ok(None) => None,
             Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
                 // Gone: checking the path removes it.
                 self.check_path(path, deferred, depth + 1);
                 return;
             }
-            // A partial walk would remove everything it missed.
             Err(_) => return,
         };
-        // The indexed side covers the folder's subtree plus the subtrees of
-        // folders that moved in from elsewhere: whatever they held that is
-        // not listed now is gone (or is found again at its new path).
-        let mut keys = self.subtree_keys(top);
-        let mut seen: HashSet<FileKey> = keys.iter().copied().collect();
-        for e in &fresh {
-            let moved_in = !seen.contains(&e.key)
-                && self
-                    .index
-                    .get(e.key)
-                    .is_some_and(|old| old.parent != e.parent);
-            if moved_in {
-                for k in self.subtree_keys(e.key) {
-                    if seen.insert(k) {
-                        keys.push(k);
-                    }
+        // The entries stream into the index, as in a full rescan (run 2.17):
+        // no list of every entry and no map of the old ones, which took more
+        // than 300 B per entry for a busy folder macOS asked to rescan.
+        let Writer {
+            index,
+            batch,
+            enumerator,
+            ..
+        } = self;
+        let mut seen = vec![false; index.id_bound()];
+        let mut take = |e: Entry| {
+            // Several hard links: keep the first listing, as a full rescan does.
+            if let Some(id) = index.lookup(e.key) {
+                if seen.get(id.index()).copied().unwrap_or(false) {
+                    return;
                 }
             }
+            take_one(index, batch, &mut seen, e);
+        };
+        if let Some(entry) = top_entry {
+            take(entry);
         }
-        let indexed: HashMap<FileKey, Entry> = keys
-            .into_iter()
-            .filter_map(|k| self.index.get(k).map(|e| (k, e)))
-            .collect();
-        self.apply_changes(diff_subtree(&indexed, fresh).changes);
+        match enumerator.enumerate(path, &mut take) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
+                self.check_path(path, deferred, depth + 1);
+                return;
+            }
+            // A partial walk would remove everything it missed; what it
+            // listed is applied.
+            Err(_) => return,
+        }
+        // Whatever the folder holds now (folders that moved in included,
+        // with what they held) and the walk didn't list is gone, or is found
+        // again at its new path.
+        let unseen: Vec<FileKey> = match self.index.lookup(top) {
+            Some(id) => self
+                .index
+                .subtree(id)
+                .into_iter()
+                .filter(|d| !seen.get(d.index()).copied().unwrap_or(false))
+                .map(|d| self.index.key(d))
+                .collect(),
+            None => Vec::new(),
+        };
+        for key in unseen {
+            self.remove(key);
+        }
     }
 
     /// Re-enumerates the whole volume and applies the difference. Readers
@@ -521,6 +554,7 @@ where
             return false;
         }
         self.index = builder.finish();
+        self.fresh_base = true;
         // The writer compacts between batches itself.
         self.index.set_compact_fraction(f64::INFINITY);
         self.batch.clear();
@@ -569,34 +603,6 @@ where
         true
     }
 
-    /// `key` and every live entry below it, each after its parent.
-    fn subtree_keys(&self, key: FileKey) -> Vec<FileKey> {
-        match self.index.lookup(key) {
-            Some(id) => self
-                .index
-                .subtree(id)
-                .into_iter()
-                .map(|d| self.index.key(d))
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    /// Enumerates the folder at `path`, parent before child, with the
-    /// folder's own entry first. Enumerators that list only what is below
-    /// the folder (the macOS scanner does not emit its root) get the
-    /// folder's entry from `PathStat` prepended, so `diff_subtree` keeps it.
-    fn walk(&self, path: &Path) -> io::Result<Vec<Entry>> {
-        let mut fresh = Vec::new();
-        self.enumerator.enumerate(path, &mut |e| fresh.push(e))?;
-        if let Ok(Some(top)) = self.stat_at(path) {
-            if !fresh.iter().any(|e| e.key == top.key) {
-                fresh.insert(0, top);
-            }
-        }
-        Ok(fresh)
-    }
-
     /// `PathStat::stat`, with the watched root reported as the index's root
     /// entry (no parent): its parent folder lies outside the index.
     fn stat_at(&self, path: &Path) -> io::Result<Option<Entry>> {
@@ -609,20 +615,6 @@ where
             }
         }
         Ok(entry)
-    }
-
-    fn apply_changes(&mut self, changes: Vec<Change>) {
-        for change in changes {
-            match change {
-                Change::Upsert(entry) => {
-                    if let Err(e) = self.upsert(entry) {
-                        self.rejected(e);
-                    }
-                }
-                Change::Remove { key } => self.remove(key),
-                _ => {}
-            }
-        }
     }
 
     /// Applies the postponed removals of entries that are not on disk where
@@ -726,6 +718,7 @@ where
             // Compaction keeps live entries in ID order, so remapping an
             // order keeps it sorted.
             let remap = self.index.compact();
+            self.fresh_base = true;
             for order in &mut orders {
                 for id in &mut order.ids {
                     *id = remap[*id as usize].0;
@@ -737,6 +730,37 @@ where
         self.group_stale = true;
         self.generation += 1;
         self.publish(cursor);
+        if std::mem::take(&mut self.fresh_base) {
+            // The snapshot just published holds exactly the new base: its
+            // delta is empty and nothing is removed yet.
+            self.shared
+                .checkpoints
+                .save_exact(self.shared.current.load_full());
+        }
+    }
+
+    /// Serves the base from the store once the checkpoint thread has saved
+    /// exactly this base and mapped the file (run 2.17 step 2): the heap
+    /// copy goes when the last snapshot holding it does. The swap is
+    /// published at once, under the same generation, so no window re-runs
+    /// its search for it; it doesn't happen when the base was compacted
+    /// again meanwhile.
+    fn adopt_saved_base(&mut self) {
+        let Some((saved, restored)) = self.shared.checkpoints.take_restored() else {
+            return;
+        };
+        if !self.index.adopt_base(saved.index(), restored) {
+            return;
+        }
+        let current = self.shared.current.load_full();
+        let snap = EngineSnapshot {
+            index: self.index.snapshot(),
+            orders: Arc::clone(&self.orders),
+            cursor: current.cursor,
+            generation: self.generation,
+            priority: self.group.clone(),
+        };
+        self.shared.current.store(Arc::new(snap));
     }
 
     /// Publishes `cursor` with the snapshot already published, without a
