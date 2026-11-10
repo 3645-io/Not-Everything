@@ -11,8 +11,10 @@
 //!   with the app's `measure` feature, and finishes with `perf-compare`;
 //! - it validates its arguments before taking the lock, building or
 //!   creating anything, and never touches an existing `--out`;
-//! - it deletes nothing but its own lock, runs only the app and `fx-bench
-//!   churn` in the background (the app has to run while it is sampled),
+//! - it deletes nothing but its own lock and, when it ends, its own scratch
+//!   folder (it leaves `$TMPDIR` as it found it), runs only the app and
+//!   `fx-bench churn` in the background (the app has to run while it is
+//!   sampled),
 //!   gives every app launch its own `--data-dir`, so the daily app's and the
 //!   Preview app's data folders are never touched, and runs the file
 //!   activity in a scratch folder the app indexes even without Full Disk
@@ -20,9 +22,9 @@
 //! - its quick-tier map from crates to steps is the one the agent rule
 //!   (`.agents/rules/performance.md`) lists;
 //! - `check-perf-report.sh` passes a pull request that changes no shipped
-//!   code, or whose description has a passing summary or the owner's
-//!   approval to skip, fails one without, and never runs the description as
-//!   shell;
+//!   code, or whose description has a passing summary of a run with no
+//!   skipped step or the owner's approval to skip, fails one without, and
+//!   never runs the description as shell;
 //! - the workflow runs it on pull requests, again when the description is
 //!   edited, passes the description through the environment and checks out
 //!   without keeping the token.
@@ -88,10 +90,13 @@ fn perf_check_builds_with_the_measure_feature_and_compares() {
     }
 }
 
-/// The only removals are of the script's own lock: its PID file and its
-/// folder.
+/// The only removals are of the script's own lock (its PID file and its
+/// folder) and, when it ends, of its own scratch folder, by the exact path
+/// it made, only while that path is still in `$TMPDIR`.
 #[test]
-fn perf_check_deletes_nothing_but_its_lock() {
+fn perf_check_deletes_nothing_but_its_lock_and_scratch_folder() {
+    const SCRATCH_REMOVAL: &str =
+        "\"${TMPDIR:-/tmp}\"/not-everything-perf-*) rm -rf \"$SCRATCH\" ;;";
     let forbidden = [
         "rm", "rmdir", "unlink", "mv", "purge", "-delete", "srm", "sudo",
     ];
@@ -102,12 +107,21 @@ fn perf_check_deletes_nothing_but_its_lock() {
                 .iter()
                 .any(|w| forbidden.contains(&w.as_str()))
         })
-        .filter(|line| !line.contains("\"$LOCK/pid\"") && !line.contains("rmdir \"$LOCK\""))
+        .filter(|line| {
+            !line.contains("\"$LOCK/pid\"")
+                && !line.contains("rmdir \"$LOCK\"")
+                && line.trim() != SCRATCH_REMOVAL
+        })
         .map(|l| l.trim().to_owned())
         .collect();
     assert!(
         hits.is_empty(),
-        "{SCRIPT} may remove only its own lock: {hits:?}"
+        "{SCRIPT} may remove only its own lock and scratch folder: {hits:?}"
+    );
+    let removals = code().into_iter().filter(|l| l.contains("rm -rf")).count();
+    assert_eq!(
+        removals, 1,
+        "{SCRIPT} must remove its scratch folder in one place, guarded"
     );
 }
 
@@ -305,6 +319,54 @@ mod refusals {
         assert_refused(&res, 2, "cargo is not on PATH", "no cargo on PATH");
         assert!(!dir.exists(), "--out must not be created without cargo");
     }
+
+    /// A run that stops after making its scratch folder (here the build
+    /// fails, through a `cargo` that only exits 1) leaves nothing in
+    /// `$TMPDIR`: no lock and no scratch folder, whose files the app would
+    /// otherwise index in every later run. `--out` keeps `run.txt`, which
+    /// records the displays by size only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removes_its_scratch_folder_and_lock_when_it_stops() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_path("perf-check-scratch");
+        let bin = root.join("bin");
+        let tmp = root.join("tmp");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let out = root.join("out");
+        let mut cmd = Command::new("sh");
+        cmd.arg(repo_root().join(SCRIPT))
+            .args(["--tier", "quick", "--out", out.to_str().unwrap()])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), common::shell::SYSTEM_PATH),
+            )
+            .env("TMPDIR", &tmp);
+        let res = run_with_timeout(&mut cmd);
+        assert_refused(&res, 2, "release build failed", "a failing build");
+        let left: Vec<_> = fs::read_dir(&tmp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "$TMPDIR must be left empty: {left:?}");
+        let run_txt = fs::read_to_string(out.join("run.txt")).unwrap();
+        let displays = run_txt
+            .lines()
+            .find_map(|l| l.strip_prefix("displays: "))
+            .unwrap_or_else(|| panic!("run.txt must record the displays:\n{run_txt}"));
+        assert!(
+            displays == "unknown"
+                || displays.split("; ").all(|d| d
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || " x.@()Hzpxlookslikemain".contains(c))),
+            "the displays line holds sizes only, no names: {displays}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -312,8 +374,8 @@ mod report {
     use super::*;
     use std::process::Output;
 
-    const PASSING: &str =
-        "Tests pass.\n\nperf-compare: 27 pass, 0 fail, 0 not measured, 0 no baseline, 2 tracked\n";
+    const PASSING: &str = "Tests pass.\n\nperf-compare: 27 pass, 0 fail, 0 not measured, \
+         0 no baseline, 2 tracked, 0 skipped\n";
 
     /// A repository with `dev`, and a branch `work` checked out that
     /// changes `rel`.
@@ -364,8 +426,12 @@ mod report {
     fn fails_shipped_code_without_a_passing_summary() {
         for body in [
             "",
-            "perf-compare: 25 pass, 2 fail, 0 not measured, 0 no baseline, 2 tracked",
-            "perf-compare: 25 pass, 0 fail, 2 not measured, 0 no baseline, 2 tracked",
+            "perf-compare: 25 pass, 2 fail, 0 not measured, 0 no baseline, 2 tracked, 0 skipped",
+            "perf-compare: 25 pass, 0 fail, 2 not measured, 0 no baseline, 2 tracked, 0 skipped",
+            // A run of some steps only (`--step`): the others never ran.
+            "perf-compare: 10 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 19 skipped",
+            // Without the skipped count a line can't show that every step ran.
+            "perf-compare: 27 pass, 0 fail, 0 not measured, 0 no baseline, 2 tracked",
             "Performance: skipped",
         ] {
             let out = check(&repo("report-missing", "crates/fx-query/src/lib.rs"), body);
@@ -378,6 +444,15 @@ mod report {
         assert_passed(&check(
             &repo("report-pass", "crates/fx-query/src/lib.rs"),
             PASSING,
+        ));
+        // A full run with a failure, and the failing step re-run alone and
+        // passing (`.agents/rules/performance.md`: only a second failure
+        // counts).
+        assert_passed(&check(
+            &repo("report-rerun", "crates/fx-query/src/lib.rs"),
+            "Full run:\nperf-compare: 26 pass, 1 fail, 0 not measured, 0 no baseline, 2 tracked, \
+             0 skipped\n\nS2 re-run alone:\nperf-compare: 1 pass, 0 fail, 0 not measured, \
+             0 no baseline, 0 tracked, 28 skipped\n",
         ));
         assert_passed(&check(
             &repo("report-lock", "Cargo.lock"),
