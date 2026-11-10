@@ -195,6 +195,10 @@ const CORE_DEPENDENCY_ALLOWLIST: &[(&str, &[(&str, DepKind)])] = &[
         &[
             // Shared types (entry IDs, flags, metadata) from the model crate.
             ("fx-model", DepKind::Normal),
+            // Zlib OR Apache-2.0 OR MIT, used under MIT (already locked
+            // through fx-store); casts a saved index's mapped columns without
+            // `unsafe` (run 2.17 step 2).
+            ("bytemuck", DepKind::Normal),
             // Synthetic trees for tests.
             ("fx-bench", DepKind::Dev),
         ],
@@ -861,6 +865,7 @@ fn allowlist_accepts_fx_index_dependencies_and_rejects_third_party_ones() {
         "[dev-dependencies]\nfx-bench = { path = \"../fx-bench\" }\n",
         "[dependencies]\nfx-model = { path = \"../fx-model\" }\n\n\
          [dev-dependencies]\nfx-bench = { path = \"../fx-bench\" }\n",
+        "[dependencies]\nbytemuck = { version = \"1\", default-features = false }\n",
     ] {
         assert_eq!(
             violations("fx-index", extra),

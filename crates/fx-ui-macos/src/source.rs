@@ -34,6 +34,7 @@ pub use synthetic::SyntheticSource;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -246,6 +247,11 @@ pub trait ResultsSource: Send + Sync {
     /// (the daily save). Sources without a saved index do nothing.
     fn request_save(&self) {}
 
+    /// The search window went on screen (`true`) or off it. An engine
+    /// collects changes in longer batches while nobody watches the results
+    /// (`fx_engine::Engine::set_foreground`); other sources do nothing.
+    fn set_window_visible(&self, _visible: bool) {}
+
     /// The search window's search: `query.text` under the search
     /// field's options, in the order of
     /// [`search_grouped`](Self::search_grouped), at positions
@@ -389,6 +395,10 @@ impl<T: ResultsSource + ?Sized> ResultsSource for Arc<T> {
 
     fn request_save(&self) {
         (**self).request_save();
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        (**self).set_window_visible(visible);
     }
 }
 
@@ -651,10 +661,18 @@ impl ResultsSource for Engine {
     fn request_save(&self) {
         self.request_checkpoint();
     }
+
+    /// [`Engine::set_foreground`]: longer batches while hidden.
+    fn set_window_visible(&self, visible: bool) {
+        self.set_foreground(visible);
+    }
 }
 
-/// How many searched snapshots an [`EngineSource`] keeps for row reads.
-const PINNED_SNAPSHOTS: usize = 4;
+/// How many searched snapshots an [`EngineSource`] keeps for row reads
+/// while the window shows: the page on screen's. Each keeps its own sort
+/// orders (16 B per entry), so 0.3.2's four could hold four copies; none
+/// is kept while the window is hidden (run 2.17).
+const PINNED_SNAPSHOTS: usize = 1;
 
 /// An [`Engine`] plus the root path it watches.
 ///
@@ -666,6 +684,8 @@ pub struct EngineSource {
     engine: Arc<Engine>,
     root_parent: Option<String>,
     pinned: Mutex<VecDeque<Arc<EngineSnapshot>>>,
+    /// The window shows the results; while it doesn't, nothing is pinned.
+    visible: AtomicBool,
 }
 
 impl EngineSource {
@@ -681,12 +701,19 @@ impl EngineSource {
             engine,
             root_parent,
             pinned: Mutex::new(VecDeque::with_capacity(PINNED_SNAPSHOTS)),
+            visible: AtomicBool::new(true),
         }
     }
 
     /// The wrapped engine.
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
+    }
+
+    /// How many searched snapshots are pinned now (at most one while the
+    /// window shows, none while it is hidden), for tests and measurements.
+    pub fn pinned_count(&self) -> usize {
+        self.pinned().len()
     }
 
     fn pinned(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<EngineSnapshot>>> {
@@ -697,7 +724,9 @@ impl EngineSource {
 
     fn pin(&self, snap: Arc<EngineSnapshot>) {
         let mut pinned = self.pinned();
-        if pinned.iter().any(|s| s.generation() == snap.generation()) {
+        if !self.visible.load(Ordering::Acquire)
+            || pinned.iter().any(|s| s.generation() == snap.generation())
+        {
             return;
         }
         if pinned.len() == PINNED_SNAPSHOTS {
@@ -823,6 +852,16 @@ impl ResultsSource for EngineSource {
 
     fn request_save(&self) {
         ResultsSource::request_save(&*self.engine);
+    }
+
+    /// Also pins nothing while the window is hidden, and lets go of the
+    /// pinned snapshot when it hides.
+    fn set_window_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+        if !visible {
+            self.pinned().clear();
+        }
+        ResultsSource::set_window_visible(&*self.engine, visible);
     }
 }
 
