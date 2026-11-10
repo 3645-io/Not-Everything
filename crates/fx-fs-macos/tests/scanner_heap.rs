@@ -2,8 +2,8 @@
 //! as the writer is when macOS asks it to rescan a big folder, the entries
 //! the walk has listed and the receiver hasn't taken stay within the
 //! scan's byte budget ([`ScanOptions::stream_budget`]). Until then the walk
-//! could run 256 directories ahead whatever their size, which raised the
-//! app's footprint by up to 100 MB for half a minute in the gate's runs.
+//! could run 256 directories ahead whatever their size: about 45 MB of a
+//! rescan of a 3.2M-entry disk.
 //!
 //! The heap is counted by a wrapping allocator in this test binary.
 //!

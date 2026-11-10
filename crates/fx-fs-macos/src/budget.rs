@@ -3,11 +3,11 @@
 //! The streaming scan ([`scan_streaming`](crate::scan::scan_streaming))
 //! sends a folder's entries per message. Bounded by the number of messages,
 //! the walk could run far ahead of a slow receiver whenever folders were
-//! big: when macOS asked for a rescan of a busy folder, 256 messages held
-//! up to 100 MB while the writer caught up. Here a sender waits while the
-//! bytes queued plus its message's would pass the budget, so what the walk
-//! holds ahead of the receiver stays near the budget whatever the folders
-//! hold.
+//! big: in a rescan of a 3.2M-entry disk, where the writer upserts more
+//! slowly than eight walkers list, 256 messages held about 45 MB. Here a
+//! sender waits while the bytes queued plus its message's would pass the
+//! budget, so what the walk holds ahead of the receiver stays near the
+//! budget whatever the folders hold.
 //!
 //! * A message is always admitted into an empty queue, however big, so one
 //!   larger than the budget can't stop the walk. The scan sends at most
