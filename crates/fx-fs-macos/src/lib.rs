@@ -13,6 +13,8 @@
 //! * `enumerator` (macOS only) holds `MacScanner`, which implements
 //!   `fx_fs::VolumeEnumerator` on top of `scan` and emits `fx_model::Entry`
 //!   values in parent-before-child order.
+//! * [`budget`] is the channel the streaming scan sends through, bounded by
+//!   the heap its messages hold rather than by their number.
 //! * [`fsevents`] is the FSEvents change source: a hand-written binding
 //!   (macOS only) with a per-volume stream that replays from a saved
 //!   `fx_model::ResumeCursor`, the `FsEventsSource` `fx_fs::ChangeSource`
@@ -37,6 +39,7 @@
 //!   that the non-FDA mode hands to the scanner.
 
 pub mod attrbuf;
+pub mod budget;
 pub mod cloud;
 pub mod fda;
 pub mod firmlinks;
