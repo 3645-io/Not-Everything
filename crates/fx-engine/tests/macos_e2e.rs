@@ -1255,10 +1255,6 @@ fn flag_word_none_rescans_the_folder() {
 }
 
 #[test]
-#[ignore = "engine follow-up (run 2.1): Writer::rescan_subtree on a path that is a file \
-            does nothing, because the scanner refuses to enumerate a non-folder and the \
-            writer drops any walk error other than NotFound; the source only asks for \
-            subtree rescans of folders, so this is not reached today"]
 fn subtree_rescan_of_a_file_path_updates_the_file() {
     muted_changes_are_recovered_by(
         "flag-none-on-file",
