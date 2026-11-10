@@ -11,6 +11,14 @@ pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(100);
 pub const MIN_BATCH_WINDOW: Duration = Duration::from_millis(50);
 /// Longest batch window the writer accepts.
 pub const MAX_BATCH_WINDOW: Duration = Duration::from_millis(200);
+/// Default batch window while no window shows the results
+/// ([`Engine::set_foreground`](crate::Engine::set_foreground)): nobody
+/// watches the results then, so the writer collects changes for up to 2 s
+/// and merges the sort orders up to 20 times less often than with the
+/// 100 ms window.
+pub const DEFAULT_BACKGROUND_BATCH_WINDOW: Duration = Duration::from_secs(2);
+/// Longest background batch window the writer accepts.
+pub const MAX_BACKGROUND_BATCH_WINDOW: Duration = Duration::from_secs(10);
 /// Default delay between the last published change and the idle
 /// checkpoint: none. A store holds a whole volume (about 251 MB for a whole
 /// disk), so the app saves it once a day and when it quits instead; a quiet
@@ -35,6 +43,7 @@ pub const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 pub struct EngineConfig {
     root: PathBuf,
     batch_window: Duration,
+    background_batch_window: Duration,
     resume_from: Option<ResumeCursor>,
     store_path: Option<PathBuf>,
     checkpoint_idle: Option<Duration>,
@@ -54,6 +63,7 @@ impl EngineConfig {
         EngineConfig {
             root: root.into(),
             batch_window: DEFAULT_BATCH_WINDOW,
+            background_batch_window: DEFAULT_BACKGROUND_BATCH_WINDOW,
             resume_from: None,
             store_path: None,
             checkpoint_idle: DEFAULT_CHECKPOINT_IDLE,
@@ -132,6 +142,14 @@ impl EngineConfig {
         self
     }
 
+    /// Sets the batch window used while no window shows the results
+    /// (default [`DEFAULT_BACKGROUND_BATCH_WINDOW`]), clamped to
+    /// [`MIN_BATCH_WINDOW`]..=[`MAX_BACKGROUND_BATCH_WINDOW`].
+    pub fn with_background_batch_window(mut self, window: Duration) -> EngineConfig {
+        self.background_batch_window = window.clamp(MIN_BATCH_WINDOW, MAX_BACKGROUND_BATCH_WINDOW);
+        self
+    }
+
     /// Sets the cursor the index was saved with; the change source catches
     /// up from it. [`Engine::open`](crate::Engine::open) replaces it with the
     /// cursor saved in the store.
@@ -180,6 +198,11 @@ impl EngineConfig {
     /// The (clamped) batch window.
     pub fn batch_window(&self) -> Duration {
         self.batch_window
+    }
+
+    /// The batch window used while no window shows the results.
+    pub fn background_batch_window(&self) -> Duration {
+        self.background_batch_window
     }
 
     /// The cursor the change source is started from, if any.

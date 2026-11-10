@@ -23,10 +23,13 @@
 //!   (`SF_RESTRICTED` or under `/System`), `DATALESS` (`SF_DATALESS`,
 //!   cloud-only) and `LOCKED` (`UF_IMMUTABLE` or `SF_IMMUTABLE`).
 //!
-//! Entries reach the sink in parent-before-child order: a depth-first walk
-//! over the collected parent links. Below a traverse-only ancestor of an
-//! include-only root, the first emitted level has a parent that is never
-//! emitted (the top of the emitted tree).
+//! Entries reach the sink in parent-before-child order, as the walk lists
+//! them ([`crate::scan::scan_streaming`]): the walk runs on its own threads
+//! and sends each directory's entries through a bounded channel, and the
+//! sink is called on the calling thread. Nothing collects every entry
+//! first (run 2.17: that copy took about 330 MB for a whole disk). Below a
+//! traverse-only ancestor of an include-only root, the first emitted level
+//! has a parent that is never emitted (the top of the emitted tree).
 //!
 //! # Keys of firmlinked directories
 //!
@@ -52,20 +55,21 @@
 //! The scanner is read-only.
 
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
 
 use fx_fs::VolumeEnumerator;
 use fx_model::{Entry, EntryFlags, EntryKind, FileKey, VolumeId};
 
 use crate::attrbuf;
-use crate::scan::{ScanOptions, ScannedEntry, scan};
+use crate::scan::{ScanOptions, ScannedEntry, scan_streaming};
 
 /// `UF_IMMUTABLE` (`sys/stat.h`).
 const UF_IMMUTABLE: u32 = 0x0000_0002;
 /// `SF_IMMUTABLE` (`sys/stat.h`).
 const SF_IMMUTABLE: u32 = 0x0002_0000;
 
-/// Marker for "no parent index".
-const NONE: u32 = u32::MAX;
+/// Directories' worth of entries the walk may send ahead of the sink.
+const STREAM_BATCHES: usize = 256;
 
 /// The production macOS scanner. See the module docs.
 ///
@@ -122,45 +126,24 @@ fn to_entry(e: &ScannedEntry, parent: FileKey) -> Entry {
     }
 }
 
-/// Calls `visit` with every index of `entries` in parent-before-child
-/// order (depth first), using the `parent` links.
-fn parent_first(entries: &[ScannedEntry], mut visit: impl FnMut(usize)) {
-    let n = entries.len();
-    let mut first_child = vec![NONE; n];
-    let mut next_sibling = vec![NONE; n];
-    let mut stack = Vec::new();
-    for (i, e) in entries.iter().enumerate().rev() {
-        if e.parent == NONE || e.parent as usize >= n {
-            stack.push(i as u32);
-        } else {
-            let p = e.parent as usize;
-            next_sibling[i] = first_child[p];
-            first_child[p] = i as u32;
-        }
-    }
-    stack.reverse();
-    while let Some(i) = stack.pop() {
-        let i = i as usize;
-        visit(i);
-        let mut c = first_child[i];
-        while c != NONE {
-            stack.push(c);
-            c = next_sibling[c as usize];
-        }
-    }
-}
-
 impl VolumeEnumerator for MacScanner {
     fn enumerate(&self, root: &Path, sink: &mut dyn FnMut(Entry)) -> fx_fs::Result<()> {
-        let mut opts = self.opts.clone();
-        opts.collect = true;
-        let result = scan(root, &opts)?;
-        let entries = result.entries.unwrap_or_default();
-        parent_first(&entries, |i| {
-            let e = &entries[i];
-            let (dev, id) = e.parent_key;
-            sink(to_entry(e, FileKey::new(VolumeId(dev), id)));
-        });
-        Ok(())
+        let opts = self.opts.clone();
+        let (tx, rx) = sync_channel::<Vec<ScannedEntry>>(STREAM_BATCHES);
+        std::thread::scope(|s| {
+            // The walk owns the sender: when it ends, the channel closes and
+            // the loop below finishes.
+            let walk = s.spawn(move || scan_streaming(root, &opts, &tx));
+            for batch in rx {
+                for e in &batch {
+                    let (dev, id) = e.parent_key;
+                    sink(to_entry(e, FileKey::new(VolumeId(dev), id)));
+                }
+            }
+            match walk.join() {
+                Ok(result) => result.map(|_| ()),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
     }
 }

@@ -5,8 +5,9 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
-use fx_index::{Index, IndexError, IndexParts};
+use fx_index::{Backing, Index, IndexError, IndexParts, PartsError, SharedParts};
 use fx_model::{ResumeCursor, VolumeId};
 use memmap2::Mmap;
 
@@ -63,7 +64,8 @@ struct Stored {
 /// validates everything.
 #[derive(Debug)]
 pub struct MappedIndex {
-    map: Mmap,
+    /// Shared with the indexes restored by [`share_index`](Self::share_index).
+    map: Arc<Mmap>,
     header_len: usize,
     id_bound: usize,
     live_count: usize,
@@ -118,6 +120,7 @@ impl MappedIndex {
     }
 
     fn from_map(map: Mmap) -> Result<MappedIndex, LoadError> {
+        let map = Arc::new(map);
         let len = map.len();
         let b = &map[..];
         let mut magic = [0u8; 8];
@@ -218,9 +221,13 @@ impl MappedIndex {
     }
 
     fn bytes(&self, column: Column) -> &[u8] {
+        &self.map[self.range(column)]
+    }
+
+    fn range(&self, column: Column) -> Range<usize> {
         // `required_index` is `Some` for every column passed here.
         let slot = column.required_index().unwrap_or(0);
-        self.bytes_at(self.required[slot])
+        self.columns[self.required[slot]].range.clone()
     }
 
     /// Number of entry IDs (live or removed): the per-entry column length.
@@ -439,6 +446,83 @@ impl MappedIndex {
     pub fn to_index(&self) -> Result<Index, IndexError> {
         Index::from_parts(self.to_parts())
     }
+
+    /// The index [`to_index`](Self::to_index) rebuilds, with the same checks,
+    /// but its base columns are served from this file's map instead of
+    /// being copied to the heap (`Index::from_shared`). The index keeps the
+    /// map alive after this `MappedIndex` is dropped. The map's pages belong
+    /// to the file: the kernel reads them in when they are used and can drop
+    /// them again under memory pressure, and they don't count in the app's
+    /// memory footprint.
+    pub fn share_index(&self) -> Result<Index, IndexError> {
+        let names = self.range(Column::NameBytes);
+        if std::str::from_utf8(&self.map[names.clone()]).is_err() {
+            return Err(IndexError::InvalidParts(PartsError::NameBuffer {
+                reason: "name bytes are not valid UTF-8",
+            }));
+        }
+        let backing: Arc<dyn Backing> = Arc::new(SharedMap {
+            map: Arc::clone(&self.map),
+            names: names.clone(),
+        });
+        Index::from_shared(SharedParts {
+            backing,
+            name_bytes: names,
+            name_offsets: self.range(Column::NameOffsets),
+            parents: self.range(Column::Parents),
+            volumes: self.range(Column::Volumes),
+            file_ids: self.range(Column::FileIds),
+            meta: self.range(Column::Meta),
+            modified: self.range(Column::Modified),
+            created: self.range(Column::Created),
+            ext_ids: self.range(Column::ExtIds),
+            ext_bytes: self.ext_bytes().to_vec(),
+            ext_offsets: self.ext_offsets().to_vec(),
+            live: self.live().to_vec(),
+        })
+    }
+}
+
+/// A checkpoint file's map, shared by the index restored from it
+/// ([`MappedIndex::share_index`]). Its name column was checked as UTF-8
+/// when this was made, so every name read from it later is sliced out
+/// without scanning its bytes again.
+#[derive(Debug)]
+struct SharedMap {
+    map: Arc<Mmap>,
+    /// The name column's bytes in the map, valid UTF-8.
+    names: Range<usize>,
+}
+
+impl Backing for SharedMap {
+    fn bytes(&self) -> &[u8] {
+        &self.map
+    }
+
+    fn text(&self, range: Range<usize>) -> Option<&str> {
+        let bytes = self.map.get(range.clone())?;
+        if range.start < self.names.start || range.end > self.names.end {
+            return std::str::from_utf8(bytes).ok();
+        }
+        let names = &self.map[self.names.clone()];
+        let start = range.start - self.names.start;
+        let end = range.end - self.names.start;
+        if !char_boundary(names, start) || !char_boundary(names, end) {
+            return None;
+        }
+        // SAFETY: `names` was checked as UTF-8 before this `SharedMap` was
+        // made (`share_index`), and the bytes between two character
+        // boundaries of valid UTF-8 are valid UTF-8. The map is read-only,
+        // and fx-store never writes a file in place (see `open`), so the
+        // checked bytes don't change.
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+    }
+}
+
+/// Whether byte `i` of the UTF-8 `text` starts a character (or is its end).
+fn char_boundary(text: &[u8], i: usize) -> bool {
+    // Continuation bytes are 0b10xx_xxxx, which as i8 are below -0x40.
+    i == text.len() || text.get(i).is_some_and(|&b| (b as i8) >= -0x40)
 }
 
 /// Decodes the volume table.

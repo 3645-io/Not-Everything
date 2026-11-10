@@ -422,3 +422,121 @@ fn rescan_volume_rebuilds_while_changes_keep_flowing() {
     assert_orders_match(&snap);
     engine.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Background cost (run 2.14)
+// ---------------------------------------------------------------------------
+
+/// Drops every generation already sent to `rx`.
+fn drain(rx: &std::sync::mpsc::Receiver<fx_engine::Generation>) {
+    while rx.try_recv().is_ok() {}
+}
+
+#[test]
+fn a_batch_that_changes_nothing_publishes_no_new_generation() {
+    let tree = sample_tree();
+    let (source, engine) = running(&tree);
+    let rx = engine.subscribe();
+    thread::sleep(Duration::from_millis(100));
+    drain(&rx);
+    let gen0 = engine.snapshot().generation();
+
+    // A change notice for a file that did not change.
+    source.push(vec![check("/vol/top.txt")]);
+    let end = Instant::now() + WAIT;
+    while engine.snapshot().cursor() != Some(source.current_cursor()) {
+        assert!(Instant::now() < end, "the newer cursor was never published");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine.snapshot().generation(),
+        gen0,
+        "nothing changed, so no new generation"
+    );
+    assert!(rx.try_recv().is_err(), "no subscriber was woken");
+    engine.shutdown();
+}
+
+#[test]
+fn the_engine_starts_in_the_foreground_with_a_2s_background_window() {
+    assert_eq!(
+        EngineConfig::new(ROOT).background_batch_window(),
+        Duration::from_secs(2)
+    );
+    let tree = sample_tree();
+    let (_source, engine) = running(&tree);
+    assert!(engine.is_foreground());
+    engine.set_foreground(false);
+    assert!(!engine.is_foreground());
+    engine.shutdown();
+}
+
+#[test]
+fn a_hidden_window_collects_changes_for_the_background_window() {
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let config = config().with_background_batch_window(Duration::from_millis(800));
+    let engine = start(&tree, &source, tree.build_index(), config);
+    engine.set_foreground(false);
+    // Let the writer finish the foreground wait it may be in.
+    thread::sleep(Duration::from_millis(150));
+    let gen0 = engine.snapshot().generation();
+
+    let t0 = Instant::now();
+    tree.touch("/vol/other/n.txt", 1);
+    source.push(vec![check("/vol/other/n.txt")]);
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        engine.snapshot().generation(),
+        gen0,
+        "hidden: the change waits for the end of the background window"
+    );
+    wait_for_tree(&engine, &tree, "applied after the background window");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(700),
+        "applied after {:?}, before the background window ended",
+        t0.elapsed()
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn showing_the_window_applies_pending_changes_soon() {
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let config = config().with_background_batch_window(Duration::from_secs(5));
+    let engine = start(&tree, &source, tree.build_index(), config);
+    engine.set_foreground(false);
+    thread::sleep(Duration::from_millis(150));
+
+    tree.touch("/vol/other/n.txt", 1);
+    source.push(vec![check("/vol/other/n.txt")]);
+    thread::sleep(Duration::from_millis(100));
+    let shown = Instant::now();
+    engine.set_foreground(true);
+    wait_for_tree(&engine, &tree, "applied once the window shows");
+    assert!(
+        shown.elapsed() < Duration::from_millis(700),
+        "applied {:?} after the window showed",
+        shown.elapsed()
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn a_hidden_idle_writer_polls_the_source_rarely() {
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let config = config().with_background_batch_window(Duration::from_millis(500));
+    let engine = start(&tree, &source, tree.build_index(), config);
+    engine.set_foreground(false);
+    thread::sleep(Duration::from_millis(150));
+    let polls = source.polls();
+    thread::sleep(Duration::from_secs(1));
+    let woke = source.polls() - polls;
+    assert!(
+        woke <= 3,
+        "hidden and idle, the writer waited on the source {woke} times in 1 s"
+    );
+    engine.shutdown();
+}
