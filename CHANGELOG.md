@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.4.0: a tenth of the memory, a quiet background (November 2026)
+
+Not-Everything now uses about a tenth of the memory it did, barely touches the processor while its window is hidden, and scans the disk faster. Signed and notarized. Apple silicon only, macOS 13 or later.
+
+### Before you update
+
+- **Nothing to do.** Full Disk Access, Launch at Login, your hotkey, your settings and your index carry over from 0.3.2.
+
+### Changed
+
+- **About a tenth of the memory.** On the test Mac's whole disk (about 2 million files), the app takes 125 MB with its window hidden (1,281 MB in 0.3.2) and 169 MB showing a search (1,345 MB). The first scan peaks at 393 MB (2,175 MB). The saved index is now read straight from its file instead of being copied into memory, the app no longer keeps a second copy of every file's path, the first scan builds the index as the files are listed, and a folder macOS asks the app to look through again is read the same way.
+- **A quiet background.** With the window hidden, the app uses 1.4% of one core (10.4% in 0.3.2) and 10 mW (68 mW), and wakes up 0.3 times a second (3.0). Changes are gathered for 2 seconds while the window is hidden, and a change that leaves the index as it was no longer starts a new search. Showing a search costs about 60% less processor time.
+- **Faster to scan.** A first scan of the whole disk takes about 15 s (19.0 s in 0.3.2). From launch to the first result takes about 1 s, as before, and a search is usable 10 ms after a relaunch (13 ms).
+- **Set your own shortcut.** Settings › General › Show the search window records a new shortcut: click the keys, press the combination you want. Shortcuts that type a character, or that macOS uses, are refused, and Use Default brings back Option-Shift-Space.
+
+### Fixed
+
+- **A moved folder's contents could drop out of the index** when a change inside it was reported under the folder's old path.
+- **A quit during a background save no longer leaves a temporary file** as large as the index; the next start removes any that a crash left.
+
+### For testers
+
+Release candidates install as **Not-Everything Preview**, with its own settings, index, hotkey (Option-Shift-Space) and command (`not-everything-preview`). It runs next to your everyday Not-Everything without touching it.
+
+### Install
+
+Open `Not-Everything-0.4.0-macos-arm64.dmg` and drag Not-Everything to Applications, replacing the old copy. The zip, `Not-Everything-0.4.0-macos-arm64.zip`, holds the same signed app. `not-everything-cli-0.4.0-macos-arm64.tar.gz` holds the `not-everything` command, its manual (`cli.md`), the license and the third-party notices.
+
 ## v0.3.2: less background work (November 2026)
 
 A small update that makes Not-Everything far lighter while it waits in the background. Signed and notarized. Apple silicon only, macOS 13 or later.
