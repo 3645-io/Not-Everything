@@ -11,17 +11,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, diff_subtree, reconcile_path};
-use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexError};
+use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
 use fx_model::{Change, Entry, EntryId, FileKey, ResumeCursor, StartOutcome};
 use fx_sort::{Batch, MatchSet, Order};
 
 use crate::Shared;
 use crate::config::MAX_RESTART_BACKOFF;
 use crate::health::EngineHealth;
+use crate::paths;
 use crate::priority::PriorityFolders;
 use crate::qos;
 use crate::snapshot::EngineSnapshot;
-use crate::tree::Tree;
 
 /// How deep `check_path` may recurse into missing parents.
 const MAX_DEPTH: u32 = 64;
@@ -44,15 +44,11 @@ const BACKGROUND_SLICE: Duration = Duration::from_millis(250);
 /// anything is removed.
 struct Deferred {
     key: FileKey,
-    parent: Option<FileKey>,
-    name: String,
-    path: PathBuf,
 }
 
 /// State owned by the writer thread.
 pub(crate) struct Writer<C, P, V> {
     pub(crate) index: Index,
-    pub(crate) tree: Tree,
     pub(crate) orders: Arc<Vec<Order>>,
     pub(crate) root: PathBuf,
     pub(crate) window: Duration,
@@ -65,6 +61,9 @@ pub(crate) struct Writer<C, P, V> {
     pub(crate) generation: u64,
     /// Changes applied to the index since the last publish, by entry ID.
     pub(crate) batch: Batch,
+    /// Every order must be rebuilt at the next commit (after a first scan,
+    /// which records no batch).
+    pub(crate) orders_stale: bool,
     /// A full rescan is due (start outcome, `RescanVolume`, or a change the
     /// index rejected).
     pub(crate) full_rescan_pending: bool,
@@ -353,7 +352,7 @@ where
         self.shared.health.set(EngineHealth::Recovering);
     }
 
-    /// Applies one collected batch of changes to the index and the tree.
+    /// Applies one collected batch of changes to the index.
     /// Returns `false` when a full rescan it needed failed (a retry is then
     /// scheduled).
     fn process(&mut self, changes: Vec<Change>) -> bool {
@@ -390,11 +389,11 @@ where
             // Unreadable (e.g. permission denied): leave the index as is.
             return;
         };
-        let indexed = self
-            .tree
-            .resolve(&self.root, path)
-            .and_then(|k| self.tree.get(k))
-            .cloned();
+        // A replaced entry still waiting for its removal shares its name:
+        // the one the disk has now is the one to compare.
+        let prefer = on_disk.as_ref().map(|e| e.key);
+        let indexed = paths::resolve(&self.index, &self.root, path, prefer)
+            .and_then(|id| self.index.get(self.index.key(id)));
         // A folder found here under another key (new, or moved in from
         // another path) is re-enumerated. A moved folder's children move
         // with it, but changes made inside it are reported under its old
@@ -404,13 +403,8 @@ where
         for change in result.changes {
             match change {
                 Change::Remove { key } => {
-                    if let Some(old) = indexed.as_ref().filter(|i| i.key == key) {
-                        deferred.push(Deferred {
-                            key,
-                            parent: old.parent,
-                            name: old.name.clone(),
-                            path: path.to_path_buf(),
-                        });
+                    if indexed.as_ref().is_some_and(|i| i.key == key) {
+                        deferred.push(Deferred { key });
                     }
                 }
                 Change::Upsert(entry) => self.upsert_at(entry, path, deferred, depth),
@@ -442,7 +436,8 @@ where
 
     /// Re-enumerates the folder at `path` and applies `fx_fs::diff_subtree`.
     fn rescan_subtree(&mut self, path: &Path, deferred: &mut Vec<Deferred>, depth: u32) {
-        let Some(top) = self.tree.resolve(&self.root, path) else {
+        let top = paths::resolve(&self.index, &self.root, path, None).map(|id| self.index.key(id));
+        let Some(top) = top else {
             // Not indexed: checking the path upserts it and, for a folder,
             // rescans it from there.
             if depth < MAX_DEPTH {
@@ -463,15 +458,16 @@ where
         // The indexed side covers the folder's subtree plus the subtrees of
         // folders that moved in from elsewhere: whatever they held that is
         // not listed now is gone (or is found again at its new path).
-        let mut keys = self.tree.subtree(top);
+        let mut keys = self.subtree_keys(top);
         let mut seen: HashSet<FileKey> = keys.iter().copied().collect();
         for e in &fresh {
-            let moved_in = self
-                .tree
-                .get(e.key)
-                .is_some_and(|old| old.parent != e.parent && !seen.contains(&e.key));
+            let moved_in = !seen.contains(&e.key)
+                && self
+                    .index
+                    .get(e.key)
+                    .is_some_and(|old| old.parent != e.parent);
             if moved_in {
-                for k in self.tree.subtree(e.key) {
+                for k in self.subtree_keys(e.key) {
                     if seen.insert(k) {
                         keys.push(k);
                     }
@@ -480,7 +476,7 @@ where
         }
         let indexed: HashMap<FileKey, Entry> = keys
             .into_iter()
-            .filter_map(|k| self.tree.get(k).map(|e| (k, e.clone())))
+            .filter_map(|k| self.index.get(k).map(|e| (k, e)))
             .collect();
         self.apply_changes(diff_subtree(&indexed, fresh).changes);
     }
@@ -488,20 +484,102 @@ where
     /// Re-enumerates the whole volume and applies the difference. Readers
     /// keep the previous snapshot until the result is published. Returns
     /// whether the volume could be enumerated.
+    ///
+    /// The entries stream from the enumerator into the index, with no list
+    /// of every entry and no map of the old ones (run 2.17): an empty index
+    /// is built straight into its base columns ([`IndexBuilder`]); a loaded
+    /// one takes each entry as an upsert, and whatever the scan did not
+    /// list is removed at the end.
     fn full_rescan(&mut self) -> bool {
         self.full_rescan_pending = false;
         self.in_full_rescan = true;
         let root = self.root.clone();
-        let ok = match self.walk(&root) {
-            Ok(fresh) => {
-                let diff = diff_subtree(self.tree.entries(), fresh);
-                self.apply_changes(diff.changes);
-                true
-            }
-            Err(_) => false,
+        let ok = if self.index.live_count() == 0 {
+            self.first_scan(&root)
+        } else {
+            self.rescan_loaded(&root)
         };
         self.in_full_rescan = false;
         ok
+    }
+
+    /// The first scan of an empty index: built in the base columns, then
+    /// published with every order rebuilt by one shared Name sort.
+    fn first_scan(&mut self, root: &Path) -> bool {
+        let mut builder = IndexBuilder::new();
+        // The enumerator may not list the root itself (the macOS scanner
+        // does not); the root goes first so every entry finds its parent.
+        if let Ok(Some(top)) = self.stat_at(root) {
+            let _ = builder.push(top);
+        }
+        // An entry whose parent is unknown is dropped, as a rejected change
+        // during a full rescan is; a repeated key keeps its first listing.
+        let listed = self.enumerator.enumerate(root, &mut |e| {
+            let _ = builder.push(e);
+        });
+        if listed.is_err() {
+            return false;
+        }
+        self.index = builder.finish();
+        // The writer compacts between batches itself.
+        self.index.set_compact_fraction(f64::INFINITY);
+        self.batch.clear();
+        self.orders_stale = true;
+        true
+    }
+
+    /// A full rescan of a loaded index: every listed entry is upserted (and
+    /// recorded in the batch only when it changed), then every live entry
+    /// the scan did not list is removed. A failed scan removes nothing.
+    fn rescan_loaded(&mut self, root: &Path) -> bool {
+        let top = self.stat_at(root);
+        let Writer {
+            index,
+            batch,
+            enumerator,
+            ..
+        } = self;
+        let mut seen = vec![false; index.id_bound()];
+        let mut take = |e: Entry| {
+            // A file with several hard links is listed once per link: keep
+            // the first listing, as a first scan does, so rescans don't move
+            // it back and forth.
+            if let Some(id) = index.lookup(e.key) {
+                if seen.get(id.index()).copied().unwrap_or(false) {
+                    return;
+                }
+            }
+            take_one(index, batch, &mut seen, e);
+        };
+        if let Ok(Some(top)) = top {
+            take(top);
+        }
+        let listed = enumerator.enumerate(root, &mut take);
+        if listed.is_err() {
+            return false;
+        }
+        let unseen: Vec<FileKey> = (0..self.index.id_bound())
+            .map(|i| EntryId(i as u32))
+            .filter(|&id| self.index.is_live(id) && !seen.get(id.index()).copied().unwrap_or(false))
+            .map(|id| self.index.key(id))
+            .collect();
+        for key in unseen {
+            self.remove(key);
+        }
+        true
+    }
+
+    /// `key` and every live entry below it, each after its parent.
+    fn subtree_keys(&self, key: FileKey) -> Vec<FileKey> {
+        match self.index.lookup(key) {
+            Some(id) => self
+                .index
+                .subtree(id)
+                .into_iter()
+                .map(|d| self.index.key(d))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Enumerates the folder at `path`, parent before child, with the
@@ -547,23 +625,42 @@ where
         }
     }
 
-    /// Applies the postponed removals whose entry is still where it was and
-    /// is no longer on disk there.
+    /// Applies the postponed removals of entries that are not on disk where
+    /// the index has them now.
     fn finish_deferred(&mut self, deferred: Vec<Deferred>) {
         for d in deferred {
-            let unmoved = self
-                .tree
-                .get(d.key)
-                .is_some_and(|e| e.parent == d.parent && e.name == d.name);
-            if !unmoved {
+            // Where the index has the entry now: an entry that moved in this
+            // batch, itself or with a folder above it, has a new path by
+            // now. Checking only the path it was reported at removed a moved
+            // folder's subtree when a change inside it was reported under
+            // the folder's old path (found by the differential test).
+            let Some(path) = self.path_of(d.key) else {
                 continue;
-            }
-            match self.stat_at(&d.path) {
+            };
+            match self.stat_at(&path) {
                 Ok(Some(now)) if now.key == d.key => {}
                 Ok(_) => self.remove(d.key),
                 Err(_) => {}
             }
         }
+    }
+
+    /// The absolute path the index has for `key` now: the watched root,
+    /// then the names below the root entry. `None` if `key` is not live.
+    fn path_of(&self, key: FileKey) -> Option<PathBuf> {
+        let mut names = Vec::new();
+        let mut cur = self.index.get(key)?;
+        while let Some(parent) = cur.parent {
+            names.push(cur.name);
+            // The index keeps no cycles; the cap guards a corrupt one.
+            if names.len() > self.index.live_count() {
+                return None;
+            }
+            cur = self.index.get(parent)?;
+        }
+        let mut path = self.root.clone();
+        path.extend(names.iter().rev());
+        Some(path)
     }
 
     /// The index rejected a change (unknown parent, cycle, bad name): the
@@ -574,34 +671,26 @@ where
         }
     }
 
-    /// Upserts one entry into the index and the tree and records it in the
-    /// order batch: a changed name or parent through `Batch::moved`, anything
-    /// else through `Batch::upsert`.
+    /// Upserts one entry into the index and records it in the order batch:
+    /// a changed name or parent through `Batch::moved`, anything else
+    /// through `Batch::upsert`, nothing when it was already stored so.
     fn upsert(&mut self, entry: Entry) -> Result<(), IndexError> {
-        let old = self.tree.get(entry.key);
-        if old == Some(&entry) {
-            return Ok(());
+        let (id, what) = self.index.upsert_reporting(entry)?;
+        match what {
+            Upserted::Unchanged => {}
+            Upserted::Moved => self.batch.moved(id),
+            Upserted::Updated | Upserted::Inserted => self.batch.upsert(id),
         }
-        let moved = old.is_some_and(|o| o.name != entry.name || o.parent != entry.parent);
-        let id = self.index.upsert(entry.clone())?;
-        if moved {
-            self.batch.moved(id);
-        } else {
-            self.batch.upsert(id);
-        }
-        self.tree.insert(entry);
         Ok(())
     }
 
     /// Removes an entry and its descendants, recording every removed ID.
     fn remove(&mut self, key: FileKey) {
-        if self.tree.get(key).is_none() {
+        let Some(id) = self.index.lookup(key) else {
             return;
-        }
-        for k in self.tree.remove_subtree(key) {
-            if let Some(id) = self.index.lookup(k) {
-                self.batch.remove(id);
-            }
+        };
+        for d in self.index.subtree(id) {
+            self.batch.remove(d);
         }
         self.index.remove(key);
     }
@@ -613,17 +702,17 @@ where
     /// generation: the newer cursor is published silently, so no window
     /// re-runs its search and no idle save is started for it.
     fn commit(&mut self, cursor: Option<ResumeCursor>) {
-        if self.batch.is_empty() {
+        if self.batch.is_empty() && !self.orders_stale {
             self.publish_cursor(cursor);
             return;
         }
         let snap = self.index.snapshot();
-        let rebuild = self.batch.len() > self.tree.len() / 2;
+        let rebuild = self.orders_stale || self.batch.len() > self.index.live_count() / 2;
+        self.orders_stale = false;
         let mut orders: Vec<Order> = if rebuild {
-            self.orders
-                .iter()
-                .map(|o| Order::build(&*snap, o.key))
-                .collect()
+            // One Name sort shared by every order (a first scan lands here).
+            let keys: Vec<_> = self.orders.iter().map(|o| o.key).collect();
+            Order::build_keys(&*snap, &keys)
         } else {
             // The published snapshot shares `self.orders`, so each order is
             // read, not changed: `applied` copies it once into the new one.
@@ -681,7 +770,7 @@ where
     fn publish(&mut self, cursor: Option<ResumeCursor>) {
         let index = self.index.snapshot();
         if self.group_stale {
-            self.group = self.priority.group(&self.tree, &index, &self.orders);
+            self.group = self.priority.group(&self.index, &index, &self.orders);
             self.group_stale = false;
         }
         let snap = EngineSnapshot {
@@ -694,4 +783,23 @@ where
         self.shared.current.store(Arc::new(snap));
         self.shared.notify(self.generation);
     }
+}
+
+/// One entry of a full rescan of a loaded index: upserted, recorded in the
+/// order batch when it changed, and marked seen. A rejected entry is
+/// dropped, as during any full rescan: the rescan is already the fallback
+/// for an inconsistent batch.
+fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut Vec<bool>, e: Entry) {
+    let Ok((id, what)) = index.upsert_reporting(e) else {
+        return;
+    };
+    match what {
+        Upserted::Unchanged => {}
+        Upserted::Moved => batch.moved(id),
+        Upserted::Updated | Upserted::Inserted => batch.upsert(id),
+    }
+    if id.index() >= seen.len() {
+        seen.resize(id.index() + 1, false);
+    }
+    seen[id.index()] = true;
 }

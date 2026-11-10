@@ -288,7 +288,7 @@ fn push_name(bytes: &mut Vec<u8>, offsets: &mut Vec<u32>, name: &str) {
 
 /// Validates `parts` and builds the index state plus the live child count
 /// per entry. Never panics on bad input.
-pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError> {
+pub(crate) fn restore(parts: IndexParts) -> Result<State, PartsError> {
     let n = parts.parents.len();
     let columns: [(&'static str, usize); 8] = [
         ("name_offsets", parts.name_offsets.len()),
@@ -346,7 +346,6 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
     }
 
     // Parents: in range for every entry; live and acyclic for live ones.
-    let mut children = vec![0u32; n];
     for (i, &p) in parts.parents.iter().enumerate() {
         if p == u32::MAX {
             continue;
@@ -357,9 +356,6 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
                 id: i as u32,
                 parent: p,
             });
-        }
-        if is_live(i) {
-            children[pi] += 1;
         }
     }
     check_acyclic(&parts.parents, &deleted)?;
@@ -388,7 +384,7 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
         exts: Arc::new(exts),
         live,
     };
-    Ok((state, children))
+    Ok(state)
 }
 
 /// The deletion bitset for `len` IDs from live-bitmap words (exactly

@@ -191,6 +191,16 @@ impl Order {
             .collect()
     }
 
+    /// Builds the orders for `keys`, in that order, sharing one Name sort
+    /// between them: the engine keeps four orders, and a first scan or a
+    /// large batch rebuilds them all at once.
+    pub fn build_keys<S: SortSource + Sync + ?Sized>(src: &S, keys: &[SortKey]) -> Vec<Order> {
+        let by_name = name_order(src);
+        keys.iter()
+            .map(|&key| Self::from_name_order(src, key, by_name.clone()))
+            .collect()
+    }
+
     fn from_name_order<S: SortSource + Sync + ?Sized>(
         src: &S,
         key: SortKey,
