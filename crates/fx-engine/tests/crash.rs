@@ -61,6 +61,10 @@ use fx_testkit::crash::{self, Child, ChildError};
 /// The child's test, by its name in this binary.
 const CHILD_TEST: &str = "crash_child";
 
+/// Children a series may start per kill it needs during a checkpoint
+/// before it gives up.
+const MAX_RUNS_PER_KILL: u32 = 10;
+
 /// Names the store folder (the parent's scratch folder) for the child.
 const DIR_ENV: &str = "FX_CRASH_DIR";
 
@@ -440,8 +444,13 @@ fn run_kills(target: u32) {
     while kills_leaving_temp + kills_in_save < target {
         runs += 1;
         let run = runs;
+        // The kill delays follow the save times measured so far, so on a
+        // shared CI runner, where a few saves take far longer than the rest,
+        // most kills can come after the save they aimed at: GitHub's runner
+        // once saw only 8 of 40 land. Ten runs per kill needed keep the test
+        // from failing on that alone; a working machine needs fewer than two.
         assert!(
-            run <= 4 * target,
+            run <= MAX_RUNS_PER_KILL * target,
             "only {} of {} kills landed during a checkpoint",
             kills_leaving_temp + kills_in_save,
             run - 1
