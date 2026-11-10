@@ -15,7 +15,7 @@ use crate::kids::{BaseKids, DeltaKids, name_hash};
 use crate::extensions::{ExtId, extension_of};
 use crate::meta::PackedMeta;
 use crate::names::{NameBuffer, NameError};
-use crate::parts::{self, IndexParts, PartsError};
+use crate::parts::{self, IndexParts, PartsError, SharedParts};
 use crate::snapshot::Snapshot;
 use crate::store::{Base, Bitset, Delta, Row, State};
 
@@ -189,6 +189,51 @@ impl Index {
             compact_fraction: DEFAULT_COMPACT_FRACTION,
             auto_remap: None,
         })
+    }
+
+    /// [`from_parts`](Index::from_parts) for columns that stay in a
+    /// [`Backing`](crate::Backing), such as a saved index's memory map: the
+    /// same checks and the same index, but the base columns are served from
+    /// the backing instead of being copied to the heap. Only the key table,
+    /// the extension table and the deletion bitset are built on the heap.
+    ///
+    /// Errors: as [`from_parts`](Index::from_parts), and
+    /// [`PartsError::SharedColumn`] when a range is out of bounds or isn't a
+    /// whole number of values.
+    pub fn from_shared(parts: SharedParts) -> Result<Index, IndexError> {
+        Ok(Index::from_state(parts::restore_shared(parts)?))
+    }
+
+    /// Serves the base columns from `restored`, an index restored from a
+    /// save of `saved`, when `saved` held exactly this index's base: the
+    /// same base, an empty delta and no removals, as right after a first
+    /// scan or a compaction. Changes made since `saved` stay in the delta
+    /// and the deletion bitset, which refer to the same entry IDs. Returns
+    /// whether the base was swapped; it isn't when the base has been
+    /// compacted since, or `saved` wasn't exactly the base.
+    pub fn adopt_base(&mut self, saved: &Snapshot, restored: Index) -> bool {
+        let saved = &saved.state;
+        let exact = Arc::ptr_eq(&self.state.base, &saved.base)
+            && saved.delta.len() == 0
+            && saved.deleted.ones == 0;
+        let restored = restored.state;
+        if !exact
+            || restored.base.len() != self.state.base.len()
+            || restored.deleted.ones != 0
+            || restored.delta.len() != 0
+        {
+            return false;
+        }
+        self.state.base = restored.base;
+        true
+    }
+
+    /// Bytes of the base columns served from a backing instead of the heap
+    /// ([`from_shared`](Index::from_shared)). They are part of
+    /// [`heap_bytes`](Index::heap_bytes), which counts every column the
+    /// index holds, so that figure keeps its meaning.
+    pub fn mapped_bytes(&self) -> usize {
+        self.state.base.mapped_bytes()
     }
 
     /// An index over `state`, whose delta is empty ([`IndexBuilder`](crate::IndexBuilder)).
@@ -665,13 +710,13 @@ impl Index {
         }
         let mut base = Base {
             names: NameBuffer::with_capacity(live, name_bytes),
-            parent: Vec::with_capacity(live),
-            meta: Vec::with_capacity(live),
-            modified: Vec::with_capacity(live),
-            created: Vec::with_capacity(live),
-            ext: Vec::with_capacity(live),
-            volume: Vec::with_capacity(live),
-            file_id: Vec::with_capacity(live),
+            parent: Vec::with_capacity(live).into(),
+            meta: Vec::with_capacity(live).into(),
+            modified: Vec::with_capacity(live).into(),
+            created: Vec::with_capacity(live).into(),
+            ext: Vec::with_capacity(live).into(),
+            volume: Vec::with_capacity(live).into(),
+            file_id: Vec::with_capacity(live).into(),
             table: Vec::new(),
         };
         for i in 0..total {
@@ -697,7 +742,7 @@ impl Index {
             base.meta.push(state.meta(id).0);
             base.modified.push(state.modified(id));
             base.created.push(state.created(id));
-            base.ext.push(state.ext(id));
+            base.ext.push(state.ext(id).0);
             let key = state.key(id);
             base.volume.push(key.volume.0);
             base.file_id.push(key.file_id);

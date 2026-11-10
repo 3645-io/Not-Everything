@@ -43,7 +43,7 @@ impl BaseKids {
         // Bucket `n` holds the roots; parents are validated to be in range.
         let bucket = |p: u32| if (p as usize) < n { p as usize } else { n };
         let mut next = vec![0u32; n + 1];
-        for &p in &base.parent {
+        for &p in base.parent.iter() {
             next[bucket(p)] += 1;
         }
         let mut sum = 0u32;

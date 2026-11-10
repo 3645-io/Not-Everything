@@ -79,6 +79,10 @@ pub(crate) struct Writer<C, P, V> {
     /// The index changed since `group` was built: rebuild it at the next
     /// publish.
     pub(crate) group_stale: bool,
+    /// The base was just built on the heap (a first scan or a compaction):
+    /// the next publish asks for that exact snapshot to be saved, so the
+    /// base can then be served from the saved file (run 2.17 step 2).
+    pub(crate) fresh_base: bool,
 }
 
 /// What the writer must do before it reads the change source again.
@@ -158,6 +162,7 @@ where
             self.try_rescan();
         }
         while !self.stopping() {
+            self.adopt_saved_base();
             if self.shared.paused.load(Ordering::Acquire) {
                 thread::park_timeout(PAUSE_POLL);
                 continue;
@@ -521,6 +526,7 @@ where
             return false;
         }
         self.index = builder.finish();
+        self.fresh_base = true;
         // The writer compacts between batches itself.
         self.index.set_compact_fraction(f64::INFINITY);
         self.batch.clear();
@@ -726,6 +732,7 @@ where
             // Compaction keeps live entries in ID order, so remapping an
             // order keeps it sorted.
             let remap = self.index.compact();
+            self.fresh_base = true;
             for order in &mut orders {
                 for id in &mut order.ids {
                     *id = remap[*id as usize].0;
@@ -737,6 +744,37 @@ where
         self.group_stale = true;
         self.generation += 1;
         self.publish(cursor);
+        if std::mem::take(&mut self.fresh_base) {
+            // The snapshot just published holds exactly the new base: its
+            // delta is empty and nothing is removed yet.
+            self.shared
+                .checkpoints
+                .save_exact(self.shared.current.load_full());
+        }
+    }
+
+    /// Serves the base from the store once the checkpoint thread has saved
+    /// exactly this base and mapped the file (run 2.17 step 2): the heap
+    /// copy goes when the last snapshot holding it does. The swap is
+    /// published at once, under the same generation, so no window re-runs
+    /// its search for it; it doesn't happen when the base was compacted
+    /// again meanwhile.
+    fn adopt_saved_base(&mut self) {
+        let Some((saved, restored)) = self.shared.checkpoints.take_restored() else {
+            return;
+        };
+        if !self.index.adopt_base(saved.index(), restored) {
+            return;
+        }
+        let current = self.shared.current.load_full();
+        let snap = EngineSnapshot {
+            index: self.index.snapshot(),
+            orders: Arc::clone(&self.orders),
+            cursor: current.cursor,
+            generation: self.generation,
+            priority: self.group.clone(),
+        };
+        self.shared.current.store(Arc::new(snap));
     }
 
     /// Publishes `cursor` with the snapshot already published, without a

@@ -22,27 +22,31 @@ use std::sync::Arc;
 
 use fx_model::{EntryId, FileKey, VolumeId};
 
+use crate::column::Column;
 use crate::extensions::{ExtId, ExtensionTable};
 use crate::meta::PackedMeta;
 use crate::names::NameBuffer;
 
 const NONE: u32 = u32::MAX;
 
-/// Dense, immutable base columns plus a read-only key table.
+/// Dense, immutable base columns plus a read-only key table. The columns
+/// are owned, or served from a saved index's memory map
+/// ([`Column::Shared`]); the key table is always on the heap.
 #[derive(Debug, Default)]
 pub(crate) struct Base {
     pub(crate) names: NameBuffer,
     /// Parent ID per entry; `u32::MAX` (`EntryId::NONE`) for roots.
-    pub(crate) parent: Vec<u32>,
+    pub(crate) parent: Column<u32>,
     /// Size, kind and flags; see [`PackedMeta`].
-    pub(crate) meta: Vec<u64>,
-    pub(crate) modified: Vec<i64>,
-    pub(crate) created: Vec<i64>,
-    pub(crate) ext: Vec<ExtId>,
+    pub(crate) meta: Column<u64>,
+    pub(crate) modified: Column<i64>,
+    pub(crate) created: Column<i64>,
+    /// [`ExtId`] per entry, as its `u16`.
+    pub(crate) ext: Column<u16>,
     /// `FileKey::volume` per entry.
-    pub(crate) volume: Vec<u32>,
+    pub(crate) volume: Column<u32>,
     /// `FileKey::file_id` per entry.
-    pub(crate) file_id: Vec<u64>,
+    pub(crate) file_id: Column<u64>,
     /// Open-addressing table (linear probing) of base IDs keyed by their
     /// `FileKey`. Built once per compaction and never modified, so it needs
     /// no tombstones: removed entries are filtered by the deletion bitset.
@@ -162,32 +166,44 @@ impl Base {
 
     /// Allocated bytes of the parent column.
     fn parent_bytes(&self) -> usize {
-        self.parent.capacity() * size_of::<u32>()
+        self.parent.held_bytes()
     }
 
     /// Allocated bytes of the packed size/kind/flags column.
     fn meta_bytes(&self) -> usize {
-        self.meta.capacity() * size_of::<u64>()
+        self.meta.held_bytes()
     }
 
     /// Allocated bytes of the two time columns.
     fn times_bytes(&self) -> usize {
-        self.modified.capacity() * size_of::<i64>() + self.created.capacity() * size_of::<i64>()
+        self.modified.held_bytes() + self.created.held_bytes()
     }
 
     /// Allocated bytes of the extension ID column.
     fn ext_bytes(&self) -> usize {
-        self.ext.capacity() * size_of::<ExtId>()
+        self.ext.held_bytes()
     }
 
     /// Allocated bytes of the file key columns (volume and file ID).
     fn key_bytes(&self) -> usize {
-        self.volume.capacity() * size_of::<u32>() + self.file_id.capacity() * size_of::<u64>()
+        self.volume.held_bytes() + self.file_id.held_bytes()
     }
 
     /// Allocated bytes of the key lookup table.
     fn table_bytes(&self) -> usize {
         self.table.capacity() * size_of::<u32>()
+    }
+
+    /// Bytes of the columns served from a backing instead of the heap.
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.names.mapped_bytes()
+            + self.parent.mapped_bytes()
+            + self.meta.mapped_bytes()
+            + self.modified.mapped_bytes()
+            + self.created.mapped_bytes()
+            + self.ext.mapped_bytes()
+            + self.volume.mapped_bytes()
+            + self.file_id.mapped_bytes()
     }
 }
 
@@ -386,7 +402,7 @@ impl State {
 
     pub(crate) fn ext(&self, id: EntryId) -> ExtId {
         match self.slot(id) {
-            Slot::Base(i) => self.base.ext[i],
+            Slot::Base(i) => ExtId(self.base.ext[i]),
             Slot::Row(r) => r.ext,
         }
     }
@@ -408,7 +424,7 @@ impl State {
                 meta: PackedMeta(self.base.meta[i]),
                 modified: self.base.modified[i],
                 created: self.base.created[i],
-                ext: self.base.ext[i],
+                ext: ExtId(self.base.ext[i]),
             },
             Slot::Row(r) => r.clone(),
         }

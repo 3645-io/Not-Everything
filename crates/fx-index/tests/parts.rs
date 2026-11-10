@@ -542,3 +542,250 @@ fn garbage_parts_never_panic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared columns (run 2.17 step 2): the same index served from a buffer such
+// as a saved index's memory map, without copying its base columns.
+// ---------------------------------------------------------------------------
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use fx_index::{Backing, PartsError, SharedParts};
+
+/// A test buffer: 8-byte aligned, text checked on every call.
+#[derive(Debug)]
+struct Words(Vec<u64>);
+
+impl Backing for Words {
+    fn bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.0)
+    }
+
+    fn text(&self, range: Range<usize>) -> Option<&str> {
+        std::str::from_utf8(self.bytes().get(range)?).ok()
+    }
+}
+
+/// `bytes` (a whole number of words) in an 8-byte aligned buffer.
+fn words(bytes: &[u8]) -> Words {
+    Words(
+        bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+            .collect(),
+    )
+}
+
+/// Appends `data` at the next 8-byte boundary plus `skew` bytes.
+fn put(bytes: &mut Vec<u8>, skew: usize, data: &[u8]) -> Range<usize> {
+    while bytes.len() % 8 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend(std::iter::repeat_n(0xEE, skew));
+    let start = bytes.len();
+    bytes.extend_from_slice(data);
+    start..bytes.len()
+}
+
+/// `parts`' per-entry columns laid out in one buffer, as a saved index's
+/// map holds them; `skew` bytes before each column misalign it.
+fn share(parts: &IndexParts, skew: usize) -> SharedParts {
+    let mut b = Vec::new();
+    let name_bytes = put(&mut b, skew, &parts.name_bytes);
+    let name_offsets = put(&mut b, skew, bytemuck::cast_slice(&parts.name_offsets));
+    let parents = put(&mut b, skew, bytemuck::cast_slice(&parts.parents));
+    let volumes = put(&mut b, skew, bytemuck::cast_slice(&parts.volumes));
+    let file_ids = put(&mut b, skew, bytemuck::cast_slice(&parts.file_ids));
+    let meta = put(&mut b, skew, bytemuck::cast_slice(&parts.meta));
+    let modified = put(&mut b, skew, bytemuck::cast_slice(&parts.modified));
+    let created = put(&mut b, skew, bytemuck::cast_slice(&parts.created));
+    let ext_ids = put(&mut b, skew, bytemuck::cast_slice(&parts.ext_ids));
+    while b.len() % 8 != 0 {
+        b.push(0);
+    }
+    SharedParts {
+        backing: Arc::new(words(&b)),
+        name_bytes,
+        name_offsets,
+        parents,
+        volumes,
+        file_ids,
+        meta,
+        modified,
+        created,
+        ext_ids,
+        ext_bytes: parts.ext_bytes.clone(),
+        ext_offsets: parts.ext_offsets.clone(),
+        live: parts.live.clone(),
+    }
+}
+
+/// Bytes of the per-entry columns of `parts`.
+fn column_bytes(parts: &IndexParts) -> usize {
+    let n = parts.id_bound();
+    parts.name_bytes.len() + n * (4 + 4 + 4 + 8 + 8 + 8 + 8 + 2)
+}
+
+#[test]
+fn a_shared_index_matches_the_owned_one_and_maps_its_columns() {
+    let parts = rich_index().snapshot().to_parts();
+    let owned = Index::from_parts(parts.clone()).expect("owned");
+    let shared = Index::from_shared(share(&parts, 0)).expect("shared");
+    assert_same(&owned.snapshot(), &shared.snapshot());
+    assert_parts_equal(&owned.snapshot().to_parts(), &shared.snapshot().to_parts());
+    assert_eq!(owned.mapped_bytes(), 0);
+    assert_eq!(shared.mapped_bytes(), column_bytes(&parts));
+    assert_eq!(shared.snapshot().mapped_bytes(), column_bytes(&parts));
+    // The memory report keeps counting every column the index holds.
+    assert!(shared.heap_bytes() >= column_bytes(&parts));
+}
+
+#[test]
+fn misaligned_columns_are_copied_instead() {
+    let parts = rich_index().snapshot().to_parts();
+    let owned = Index::from_parts(parts.clone()).expect("owned");
+    let shared = Index::from_shared(share(&parts, 1)).expect("shared");
+    assert_same(&owned.snapshot(), &shared.snapshot());
+    // Bytes need no alignment, so only the names stay shared.
+    assert_eq!(shared.mapped_bytes(), parts.name_bytes.len());
+}
+
+#[test]
+fn a_shared_index_takes_the_same_later_changes() {
+    let mut owned = rich_index();
+    let mut shared = Index::from_shared(share(&owned.snapshot().to_parts(), 0)).expect("shared");
+    shared.set_compact_fraction(f64::INFINITY);
+    fn op(n: usize, i: &mut Index) -> String {
+        match n {
+            0 => format!("{:?}", i.upsert(file(ka(50), ka(20), "añadido.txt"))),
+            1 => format!("{:?}", i.upsert(file(ka(3), ka(20), "moved-again.txt"))),
+            2 => format!("{:?}", i.upsert(dir(ka(2), Some(ka(1)), "documents"))),
+            3 => format!("{:?}", i.upsert(dir(ka(1), Some(ka(20)), "vol"))),
+            4 => format!("{}", i.remove(ka(20))),
+            _ => format!("{}", i.remove(kb(1))),
+        }
+    }
+    for n in 0..=5 {
+        assert_eq!(op(n, &mut shared), op(n, &mut owned), "op {n}");
+        assert_same(&owned.snapshot(), &shared.snapshot());
+    }
+    assert_eq!(shared.compact(), owned.compact(), "compaction remap");
+    assert_same(&owned.snapshot(), &shared.snapshot());
+    assert_eq!(
+        shared.mapped_bytes(),
+        0,
+        "a compaction builds the base on the heap"
+    );
+}
+
+fn assert_shared_rejected(what: &str, mutate: impl FnOnce(&mut SharedParts)) -> PartsError {
+    let mut parts = share(&small_parts(), 0);
+    mutate(&mut parts);
+    let result = catch_unwind(AssertUnwindSafe(|| Index::from_shared(parts)));
+    match result.unwrap_or_else(|_| panic!("from_shared panicked on {what}")) {
+        Ok(_) => panic!("from_shared accepted {what}"),
+        Err(IndexError::InvalidParts(e)) => e,
+        Err(e) => panic!("{what}: expected a bad-parts error, got {e:?}"),
+    }
+}
+
+#[test]
+fn bad_shared_parts_are_rejected_without_a_panic() {
+    let len = |p: &SharedParts| p.backing.bytes().len();
+    let e = assert_shared_rejected("a column past the end", |p| {
+        p.meta = p.meta.start..len(p) + 8;
+    });
+    assert_eq!(e, PartsError::SharedColumn { column: "meta" });
+    let e = assert_shared_rejected("a column of part values", |p| {
+        p.parents = p.parents.start..p.parents.end - 1;
+    });
+    assert_eq!(e, PartsError::SharedColumn { column: "parents" });
+    let e = assert_shared_rejected("a short column", |p| {
+        p.created = p.created.start..p.created.end - 8;
+    });
+    assert!(
+        matches!(
+            e,
+            PartsError::ColumnLength {
+                column: "created",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let e = assert_shared_rejected("a name that isn't UTF-8", |p| {
+        let mut bytes = p.backing.bytes().to_vec();
+        bytes[p.name_bytes.start] = 0xFF;
+        p.backing = Arc::new(words(&bytes));
+    });
+    assert!(matches!(e, PartsError::NameBuffer { .. }), "{e:?}");
+    assert_shared_rejected("a parent out of range", |p| {
+        let mut bytes = p.backing.bytes().to_vec();
+        bytes[p.parents.start..p.parents.start + 4].copy_from_slice(&77u32.to_le_bytes());
+        p.backing = Arc::new(words(&bytes));
+    });
+}
+
+/// An index whose delta is empty and nothing removed: as after a first
+/// scan or a compaction.
+fn compacted_index() -> Index {
+    let mut index = rich_index();
+    index.compact();
+    assert_eq!((index.delta_len(), index.deleted_len()), (0, 0));
+    index
+}
+
+#[test]
+fn adopt_base_serves_an_exact_base_from_its_save() {
+    let mut index = compacted_index();
+    let mut reference = compacted_index();
+    let saved = index.snapshot();
+    // Changes made while the save is written stay in the delta.
+    for i in [&mut index, &mut reference] {
+        i.upsert(file(ka(70), ka(1), "while saving.txt"))
+            .expect("insert");
+        i.upsert(file(ka(9), ka(1), "p-back.jpg")).expect("move");
+        assert_eq!(i.remove(ka(10)), 1);
+    }
+    let restored = Index::from_shared(share(&saved.to_parts(), 0)).expect("restore");
+    assert!(
+        index.adopt_base(&saved, restored),
+        "an exact base is adopted"
+    );
+    assert_eq!(index.mapped_bytes(), column_bytes(&saved.to_parts()));
+    assert_same(&reference.snapshot(), &index.snapshot());
+    // The index goes on as before: more changes, then a compaction.
+    for i in [&mut index, &mut reference] {
+        i.upsert(file(ka(71), ka(70), "later.md")).ok();
+        i.remove(kb(3));
+    }
+    assert_same(&reference.snapshot(), &index.snapshot());
+    assert_eq!(index.compact(), reference.compact());
+    assert_same(&reference.snapshot(), &index.snapshot());
+}
+
+#[test]
+fn adopt_base_refuses_anything_but_an_exact_save_of_the_current_base() {
+    // The saved snapshot had a delta: its file isn't the base.
+    let mut index = rich_index();
+    let saved = index.snapshot();
+    let restored = Index::from_shared(share(&saved.to_parts(), 0)).expect("restore");
+    assert!(!index.adopt_base(&saved, restored));
+    assert_eq!(index.mapped_bytes(), 0);
+
+    // The base was compacted again after the save.
+    let mut index = compacted_index();
+    let saved = index.snapshot();
+    index.upsert(file(ka(80), ka(1), "x.bin")).expect("insert");
+    index.compact();
+    let restored = Index::from_shared(share(&saved.to_parts(), 0)).expect("restore");
+    assert!(!index.adopt_base(&saved, restored));
+    assert_eq!(index.mapped_bytes(), 0);
+
+    // A snapshot of another index.
+    let mut index = compacted_index();
+    let other = compacted_index().snapshot();
+    let restored = Index::from_shared(share(&other.to_parts(), 0)).expect("restore");
+    assert!(!index.adopt_base(&other, restored));
+}

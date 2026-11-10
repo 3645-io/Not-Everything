@@ -104,7 +104,7 @@ impl IndexBuilder {
             .push(PackedMeta::new(entry.size, entry.kind, entry.flags).0);
         self.base.modified.push(entry.modified);
         self.base.created.push(entry.created);
-        self.base.ext.push(ext);
+        self.base.ext.push(ext.0);
         self.base.volume.push(key.volume.0);
         self.base.file_id.push(key.file_id);
         if self.base.len() * 4 > self.table.len() * 3 {
