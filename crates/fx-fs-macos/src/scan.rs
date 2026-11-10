@@ -63,6 +63,7 @@ use std::ffi::{OsStr, c_int, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -426,6 +427,9 @@ struct Ctx<'a> {
     /// root-relative paths.
     firmlinks: HashSet<Vec<u8>>,
     exclusions: &'a Exclusions,
+    /// Where a streaming scan ([`scan_streaming`]) sends each directory's
+    /// entries; `None` for a collecting scan.
+    emit: Option<&'a SyncSender<Vec<ScannedEntry>>>,
 }
 
 /// Per-thread walker state.
@@ -714,11 +718,31 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// In a streaming scan, sends the entries recorded since the last call
+    /// (one directory's). Called after a directory is scanned and before
+    /// its subdirectories are queued, so every directory's own entry is
+    /// sent before any of its children can be listed: the receiver gets
+    /// each entry after its parent, whichever worker lists what.
+    fn flush(&mut self) {
+        let Some(tx) = self.ctx.emit else {
+            return;
+        };
+        if self.entries.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.entries);
+        self.parent_workers.clear();
+        // A receiver that hung up gets nothing more; the walk still ends
+        // normally with its counters.
+        let _ = tx.send(batch);
+    }
+
     /// Single-threaded walk of everything queued in `self.children`.
     fn run_local(&mut self) {
         let mut stack = std::mem::take(&mut self.children);
         while let Some(item) = stack.pop() {
             self.scan_counted(&item);
+            self.flush();
             stack.append(&mut self.children);
         }
     }
@@ -729,6 +753,7 @@ impl<'a> Worker<'a> {
         let mut finished = false;
         while let Some(item) = shared.exchange(finished, &mut self.children) {
             self.scan_counted(&item);
+            self.flush();
             finished = true;
         }
     }
@@ -785,6 +810,33 @@ impl Shared {
 /// Returns `Err` only when `root` itself cannot be opened or read (for
 /// example it does not exist, is not a directory, or is a symlink).
 pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
+    scan_inner(root, opts, None)
+}
+
+/// Scans like [`scan`], but sends the entries to `out` as the walk lists
+/// them, one directory's entries per message, instead of collecting them
+/// all: a caller that consumes them as they come never holds every entry
+/// at once (run 2.17). Every entry arrives after its parent directory's
+/// own entry; entries directly in the root, and below a traverse-only
+/// directory, arrive with a parent that is never sent. `parent` indices
+/// are not meaningful; `parent_key` is. Returns the counters (`entries` of
+/// the result is `None`). `out` should be bounded, so a slow receiver
+/// slows the walk instead of letting entries pile up.
+pub fn scan_streaming(
+    root: &Path,
+    opts: &ScanOptions,
+    out: &SyncSender<Vec<ScannedEntry>>,
+) -> io::Result<ScanStats> {
+    let mut opts = opts.clone();
+    opts.collect = true;
+    scan_inner(root, &opts, Some(out)).map(|r| r.stats)
+}
+
+fn scan_inner(
+    root: &Path,
+    opts: &ScanOptions,
+    emit: Option<&SyncSender<Vec<ScannedEntry>>>,
+) -> io::Result<ScanResult> {
     let start = Instant::now();
     let root_bytes = root.as_os_str().as_bytes();
     if root_bytes.is_empty() || root_bytes.contains(&0) {
@@ -810,6 +862,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
             .map(|rel| rel.as_os_str().as_bytes().to_vec()),
         firmlinks: firmlinks_below(&canon),
         exclusions: &opts.exclusions,
+        emit,
     };
     let ctx = &ctx;
     let mut main = Worker::new(0, ctx, opts);
@@ -822,6 +875,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
         key: (0, 0),
     };
     main.scan_dir(&root_item)?;
+    main.flush();
 
     let workers = if threads <= 1 {
         main.run_local();
@@ -858,7 +912,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
         })
     };
 
-    let mut result = merge(workers, opts.collect, start)?;
+    let mut result = merge(workers, opts.collect && emit.is_none(), start)?;
     result.stats.materialization_disabled = materialization_disabled;
     Ok(result)
 }

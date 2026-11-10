@@ -86,12 +86,12 @@ mod checkpoint;
 mod config;
 mod health;
 mod memory;
+mod paths;
 mod priority;
 pub mod qos;
 mod query;
 mod reader;
 mod snapshot;
-mod tree;
 mod writer;
 
 use std::io;
@@ -109,9 +109,9 @@ use fx_sort::{Batch, Direction, MatchSet, Order, SortKey};
 
 pub use checkpoint::{CheckpointError, QuitSave};
 pub use config::{
-    DEFAULT_BATCH_WINDOW, DEFAULT_CHECKPOINT_IDLE, DEFAULT_CHECKPOINT_MAX_DELAY,
-    DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_THRESHOLD, EngineConfig, MAX_BATCH_WINDOW,
-    MAX_RESTART_BACKOFF, MIN_BATCH_WINDOW,
+    DEFAULT_BACKGROUND_BATCH_WINDOW, DEFAULT_BATCH_WINDOW, DEFAULT_CHECKPOINT_IDLE,
+    DEFAULT_CHECKPOINT_MAX_DELAY, DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_THRESHOLD, EngineConfig,
+    MAX_BACKGROUND_BATCH_WINDOW, MAX_BATCH_WINDOW, MAX_RESTART_BACKOFF, MIN_BATCH_WINDOW,
 };
 pub use fx_query::QueryOptions;
 pub use health::EngineHealth;
@@ -123,7 +123,6 @@ pub use snapshot::{ENGINE_SORT_KEYS, EngineSnapshot, Generation};
 use checkpoint::Checkpoints;
 use health::HealthState;
 use priority::PriorityFolders;
-use tree::Tree;
 use writer::{Recovery, Writer};
 
 /// State shared between the [`Engine`] handle and its threads.
@@ -132,6 +131,8 @@ pub(crate) struct Shared {
     subscribers: Mutex<Vec<Sender<Generation>>>,
     health: HealthState,
     paused: AtomicBool,
+    /// A window shows the results ([`Engine::set_foreground`]).
+    foreground: AtomicBool,
     stop: AtomicBool,
     checkpoints: Checkpoints,
 }
@@ -162,6 +163,9 @@ pub struct Engine {
     writer: Option<JoinHandle<()>>,
     checkpointer: Option<JoinHandle<()>>,
     searcher: Mutex<Searcher>,
+    /// The window hid while a search held the cache: drop it after that
+    /// search ([`Engine::set_foreground`]).
+    drop_cache: AtomicBool,
     query_generation: fx_query::Generation,
     utc_offset: Option<i32>,
 }
@@ -272,18 +276,14 @@ impl Engine {
         // stable while a batch is recorded.
         index.set_compact_fraction(f64::INFINITY);
         let snap = index.snapshot();
-        let orders: Vec<Order> = orders.unwrap_or_else(|| {
-            ENGINE_SORT_KEYS
-                .iter()
-                .map(|&k| Order::build(&*snap, k))
-                .collect()
-        });
+        let orders: Vec<Order> =
+            orders.unwrap_or_else(|| Order::build_keys(&*snap, &ENGINE_SORT_KEYS));
         let orders = Arc::new(orders);
-        let tree = Tree::from_snapshot(&snap);
         let (include, exclude) = config.priority_folders();
         let priority = PriorityFolders::new(config.root(), include, exclude);
-        let group = priority.group(&tree, &snap, &orders);
-        let full_rescan = force_rescan || outcome != StartOutcome::Resumed || tree.len() == 0;
+        let group = priority.group(&index, &snap, &orders);
+        let full_rescan =
+            force_rescan || outcome != StartOutcome::Resumed || index.live_count() == 0;
         let shared = Arc::new(Shared {
             current: ArcSwap::from_pointee(EngineSnapshot {
                 index: snap,
@@ -300,6 +300,7 @@ impl Engine {
                 EngineHealth::Live
             }),
             paused: AtomicBool::new(false),
+            foreground: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             checkpoints: Checkpoints::new(
                 config.store_path().map(Into::into),
@@ -310,22 +311,24 @@ impl Engine {
         });
         let writer = Writer {
             index,
-            tree,
             orders,
             root: config.root().to_path_buf(),
             window: config.batch_window(),
+            background_window: config.background_batch_window(),
             source,
             stat,
             enumerator,
             shared: Arc::clone(&shared),
             generation: 0,
             batch: Batch::new(),
+            orders_stale: false,
             full_rescan_pending: full_rescan,
             in_full_rescan: false,
             recovery: Recovery::new(config.restart_threshold(), config.restart_backoff()),
             priority,
             group,
             group_stale: false,
+            fresh_base: false,
         };
         let handle = thread::Builder::new()
             .name("fx-engine-writer".into())
@@ -338,6 +341,7 @@ impl Engine {
             writer: Some(handle),
             checkpointer: None,
             searcher: Mutex::new(Searcher::new()),
+            drop_cache: AtomicBool::new(false),
             query_generation: fx_query::Generation::new(),
             utc_offset: config.utc_offset(),
         };
@@ -527,7 +531,11 @@ impl Engine {
             Ok(mut searcher) => {
                 searcher.set_context(ctx);
                 searcher.set_epoch(snap.generation());
-                searcher.search(&text, &opts, snap, cancel)?
+                let hits = searcher.search(&text, &opts, snap, cancel);
+                if self.drop_cache.swap(false, Ordering::AcqRel) && !self.is_foreground() {
+                    searcher.invalidate();
+                }
+                hits?
             }
             // Another thread holds the cache: search without it rather than
             // wait.
@@ -668,6 +676,40 @@ impl Engine {
     /// Whether monitoring is paused.
     pub fn is_paused(&self) -> bool {
         self.shared.paused.load(Ordering::Acquire)
+    }
+
+    /// Tells the engine whether a window shows the results (`true`, the
+    /// default) or none does. Without one, nobody watches the results, so
+    /// the writer collects changes for the background batch window
+    /// ([`EngineConfig::with_background_batch_window`], 2 s by default)
+    /// instead of the batch window, and publishes up to 20 times less
+    /// often. Back in the foreground, a batch being collected ends within a
+    /// quarter of a second, so a window that shows gets the pending changes
+    /// at once.
+    ///
+    /// Going to the background also drops the result sets cached for
+    /// refining a query (up to 8, each as large as its matches): nobody
+    /// searches while no window shows the results (run 2.17).
+    pub fn set_foreground(&self, on: bool) {
+        self.shared.foreground.store(on, Ordering::Release);
+        if !on {
+            match self.searcher.try_lock() {
+                Ok(mut searcher) => searcher.invalidate(),
+                // A search holds the cache: it drops it when done.
+                Err(_) => self.drop_cache.store(true, Ordering::Release),
+            }
+        }
+    }
+
+    /// How many result sets the search cache holds now, for tests and
+    /// measurements. Waits for a search in progress.
+    pub fn cached_searches(&self) -> usize {
+        self.searcher.lock().map_or(0, |searcher| searcher.cached())
+    }
+
+    /// Whether a window shows the results ([`set_foreground`](Self::set_foreground)).
+    pub fn is_foreground(&self) -> bool {
+        self.shared.foreground.load(Ordering::Acquire)
     }
 
     /// Orderly shutdown: stops the writer thread and waits for it to exit,

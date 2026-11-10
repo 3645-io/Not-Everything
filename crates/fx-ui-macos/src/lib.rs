@@ -131,6 +131,7 @@ pub mod latency_probe;
 pub mod limited;
 pub mod main_layout;
 pub mod main_menu;
+pub mod memory_relief;
 pub mod menu;
 #[cfg(feature = "measure")]
 pub mod model;

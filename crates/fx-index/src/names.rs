@@ -12,7 +12,10 @@
 //! Clean-room: written from docs/PLAN.md only.
 
 use std::fmt;
+use std::ops::Range;
+use std::sync::Arc;
 
+use crate::column::{Backing, Column};
 use crate::parts::PartsError;
 
 /// Whether `offsets` are exactly the start offsets of the pieces of `bytes`
@@ -66,13 +69,104 @@ impl std::error::Error for NameError {}
 /// [`bytes`](NameBuffer::bytes) and [`offsets`](NameBuffer::offsets) expose
 /// the raw layout so a matcher can scan names without copying: name `i`
 /// starts at `offsets()[i]` and runs to the next NUL or the end of `bytes()`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A buffer is either owned or a read-only view of a saved index's memory
+/// map ([`from_shared`](NameBuffer::from_shared)); a shared buffer becomes
+/// owned on its first [`push`](NameBuffer::push).
+#[derive(Clone, Default)]
 pub struct NameBuffer {
-    /// Names joined by `'\0'`; no trailing separator. Stored as a `String` so
-    /// slicing a name back out needs neither validation nor `unsafe`.
-    data: String,
+    /// Names joined by `'\0'`; no trailing separator.
+    data: Text,
     /// Byte offset of the first byte of each name, strictly ascending.
-    offsets: Vec<u32>,
+    offsets: Column<u32>,
+}
+
+/// The joined names: an owned `String`, so slicing a name back out needs
+/// neither validation nor `unsafe`, or text in a [`Backing`], which answers
+/// for a range of it.
+#[derive(Clone)]
+enum Text {
+    Owned(String),
+    Shared {
+        backing: Arc<dyn Backing>,
+        start: usize,
+        len: usize,
+    },
+}
+
+impl Default for Text {
+    fn default() -> Self {
+        Text::Owned(String::new())
+    }
+}
+
+impl Text {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Text::Owned(s) => s.as_bytes(),
+            Text::Shared {
+                backing,
+                start,
+                len,
+            } => &backing.bytes()[*start..*start + *len],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Text::Owned(s) => s.len(),
+            Text::Shared { len, .. } => *len,
+        }
+    }
+
+    fn get(&self, range: Range<usize>) -> Option<&str> {
+        match self {
+            Text::Owned(s) => s.get(range),
+            Text::Shared {
+                backing,
+                start,
+                len,
+            } => {
+                if range.start > range.end || range.end > *len {
+                    return None;
+                }
+                backing.text(start + range.start..start + range.end)
+            }
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.get(0..self.len())
+            .expect("a shared name buffer is validated as UTF-8 when it is made")
+    }
+
+    fn to_mut(&mut self) -> &mut String {
+        if let Text::Shared { .. } = self {
+            *self = Text::Owned(self.as_str().to_owned());
+        }
+        match self {
+            Text::Owned(s) => s,
+            Text::Shared { .. } => unreachable!("converted to owned above"),
+        }
+    }
+}
+
+impl PartialEq for NameBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.bytes() == other.data.bytes() && self.offsets[..] == other.offsets[..]
+    }
+}
+
+impl Eq for NameBuffer {}
+
+impl fmt::Debug for NameBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NameBuffer")
+            .field("names", &self.offsets.len())
+            .field("bytes", &self.data.len())
+            .field("shared", &matches!(self.data, Text::Shared { .. }))
+            .finish()
+    }
 }
 
 impl NameBuffer {
@@ -85,8 +179,8 @@ impl NameBuffer {
     /// `bytes` bytes (separators included).
     pub fn with_capacity(names: usize, bytes: usize) -> Self {
         Self {
-            data: String::with_capacity(bytes),
-            offsets: Vec::with_capacity(names),
+            data: Text::Owned(String::with_capacity(bytes)),
+            offsets: Column::Owned(Vec::with_capacity(names)),
         }
     }
 
@@ -104,7 +198,7 @@ impl NameBuffer {
             return Err(NameError::ContainsNul);
         }
         let index = u32::try_from(self.offsets.len()).map_err(|_| NameError::Overflow)?;
-        let separator = usize::from(!self.data.is_empty());
+        let separator = usize::from(self.data.len() != 0);
         let start = self
             .data
             .len()
@@ -118,10 +212,11 @@ impl NameBuffer {
         }
         let start = u32::try_from(start).map_err(|_| NameError::Overflow)?;
 
+        let data = self.data.to_mut();
         if separator == 1 {
-            self.data.push('\0');
+            data.push('\0');
         }
-        self.data.push_str(name);
+        data.push_str(name);
         self.offsets.push(start);
         Ok(index)
     }
@@ -147,7 +242,53 @@ impl NameBuffer {
         let data = String::from_utf8(bytes).map_err(|_| PartsError::NameBuffer {
             reason: "name bytes are not valid UTF-8",
         })?;
-        Ok(Self { data, offsets })
+        Ok(Self {
+            data: Text::Owned(data),
+            offsets: Column::Owned(offsets),
+        })
+    }
+
+    /// A buffer over the names at `bytes` and the `u32` offsets at
+    /// `offsets` in `backing`, checked like
+    /// [`from_raw_parts`](NameBuffer::from_raw_parts) but not copied: the
+    /// layout must match and the backing must vouch for the text as UTF-8.
+    pub fn from_shared(
+        backing: &Arc<dyn Backing>,
+        bytes: Range<usize>,
+        offsets: Range<usize>,
+    ) -> Result<Self, PartsError> {
+        let offsets: Column<u32> =
+            Column::shared(backing, offsets).ok_or(PartsError::NameBuffer {
+                reason: "name offsets are out of bounds or not whole u32 values",
+            })?;
+        let Some(raw) = backing.bytes().get(bytes.clone()) else {
+            return Err(PartsError::NameBuffer {
+                reason: "name bytes are out of bounds",
+            });
+        };
+        if u32::try_from(raw.len()).is_err() {
+            return Err(PartsError::NameBuffer {
+                reason: "name bytes exceed the u32 offset space",
+            });
+        }
+        if !nul_separated_layout_matches(raw, &offsets) {
+            return Err(PartsError::NameBuffer {
+                reason: "name offsets do not match the NUL-separated name bytes",
+            });
+        }
+        if backing.text(bytes.clone()).is_none() {
+            return Err(PartsError::NameBuffer {
+                reason: "name bytes are not valid UTF-8",
+            });
+        }
+        Ok(Self {
+            data: Text::Shared {
+                backing: Arc::clone(backing),
+                start: bytes.start,
+                len: bytes.len(),
+            },
+            offsets,
+        })
     }
 
     /// Returns name `index`.
@@ -169,8 +310,10 @@ impl NameBuffer {
     /// Returns name `index`, or `None` if it is out of range.
     pub fn try_get(&self, index: u32) -> Option<&str> {
         let i = usize::try_from(index).ok()?;
-        let start = *self.offsets.get(i)? as usize;
-        let end = match self.offsets.get(i + 1) {
+        // One look at a shared column, not two.
+        let offsets: &[u32] = &self.offsets;
+        let start = *offsets.get(i)? as usize;
+        let end = match offsets.get(i + 1) {
             // The next name starts right after this name's NUL separator.
             Some(&next) => next as usize - 1,
             None => self.data.len(),
@@ -191,7 +334,7 @@ impl NameBuffer {
     /// The raw buffer: all names joined by a single NUL byte, with no
     /// trailing NUL.
     pub fn bytes(&self) -> &[u8] {
-        self.data.as_bytes()
+        self.data.bytes()
     }
 
     /// Start offset of each name in [`bytes`](NameBuffer::bytes), one per
@@ -205,7 +348,7 @@ impl NameBuffer {
         // Names never contain NUL, so splitting on it recovers them exactly.
         // An empty buffer would yield one empty piece, so skip that case.
         let n = self.len();
-        self.data.split('\0').take(n)
+        self.data.as_str().split('\0').take(n)
     }
 
     /// Heap memory owned by the buffer, in bytes (allocated capacity of the
@@ -216,17 +359,33 @@ impl NameBuffer {
 
     /// Allocated capacity of the name bytes alone.
     pub(crate) fn data_heap_bytes(&self) -> usize {
-        self.data.capacity()
+        match &self.data {
+            Text::Owned(s) => s.capacity(),
+            Text::Shared { len, .. } => *len,
+        }
     }
 
     /// Allocated capacity of the offsets alone.
     pub(crate) fn offsets_heap_bytes(&self) -> usize {
-        self.offsets.capacity() * std::mem::size_of::<u32>()
+        self.offsets.held_bytes()
+    }
+
+    /// Bytes of names and offsets served from a backing instead of the
+    /// heap (both are still counted by [`heap_bytes`](NameBuffer::heap_bytes),
+    /// which keeps its meaning for a shared buffer).
+    pub fn mapped_bytes(&self) -> usize {
+        let data = match &self.data {
+            Text::Owned(_) => 0,
+            Text::Shared { len, .. } => *len,
+        };
+        data + self.offsets.mapped_bytes()
     }
 
     /// Releases spare capacity.
     pub fn shrink_to_fit(&mut self) {
-        self.data.shrink_to_fit();
+        if let Text::Owned(s) = &mut self.data {
+            s.shrink_to_fit();
+        }
         self.offsets.shrink_to_fit();
     }
 }

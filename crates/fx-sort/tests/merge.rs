@@ -978,3 +978,45 @@ fn moved_entries_count_as_upserted_for_attribute_orders() {
     batch.moved(EntryId(9));
     apply_and_check(&mut orders, &m, &batch, "moved with attribute changes");
 }
+
+// ---------------------------------------------------------------------------
+// Merging from an order shared with snapshots (run 2.14).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn applied_leaves_its_order_alone_and_equals_apply() {
+    for seed in 0..6u64 {
+        let mut rng = Rng::new(0xA991_0000 + seed);
+        let mut m = random_mock(&mut rng, 300);
+        let mut orders = build_all(&m);
+        for round in 0..60 {
+            let mut batch = Batch::new();
+            for _ in 0..1 + rng.below(12) {
+                random_change(&mut rng, &mut m, &mut batch);
+            }
+            for order in orders.iter_mut() {
+                let before = order.clone();
+                let next = order.applied(&m, &batch);
+                assert_eq!(
+                    *order, before,
+                    "seed {seed} round {round}: applied changed the order it read"
+                );
+                let mut expected = order.clone();
+                expected.apply(&m, &batch);
+                assert_eq!(
+                    next, expected,
+                    "seed {seed} round {round}: applied differs from apply"
+                );
+                *order = next;
+            }
+        }
+    }
+}
+
+#[test]
+fn applied_with_an_empty_batch_is_a_copy() {
+    let m = small_tree();
+    for order in build_all(&m) {
+        assert_eq!(order.applied(&m, &Batch::new()), order);
+    }
+}

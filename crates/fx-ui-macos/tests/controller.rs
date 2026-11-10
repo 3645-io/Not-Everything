@@ -9,7 +9,10 @@ use fx_engine::Generation;
 use fx_query::Cancelled;
 use fx_sort::{Direction, SortKey};
 use fx_ui_macos::columns::{Column, SortState};
-use fx_ui_macos::controller::{DEFAULT_ROW_WINDOW, DEFAULT_THROTTLE, RequestId, ResultsController};
+use fx_ui_macos::controller::{
+    DEFAULT_ROW_WINDOW, DEFAULT_THROTTLE, MAX_RERUN_SPACING, RERUN_COST_FACTOR, RequestId,
+    ResultsController,
+};
 #[cfg(feature = "measure")]
 use fx_ui_macos::source::SyntheticSource;
 use fx_ui_macos::source::{ResultPage, ResultsSource, Row, RowPositions, SourceStatus};
@@ -65,6 +68,8 @@ struct State {
     cancels: usize,
     row_generations: Vec<Generation>,
     subscribers: Vec<Sender<Generation>>,
+    /// Every `set_window_visible` call, in order.
+    window_visible: Vec<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -256,6 +261,10 @@ impl ResultsSource for FakeSource {
         let (tx, rx) = channel();
         self.lock().subscribers.push(tx);
         rx
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        self.lock().window_visible.push(visible);
     }
 }
 
@@ -1081,4 +1090,83 @@ fn a_kept_selection_follows_the_grouped_order() {
         .expect("a live update re-runs the search");
     refresh(&mut ctl, rerun);
     assert_eq!(ctl.reselect(true).expect("restored").rows, [2]);
+}
+
+// ---------------------------------------------------------------------------
+// Background cost (run 2.14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rerun_spacing_constants() {
+    assert_eq!(RERUN_COST_FACTOR, 32);
+    assert_eq!(MAX_RERUN_SPACING, Duration::from_millis(500));
+}
+
+#[test]
+fn reruns_are_spaced_by_the_last_search_time() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("");
+    refresh(&mut ctl, req);
+    let r = ctl.on_generation(fake.bump(), t0).expect("re-runs");
+    refresh(&mut ctl, r);
+    // A 10 ms search: the next re-run waits 32 times that, 320 ms.
+    ctl.note_search_time(Duration::from_millis(10));
+    assert!(ctl.on_generation(fake.bump(), t0 + 150 * MS).is_none());
+    assert!(ctl.tick(t0 + 300 * MS).is_none(), "still inside 320 ms");
+    assert!(ctl.tick(t0 + 330 * MS).is_some());
+}
+
+#[test]
+fn rerun_spacing_stays_between_the_throttle_and_half_a_second() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let req = ctl.set_query("");
+    refresh(&mut ctl, req);
+
+    // A fast search keeps the 100 ms throttle.
+    let r = ctl.on_generation(fake.bump(), t0).expect("re-runs");
+    refresh(&mut ctl, r);
+    ctl.note_search_time(Duration::from_micros(500));
+    assert!(ctl.on_generation(fake.bump(), t0 + 90 * MS).is_none());
+    let r = ctl.tick(t0 + 100 * MS).expect("100 ms is the floor");
+    refresh(&mut ctl, r);
+
+    // A slow search waits at most 500 ms, within Goal 3's second.
+    ctl.note_search_time(Duration::from_millis(200));
+    assert!(ctl.on_generation(fake.bump(), t0 + 500 * MS).is_none());
+    assert!(ctl.tick(t0 + 590 * MS).is_none());
+    assert!(ctl.tick(t0 + 600 * MS).is_some(), "500 ms is the ceiling");
+}
+
+#[test]
+fn a_longer_configured_throttle_still_holds() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone()).with_throttle(Duration::from_millis(800));
+    let req = ctl.set_query("");
+    refresh(&mut ctl, req);
+    let r = ctl.on_generation(fake.bump(), t0).expect("re-runs");
+    refresh(&mut ctl, r);
+    ctl.note_search_time(Duration::from_millis(1));
+    assert!(ctl.on_generation(fake.bump(), t0 + 600 * MS).is_none());
+    assert!(ctl.tick(t0 + 800 * MS).is_some());
+}
+
+#[test]
+fn the_controller_tells_its_source_when_the_window_shows_or_hides() {
+    let fake = sample();
+    let t0 = Instant::now();
+    let mut ctl = ResultsController::new(fake.clone());
+    let _ = ctl.set_visible(false, t0);
+    let _ = ctl.set_visible(false, t0 + MS);
+    let _ = ctl.set_visible(true, t0 + 2 * MS);
+    let _ = ctl.set_visible(true, t0 + 3 * MS);
+    assert_eq!(
+        fake.lock().window_visible,
+        vec![false, true],
+        "told once per change, so the engine batches longer while hidden"
+    );
 }

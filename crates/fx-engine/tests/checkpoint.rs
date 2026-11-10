@@ -949,3 +949,87 @@ fn saves_into_a_folder_the_engine_may_not_change_succeed() {
     assert_eq!(saved, tree.entries());
     assert!(clean, "the shutdown save was written too");
 }
+
+// ---------------------------------------------------------------------------
+// Run 2.17 step 2: the base is served from the store's memory map.
+// ---------------------------------------------------------------------------
+
+/// Bytes every entry has in the mapped per-entry columns, names aside:
+/// name offset, parent, volume, file ID, meta, two times and extension.
+const MAPPED_PER_ENTRY: usize = 4 + 4 + 4 + 8 + 8 + 8 + 8 + 2;
+
+/// Whether every entry of `snap` sits in a base served from the store.
+fn whole_base_mapped(snap: &fx_engine::EngineSnapshot) -> bool {
+    let idx = snap.index();
+    idx.mapped_bytes() >= idx.id_bound() * MAPPED_PER_ENTRY
+}
+
+#[test]
+fn after_the_first_scan_is_saved_its_base_is_served_from_the_store() {
+    let dir = TempDir::new("mapped-first-scan");
+    let store = dir.store();
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = open(&tree, &source, store_config(&store));
+    wait_for_tree(&engine, &tree, "first full scan");
+    let snap = wait_for(&engine, "the base served from the store", whole_base_mapped);
+    assert_eq!(index_entries(snap.index()), tree.entries());
+    assert_orders_match(&snap);
+
+    // Changes go on applying on top of the mapped base.
+    tree.touch("/vol/a/after.txt", 3);
+    tree.remove("/vol/b/y.txt");
+    source.push(vec![check("/vol/a/after.txt"), check("/vol/b/y.txt")]);
+    let snap = wait_for_tree(&engine, &tree, "changes after the swap");
+    assert!(snap.index().mapped_bytes() > 0, "the base stays mapped");
+    assert_orders_match(&snap);
+    engine.shutdown();
+}
+
+#[test]
+fn a_loaded_store_is_served_from_its_map() {
+    let dir = TempDir::new("mapped-load");
+    let store = dir.store();
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let (engine, _) = first_run(&tree, &source, &store);
+    engine.shutdown();
+
+    let engine = open(&tree, &source, store_config(&store));
+    let snap = wait_for_tree(&engine, &tree, "the loaded index");
+    assert!(
+        snap.index().mapped_bytes() > 0,
+        "a loaded base is served from the store's map"
+    );
+    assert_orders_match(&snap);
+    engine.shutdown();
+}
+
+#[test]
+fn a_compaction_moves_the_new_base_to_the_store_again() {
+    let dir = TempDir::new("mapped-compaction");
+    let store = dir.store();
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = open(&tree, &source, store_config(&store));
+    wait_for_tree(&engine, &tree, "first full scan");
+    wait_for(
+        &engine,
+        "the first base served from the store",
+        whole_base_mapped,
+    );
+
+    // More new entries than the compaction limit (1,024 rows at this size).
+    tree.add_files("/vol/b", "many", 1_500);
+    let changes = (0..1_500)
+        .map(|n| check(&format!("/vol/b/many{n}.dat")))
+        .collect();
+    source.push(changes);
+    wait_for_tree(&engine, &tree, "the compacted index");
+    let snap = wait_for(&engine, "the compacted base served from the store", |s| {
+        s.index().live_count() == s.index().id_bound() && whole_base_mapped(s)
+    });
+    assert_eq!(index_entries(snap.index()), tree.entries());
+    assert_orders_match(&snap);
+    engine.shutdown();
+}

@@ -974,3 +974,22 @@ fn hidden_entries_are_the_live_names_starting_with_a_dot() {
     let empty = random_mock(1, 0);
     assert!(hidden_entries(&Order::build(&empty, SortKey::Name), &empty).is_empty());
 }
+
+#[test]
+fn build_keys_equals_building_each_key_alone() {
+    for seed in 0..4u64 {
+        let m = random_mock(0xB11D_0000 + seed, 500);
+        let keys = [
+            SortKey::Name,
+            SortKey::Path,
+            SortKey::Size,
+            SortKey::Modified,
+        ];
+        let built = Order::build_keys(&m, &keys);
+        assert_eq!(built.len(), keys.len());
+        for (order, &key) in built.iter().zip(&keys) {
+            assert_eq!(*order, Order::build(&m, key), "seed {seed}: {key:?}");
+        }
+    }
+    assert!(Order::build_keys(&random_mock(1, 10), &[]).is_empty());
+}

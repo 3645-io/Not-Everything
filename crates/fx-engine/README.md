@@ -154,8 +154,11 @@ per entry ID; 0 without priority folders). This is real heap accounting: the ind
 `Index::heap_bytes()` (allocated capacities, not lengths) without the
 writer-only parts. The engine keeps no folded search copy (the matcher
 folds while scanning), so that column is 0. Writer-only structures (the
-path tree, live-children counts, a pending compaction remap) and the
-query refinement cache are not part of a snapshot and are not counted.
+index's children index, a pending compaction remap) and the query
+refinement cache are not part of a snapshot and are not counted. Since
+run 2.17 the writer keeps no copy of the entries of its own: it finds the
+entry a changed path names, compares entries and lists subtrees through
+the index (`Index::child`, `Index::get`, `Index::subtree`).
 The benchmarks print the report with a `memory_` prefix and
 `GATE memory <= 100 B per entry`. `tests/gate_metrics.rs` checks
 ≤100 B per entry for 100k fx-bench entries in CI, that the total covers

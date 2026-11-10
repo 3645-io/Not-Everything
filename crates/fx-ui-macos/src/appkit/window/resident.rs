@@ -258,6 +258,7 @@ impl WinController {
             return;
         };
         self.start_look();
+        crate::memory_relief::start();
 
         if want_hotkey {
             self.start_hotkey();

@@ -11,10 +11,13 @@
 //! concurrency") and the in-repo fx-index code only.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytemuck::Pod;
 use fx_model::EntryId;
 
+use crate::column::{Backing, Column};
 use crate::extensions::{ExtId, ExtensionTable};
 use crate::names::NameBuffer;
 use crate::store::{Base, Bitset, Delta, State};
@@ -146,6 +149,12 @@ pub enum PartsError {
         /// The extension ID.
         ext: u16,
     },
+    /// A shared column's byte range is out of bounds or not a whole number
+    /// of values ([`Index::from_shared`](crate::Index::from_shared)).
+    SharedColumn {
+        /// Name of the column.
+        column: &'static str,
+    },
     /// Two live entries share a `FileKey`.
     DuplicateKey {
         /// The earlier entry.
@@ -186,6 +195,12 @@ impl fmt::Display for PartsError {
             PartsError::BadExtId { id, ext } => {
                 write!(f, "entry {id} has extension ID {ext}, not in the table")
             }
+            PartsError::SharedColumn { column } => {
+                write!(
+                    f,
+                    "shared column {column} is out of bounds or not whole values"
+                )
+            }
             PartsError::DuplicateKey { first, second } => {
                 write!(f, "live entries {first} and {second} share a file key")
             }
@@ -204,13 +219,13 @@ pub(crate) fn export(state: &State) -> IndexParts {
 
     // Start from copies of the base columns, then patch overrides and
     // append the new rows.
-    let mut parents = base.parent.clone();
-    let mut volumes = base.volume.clone();
-    let mut file_ids = base.file_id.clone();
-    let mut meta = base.meta.clone();
-    let mut modified = base.modified.clone();
-    let mut created = base.created.clone();
-    let mut ext_ids: Vec<u16> = base.ext.iter().map(|e| e.0).collect();
+    let mut parents = base.parent.to_vec();
+    let mut volumes = base.volume.to_vec();
+    let mut file_ids = base.file_id.to_vec();
+    let mut meta = base.meta.to_vec();
+    let mut modified = base.modified.to_vec();
+    let mut created = base.created.to_vec();
+    let mut ext_ids = base.ext.to_vec();
     for (&id, row) in &delta.overrides {
         let i = id as usize;
         parents[i] = row.parent;
@@ -288,18 +303,131 @@ fn push_name(bytes: &mut Vec<u8>, offsets: &mut Vec<u32>, name: &str) {
 
 /// Validates `parts` and builds the index state plus the live child count
 /// per entry. Never panics on bad input.
-pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError> {
+pub(crate) fn restore(parts: IndexParts) -> Result<State, PartsError> {
     let n = parts.parents.len();
-    let columns: [(&'static str, usize); 8] = [
-        ("name_offsets", parts.name_offsets.len()),
-        ("volumes", parts.volumes.len()),
-        ("file_ids", parts.file_ids.len()),
-        ("meta", parts.meta.len()),
-        ("modified", parts.modified.len()),
-        ("created", parts.created.len()),
-        ("ext_ids", parts.ext_ids.len()),
-        ("parents", n),
-    ];
+    check_lengths(
+        n,
+        [
+            ("name_offsets", parts.name_offsets.len()),
+            ("volumes", parts.volumes.len()),
+            ("file_ids", parts.file_ids.len()),
+            ("meta", parts.meta.len()),
+            ("modified", parts.modified.len()),
+            ("created", parts.created.len()),
+            ("ext_ids", parts.ext_ids.len()),
+            ("parents", n),
+        ],
+    )?;
+    let deleted = live_to_deleted(&parts.live, n)?;
+    let exts = ExtensionTable::from_raw_parts(parts.ext_bytes, parts.ext_offsets)?;
+    check_rows(
+        &parts.meta,
+        &parts.ext_ids,
+        exts.len(),
+        &parts.parents,
+        &deleted,
+    )?;
+    let names = NameBuffer::from_raw_parts(parts.name_bytes, parts.name_offsets)?;
+    let base = Base {
+        names,
+        parent: parts.parents.into(),
+        meta: parts.meta.into(),
+        modified: parts.modified.into(),
+        created: parts.created.into(),
+        ext: parts.ext_ids.into(),
+        volume: parts.volumes.into(),
+        file_id: parts.file_ids.into(),
+        table: Vec::new(),
+    };
+    finish(base, deleted, exts)
+}
+
+/// An index's columns inside a [`Backing`], such as a saved index's memory
+/// map, as byte ranges, for [`Index::from_shared`](crate::Index::from_shared).
+/// Every per-entry column has one value per entry ID, as in [`IndexParts`].
+/// The extension table and the live bitmap are small, so they come owned.
+#[derive(Debug, Clone)]
+pub struct SharedParts {
+    /// The buffer every range below points into.
+    pub backing: Arc<dyn Backing>,
+    /// Names joined by NUL, no trailing separator.
+    pub name_bytes: Range<usize>,
+    /// `u32` start offset of each name.
+    pub name_offsets: Range<usize>,
+    /// `u32` parent ID per entry.
+    pub parents: Range<usize>,
+    /// `u32` volume per entry.
+    pub volumes: Range<usize>,
+    /// `u64` file ID per entry.
+    pub file_ids: Range<usize>,
+    /// `u64` packed size, kind and flags per entry.
+    pub meta: Range<usize>,
+    /// `i64` modified time per entry.
+    pub modified: Range<usize>,
+    /// `i64` created time per entry.
+    pub created: Range<usize>,
+    /// `u16` extension ID per entry.
+    pub ext_ids: Range<usize>,
+    /// The extension table's bytes, as in [`IndexParts::ext_bytes`].
+    pub ext_bytes: Vec<u8>,
+    /// The extension table's offsets, as in [`IndexParts::ext_offsets`].
+    pub ext_offsets: Vec<u32>,
+    /// Live bitmap, as in [`IndexParts::live`].
+    pub live: Vec<u64>,
+}
+
+/// [`restore`] for columns that stay in their backing: the same checks,
+/// without copying the columns.
+pub(crate) fn restore_shared(parts: SharedParts) -> Result<State, PartsError> {
+    fn column<T: Pod>(
+        backing: &Arc<dyn Backing>,
+        range: Range<usize>,
+        name: &'static str,
+    ) -> Result<Column<T>, PartsError> {
+        Column::shared(backing, range).ok_or(PartsError::SharedColumn { column: name })
+    }
+    let b = &parts.backing;
+    let parent: Column<u32> = column(b, parts.parents, "parents")?;
+    let volume: Column<u32> = column(b, parts.volumes, "volumes")?;
+    let file_id: Column<u64> = column(b, parts.file_ids, "file_ids")?;
+    let meta: Column<u64> = column(b, parts.meta, "meta")?;
+    let modified: Column<i64> = column(b, parts.modified, "modified")?;
+    let created: Column<i64> = column(b, parts.created, "created")?;
+    let ext: Column<u16> = column(b, parts.ext_ids, "ext_ids")?;
+    let names = NameBuffer::from_shared(b, parts.name_bytes, parts.name_offsets)?;
+    let n = parent.len();
+    check_lengths(
+        n,
+        [
+            ("name_offsets", names.len()),
+            ("volumes", volume.len()),
+            ("file_ids", file_id.len()),
+            ("meta", meta.len()),
+            ("modified", modified.len()),
+            ("created", created.len()),
+            ("ext_ids", ext.len()),
+            ("parents", n),
+        ],
+    )?;
+    let deleted = live_to_deleted(&parts.live, n)?;
+    let exts = ExtensionTable::from_raw_parts(parts.ext_bytes, parts.ext_offsets)?;
+    check_rows(&meta, &ext, exts.len(), &parent, &deleted)?;
+    let base = Base {
+        names,
+        parent,
+        meta,
+        modified,
+        created,
+        ext,
+        volume,
+        file_id,
+        table: Vec::new(),
+    };
+    finish(base, deleted, exts)
+}
+
+/// Every per-entry column has `n` values, and `n` fits the index's IDs.
+fn check_lengths(n: usize, columns: [(&'static str, usize); 8]) -> Result<(), PartsError> {
     for (column, found) in columns {
         if found != n {
             return Err(PartsError::ColumnLength {
@@ -313,18 +441,33 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
     if n > (u32::MAX - 1) as usize {
         return Err(PartsError::TooManyEntries { count: n });
     }
+    Ok(())
+}
+
+/// The deletion bitset of `n` entries from the live bitmap.
+fn live_to_deleted(live: &[u64], n: usize) -> Result<Bitset, PartsError> {
     let needed = n.div_ceil(64);
-    if parts.live.len() < needed {
+    if live.len() < needed {
         return Err(PartsError::LiveBitmapTooShort {
             needed,
-            found: parts.live.len(),
+            found: live.len(),
         });
     }
+    Ok(deleted_bitset(&live[..needed], n))
+}
 
-    let deleted = deleted_bitset(&parts.live[..needed], n);
+/// Meta values, extension IDs and parents are valid, and live entries'
+/// parents are live and acyclic.
+fn check_rows(
+    meta: &[u64],
+    ext_ids: &[u16],
+    ext_count: usize,
+    parents: &[u32],
+    deleted: &Bitset,
+) -> Result<(), PartsError> {
+    let n = parents.len();
     let is_live = |i: usize| !deleted.get(i);
-
-    for (i, &m) in parts.meta.iter().enumerate() {
+    for (i, &m) in meta.iter().enumerate() {
         if m & META_RESERVED != 0 || m & META_KIND_UNUSED == META_KIND_UNUSED {
             return Err(PartsError::BadMeta {
                 id: i as u32,
@@ -332,10 +475,7 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
             });
         }
     }
-
-    let exts = ExtensionTable::from_raw_parts(parts.ext_bytes, parts.ext_offsets)?;
-    let ext_count = exts.len();
-    for (i, &e) in parts.ext_ids.iter().enumerate() {
+    for (i, &e) in ext_ids.iter().enumerate() {
         let ext = ExtId(e);
         if ext.is_real() && usize::from(e) > ext_count {
             return Err(PartsError::BadExtId {
@@ -344,10 +484,8 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
             });
         }
     }
-
     // Parents: in range for every entry; live and acyclic for live ones.
-    let mut children = vec![0u32; n];
-    for (i, &p) in parts.parents.iter().enumerate() {
+    for (i, &p) in parents.iter().enumerate() {
         if p == u32::MAX {
             continue;
         }
@@ -358,37 +496,22 @@ pub(crate) fn restore(parts: IndexParts) -> Result<(State, Vec<u32>), PartsError
                 parent: p,
             });
         }
-        if is_live(i) {
-            children[pi] += 1;
-        }
     }
-    check_acyclic(&parts.parents, &deleted)?;
+    check_acyclic(parents, deleted)
+}
 
-    let names = NameBuffer::from_raw_parts(parts.name_bytes, parts.name_offsets)?;
-
-    let mut base = Base {
-        names,
-        parent: parts.parents,
-        meta: parts.meta,
-        modified: parts.modified,
-        created: parts.created,
-        ext: parts.ext_ids.into_iter().map(ExtId).collect(),
-        volume: parts.volumes,
-        file_id: parts.file_ids,
-        table: Vec::new(),
-    };
+/// The state over `base`: its key table built, the delta empty.
+fn finish(mut base: Base, deleted: Bitset, exts: ExtensionTable) -> Result<State, PartsError> {
     base.build_live_table(&deleted)
         .map_err(|(first, second)| PartsError::DuplicateKey { first, second })?;
-
-    let live = n - deleted.ones;
-    let state = State {
+    let live = base.len() - deleted.ones;
+    Ok(State {
         base: Arc::new(base),
         delta: Arc::new(Delta::default()),
         deleted: Arc::new(deleted),
         exts: Arc::new(exts),
         live,
-    };
-    Ok((state, children))
+    })
 }
 
 /// The deletion bitset for `len` IDs from live-bitmap words (exactly
