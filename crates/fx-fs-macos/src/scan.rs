@@ -213,8 +213,14 @@ pub struct ScanOptions {
     pub stream_budget: usize,
 }
 
-/// Default [`ScanOptions::stream_budget`].
-pub const DEFAULT_STREAM_BUDGET: usize = 8 << 20;
+/// Default [`ScanOptions::stream_budget`]: 1 MiB, about nine chunks of
+/// entries. Measured on an M4 Pro over a 3.2M-entry disk (`rescan_bench`,
+/// `first_run_bench`): a rescan's walk peaked at 37 MB of heap with any
+/// budget from 256 KiB to 4 MiB, against 76 to 84 MB with the 256-message
+/// channel before it, and neither the rescan nor the first scan got
+/// slower. A larger budget only holds more: on a tree of small folders,
+/// 8 MiB held more than the 256 messages did.
+pub const DEFAULT_STREAM_BUDGET: usize = 1 << 20;
 
 /// The most entries a streaming scan sends in one message: a big folder's
 /// entries go in several, so no message (and no walker's pending list)

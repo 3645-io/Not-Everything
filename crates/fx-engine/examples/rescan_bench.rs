@@ -14,14 +14,18 @@
 //! times. For each rescan it reads the live heap (counted by this binary's
 //! allocator) and the physical footprint (`proc_pid_rusage`, every 5 ms),
 //! both above their values just before it, after freed pages were handed
-//! back as the app does every 15 s.
+//! back as the app does every 15 s. The heap is read twice: its peak while
+//! the scanner walks the folder (the walk's own share, the scanner's buffer
+//! included) and its peak over the whole rescan, which adds the commit that
+//! publishes the result.
 //!
 //! `--stream-kb N` sets the scanner's buffer (`ScanOptions::stream_budget`)
 //! to compare sizes; the default is the scanner's own.
 //!
 //! Output: `metric=value` lines (see the crate README): `rescan_entries`,
-//! `rescan_p50_ms`, `rescan_max_ms`, `rescan_heap_peak_mb` and
-//! `rescan_footprint_peak_mb` (the largest over the runs). Exit codes: 0
+//! `rescan_p50_ms`, `rescan_max_ms`, `rescan_walk_heap_peak_mb`,
+//! `rescan_heap_peak_mb` and `rescan_footprint_peak_mb` (the largest over
+//! the runs). Exit codes: 0
 //! after the rescans, 1 on an error or timeout, 2 for bad arguments. On
 //! hosts other than macOS it prints a message and exits with 0.
 //!
@@ -58,12 +62,12 @@ mod bench {
     use crate::bench_common::{Flags, TempRoot, UsageError, header, metric, stats};
     use fx_bench::{TreeShape, generate_tree, materialize};
     use fx_engine::{Engine, EngineConfig, EngineHealth};
-    use fx_fs::ChangeSource;
+    use fx_fs::{ChangeSource, VolumeEnumerator};
     use fx_fs_macos::enumerator::MacScanner;
     use fx_fs_macos::path_stat::MacPathStat;
     use fx_fs_macos::scan::ScanOptions;
     use fx_index::Index;
-    use fx_model::{Change, ResumeCursor, StartOutcome};
+    use fx_model::{Change, Entry, ResumeCursor, StartOutcome};
 
     const USAGE: &str = "\
 usage:
@@ -85,10 +89,31 @@ usage:
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     /// The most `LIVE` has reached since it was last reset.
     static PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// Set while the scanner walks ([`Walk`]).
+    static WALKING: AtomicBool = AtomicBool::new(false);
+    /// The most `LIVE` has reached while the scanner walked, since it was
+    /// last reset.
+    static WALK_PEAK: AtomicUsize = AtomicUsize::new(0);
 
     fn grew(by: usize) {
         let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
         PEAK.fetch_max(now, Ordering::Relaxed);
+        if WALKING.load(Ordering::Relaxed) {
+            WALK_PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+
+    /// The macOS scanner, with the heap's peak read while it walks.
+    struct Walk(MacScanner);
+
+    impl VolumeEnumerator for Walk {
+        fn enumerate(&self, root: &Path, sink: &mut dyn FnMut(Entry)) -> fx_fs::Result<()> {
+            WALK_PEAK.fetch_max(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+            WALKING.store(true, Ordering::Relaxed);
+            let listed = self.0.enumerate(root, sink);
+            WALKING.store(false, Ordering::Relaxed);
+            listed
+        }
     }
 
     // SAFETY: every call is forwarded unchanged to the system allocator,
@@ -329,7 +354,7 @@ usage:
                 .with_background_batch_window(Duration::from_millis(20)),
             source.clone(),
             MacPathStat::new(),
-            MacScanner::new(opts),
+            Walk(MacScanner::new(opts)),
         )?;
         let t = Instant::now();
         wait(&engine, args.timeout, |e| {
@@ -354,6 +379,7 @@ usage:
 
         let mut times = Vec::new();
         let mut heap_peak = 0usize;
+        let mut walk_peak = 0usize;
         let mut fp_peak_max = 0u64;
         for _ in 0..args.runs {
             relieve();
@@ -361,6 +387,7 @@ usage:
             relieve();
             let heap0 = LIVE.load(Ordering::Relaxed);
             PEAK.store(heap0, Ordering::Relaxed);
+            WALK_PEAK.store(heap0, Ordering::Relaxed);
             let fp0 = footprint();
             fp_peak.store(fp0, Ordering::Relaxed);
 
@@ -371,6 +398,7 @@ usage:
             })?;
             times.push(t.elapsed());
             heap_peak = heap_peak.max(PEAK.load(Ordering::Relaxed).saturating_sub(heap0));
+            walk_peak = walk_peak.max(WALK_PEAK.load(Ordering::Relaxed).saturating_sub(heap0));
             fp_peak_max = fp_peak_max.max(fp_peak.load(Ordering::Relaxed).saturating_sub(fp0));
         }
         stop.store(true, Ordering::Relaxed);
@@ -378,6 +406,10 @@ usage:
         engine.shutdown();
 
         stats("rescan", &times);
+        metric(
+            "rescan_walk_heap_peak_mb",
+            format!("{:.1}", walk_peak as f64 / 1e6),
+        );
         metric(
             "rescan_heap_peak_mb",
             format!("{:.1}", heap_peak as f64 / 1e6),
