@@ -1245,6 +1245,8 @@ impl WinController {
                 };
                 if shown {
                     iv.search_time.set(Some(took));
+                    // Spaces the re-runs new generations cause.
+                    results.note_search_time(took);
                 }
                 changed |= shown;
             }

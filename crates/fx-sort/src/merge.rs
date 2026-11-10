@@ -193,21 +193,102 @@ fn moved_descendants<S: SortSource + ?Sized>(
     moved
 }
 
-/// First index at or after `start` whose ID is not `less`; `kept` must be
-/// partitioned by `less` (all `less` IDs first). Gallops from `start`, so a
-/// short step costs few comparisons.
-fn gallop(kept: &[u32], start: usize, less: impl Fn(u32) -> bool) -> usize {
-    let n = kept.len();
-    let mut lo = start;
-    let mut step = 1usize;
-    let mut hi = start;
-    while hi < n && less(kept[hi]) {
-        lo = hi + 1;
-        hi = lo.saturating_add(step);
-        step = step.saturating_mul(2);
+/// The work one batch asks of one order: which old IDs leave it and which
+/// IDs go back in, sorted.
+struct Plan {
+    /// Every ID the batch lists.
+    dirty: MatchSet,
+    /// Clean entries of the Path order whose path changed with a moved or
+    /// re-inserted ancestor (`None` for the other orders, or when nothing
+    /// structural changed).
+    extracted: Option<MatchSet>,
+    /// The IDs to put back: listed or extracted, and live in the source;
+    /// sorted by the order's key and deduplicated.
+    fresh: Vec<u32>,
+}
+
+impl Plan {
+    /// Plans merging `batch` into `old`, an order by `key` of the state
+    /// before the batch; `src` holds the state after it.
+    fn new<S: SortSource + Sync + ?Sized>(
+        key: SortKey,
+        src: &S,
+        batch: &Batch,
+        old: &[u32],
+    ) -> Plan {
+        let mut dirty = MatchSet::with_bound(src.id_bound());
+        let mut fresh: Vec<u32> = Vec::new();
+        for &id in batch
+            .removed
+            .iter()
+            .chain(&batch.upserted)
+            .chain(&batch.moved)
+        {
+            if dirty.insert(id) && src.is_live(id) {
+                fresh.push(id.0);
+            }
+        }
+        // Removed IDs count as structural too: one that is live again was
+        // re-inserted, possibly under another name or parent.
+        let mut extracted = None;
+        if key == SortKey::Path && !(batch.moved.is_empty() && batch.removed.is_empty()) {
+            let mut structural = MatchSet::with_bound(src.id_bound());
+            for &id in batch.removed.iter().chain(&batch.moved) {
+                structural.insert(id);
+            }
+            let mut ex = MatchSet::with_bound(src.id_bound());
+            let moved = moved_descendants(src, old, &dirty, &structural, &mut ex);
+            if !moved.is_empty() {
+                fresh.extend(moved.into_iter().filter(|&y| src.is_live(EntryId(y))));
+                extracted = Some(ex);
+            }
+        }
+        let cmp = |a: &u32, b: &u32| key.compare(src, EntryId(*a), EntryId(*b));
+        if fresh.len() >= PAR_SORT_MIN {
+            fresh.par_sort_unstable_by(cmp);
+        } else {
+            fresh.sort_unstable_by(cmp);
+        }
+        Plan {
+            dirty,
+            extracted,
+            fresh,
+        }
     }
-    let hi = hi.min(n);
-    lo + kept[lo..hi].partition_point(|&k| less(k))
+
+    /// Whether the old order keeps `id` where it is.
+    fn keeps(&self, id: u32) -> bool {
+        let id = EntryId(id);
+        !self.dirty.contains(id) && !self.extracted.as_ref().is_some_and(|ex| ex.contains(id))
+    }
+}
+
+/// Merges the sorted `fresh` IDs into `kept`, itself sorted by `key` in
+/// `src`, in place: `kept` grows by `fresh.len()` and is filled from the
+/// back, so no second buffer of the order's size is needed. Each fresh ID
+/// goes before the kept IDs that do not sort before it, as a forward merge
+/// would place it; its position is found by halving, and every kept ID
+/// moves at most once.
+fn merge_in_place<S: SortSource + ?Sized>(
+    key: SortKey,
+    src: &S,
+    kept: &mut Vec<u32>,
+    fresh: &[u32],
+) {
+    if fresh.is_empty() {
+        return;
+    }
+    let mut hi = kept.len();
+    kept.resize(hi + fresh.len(), 0);
+    for (j, &id) in fresh.iter().enumerate().rev() {
+        let pos = kept[..hi]
+            .partition_point(|&k| key.compare(src, EntryId(k), EntryId(id)) == Ordering::Less);
+        // kept[pos..hi] sort after `id`: they move right past the j fresh
+        // IDs still to place and `id` itself.
+        kept.copy_within(pos..hi, pos + j + 1);
+        kept[pos + j] = id;
+        hi = pos;
+    }
 }
 
 impl Order {
@@ -217,10 +298,10 @@ impl Order {
     /// `src` must hold the new state: every change in the batch already
     /// applied. Every ID listed in the batch is dropped from the order in
     /// one pass; those still live in `src` are deduplicated, sorted with the
-    /// order's comparator and merged back in one linear (galloping) merge.
-    /// An entry upserted and removed in the same batch therefore counts as
-    /// removed if it is not live in `src`, and is kept if it is. Moved IDs
-    /// count as upserted for every order.
+    /// order's comparator and merged back in place, each at a position found
+    /// by halving. An entry upserted and removed in the same batch therefore
+    /// counts as removed if it is not live in `src`, and is kept if it is.
+    /// Moved IDs count as upserted for every order.
     ///
     /// For [`SortKey::Path`], a folder recorded with [`Batch::moved`]
     /// carries its whole subtree: the descendants are found as the
@@ -234,71 +315,25 @@ impl Order {
         if batch.is_empty() {
             return;
         }
-        let key = self.key;
-        let mut dirty = MatchSet::with_bound(src.id_bound());
-        let mut fresh: Vec<u32> = Vec::new();
-        for &id in batch
-            .removed
-            .iter()
-            .chain(&batch.upserted)
-            .chain(&batch.moved)
-        {
-            if dirty.insert(id) && src.is_live(id) {
-                fresh.push(id.0);
-            }
-        }
+        let plan = Plan::new(self.key, src, batch, &self.ids);
+        self.ids.retain(|&id| plan.keeps(id));
+        merge_in_place(self.key, src, &mut self.ids, &plan.fresh);
+    }
 
-        let mut kept = std::mem::take(&mut self.ids);
-        // Removed IDs count as structural too: one that is live again was
-        // re-inserted, possibly under another name or parent.
-        let structural =
-            if key == SortKey::Path && !(batch.moved.is_empty() && batch.removed.is_empty()) {
-                let mut set = MatchSet::with_bound(src.id_bound());
-                for &id in batch.removed.iter().chain(&batch.moved) {
-                    set.insert(id);
-                }
-                Some(set)
-            } else {
-                None
-            };
-        if let Some(structural) = structural {
-            let mut extracted = MatchSet::with_bound(src.id_bound());
-            let moved = moved_descendants(src, &kept, &dirty, &structural, &mut extracted);
-            if !moved.is_empty() {
-                fresh.extend(moved.into_iter().filter(|&y| src.is_live(EntryId(y))));
-                kept.retain(|&id| {
-                    let id = EntryId(id);
-                    !dirty.contains(id) && !extracted.contains(id)
-                });
-            } else {
-                kept.retain(|&id| !dirty.contains(EntryId(id)));
-            }
-        } else {
-            kept.retain(|&id| !dirty.contains(EntryId(id)));
+    /// The order after `batch`, as [`apply`](Order::apply) would leave it,
+    /// read from this order without changing it: for an order that
+    /// published snapshots still share. It copies the kept IDs once into a
+    /// buffer sized for the result and merges the batch into it in place,
+    /// where cloning the order and applying the batch to the clone would
+    /// copy it twice.
+    pub fn applied<S: SortSource + Sync + ?Sized>(&self, src: &S, batch: &Batch) -> Order {
+        if batch.is_empty() {
+            return self.clone();
         }
-
-        if fresh.is_empty() {
-            self.ids = kept;
-            return;
-        }
-        let cmp = |a: &u32, b: &u32| key.compare(src, EntryId(*a), EntryId(*b));
-        if fresh.len() >= PAR_SORT_MIN {
-            fresh.par_sort_unstable_by(cmp);
-        } else {
-            fresh.sort_unstable_by(cmp);
-        }
-
-        let mut out = Vec::with_capacity(kept.len() + fresh.len());
-        let mut start = 0usize;
-        for &id in &fresh {
-            let pos = gallop(&kept, start, |k| {
-                key.compare(src, EntryId(k), EntryId(id)) == Ordering::Less
-            });
-            out.extend_from_slice(&kept[start..pos]);
-            out.push(id);
-            start = pos;
-        }
-        out.extend_from_slice(&kept[start..]);
-        self.ids = out;
+        let plan = Plan::new(self.key, src, batch, &self.ids);
+        let mut ids = Vec::with_capacity(self.ids.len() + plan.fresh.len());
+        ids.extend(self.ids.iter().copied().filter(|&id| plan.keeps(id)));
+        merge_in_place(self.key, src, &mut ids, &plan.fresh);
+        Order { key: self.key, ids }
     }
 }
