@@ -540,3 +540,139 @@ fn a_hidden_idle_writer_polls_the_source_rarely() {
     );
     engine.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Hidden commits merge the orders in place when no snapshot holds them.
+// ---------------------------------------------------------------------------
+
+/// A hidden engine over a tree of a few folders, with a short background
+/// window so batches come quickly.
+fn hidden(tree: &FakeTree) -> (FakeSource, Engine) {
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let config = config().with_background_batch_window(Duration::from_millis(20));
+    let engine = start(tree, &source, tree.build_index(), config);
+    engine.set_foreground(false);
+    (source, engine)
+}
+
+/// Changes round `round` makes to `tree`, and the paths to check: a new
+/// file, a changed size, a removed file, now and then a folder renamed or
+/// moved with what it holds.
+fn churn(tree: &FakeTree, round: usize) -> Vec<Change> {
+    let dir = format!("/vol/d{}", round % 4);
+    let mut paths = vec![format!("{dir}/n{round}.txt")];
+    tree.touch(&paths[0], round as u64);
+    if round >= 1 {
+        let changed = format!("/vol/d{}/n{}.txt", (round - 1) % 4, round - 1);
+        tree.set_size(&changed, 1_000 + round as u64);
+        paths.push(changed);
+    }
+    if round >= 3 {
+        let gone = format!("/vol/d{}/n{}.txt", (round - 3) % 4, round - 3);
+        tree.remove(&gone);
+        paths.push(gone);
+    }
+    if round % 5 == 4 {
+        // A folder moves under another one and comes back renamed.
+        let (from, to) = if round % 10 == 4 {
+            ("/vol/d1/sub", "/vol/d2/sub")
+        } else {
+            ("/vol/d2/sub", "/vol/d1/sub")
+        };
+        tree.rename(from, to);
+        paths.push(from.to_string());
+        paths.push(to.to_string());
+    }
+    paths.iter().map(|p| check(p)).collect()
+}
+
+fn churn_tree() -> FakeTree {
+    let tree = FakeTree::new();
+    for d in 0..4 {
+        tree.mkdir(&format!("/vol/d{d}"));
+        tree.add_files(&format!("/vol/d{d}"), "f", 50);
+    }
+    tree.mkdir("/vol/d1/sub");
+    tree.add_files("/vol/d1/sub", "s", 30);
+    tree
+}
+
+#[test]
+fn hidden_commits_keep_every_order_equal_to_a_fresh_build() {
+    let tree = churn_tree();
+    let (source, engine) = hidden(&tree);
+    drop(wait_for_tree(&engine, &tree, "the start"));
+    for round in 0..40 {
+        source.push(churn(&tree, round));
+        let snap = wait_for_tree(&engine, &tree, &format!("round {round}"));
+        assert_orders_match(&snap);
+    }
+    engine.shutdown();
+}
+
+#[test]
+fn a_snapshot_held_through_hidden_commits_keeps_its_orders() {
+    let tree = churn_tree();
+    let (source, engine) = hidden(&tree);
+    let mut held = Vec::new();
+    for round in 0..12 {
+        let snap = wait_for_tree(&engine, &tree, &format!("round {round}"));
+        // Every third snapshot is kept, as a window keeps the one it shows.
+        if round % 3 == 0 {
+            held.push(snap);
+        }
+        source.push(churn(&tree, round));
+    }
+    drop(wait_for_tree(&engine, &tree, "the last round"));
+    for snap in &held {
+        assert_orders_match(snap);
+    }
+    assert_orders_match(&engine.snapshot());
+    engine.shutdown();
+}
+
+#[test]
+fn readers_never_see_a_snapshot_without_its_orders() {
+    let tree = churn_tree();
+    let (source, engine) = hidden(&tree);
+    drop(wait_for_tree(&engine, &tree, "the start"));
+    let stop = AtomicBool::new(false);
+    thread::scope(|s| {
+        let reader = s.spawn(|| {
+            let mut reads = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                let snap = engine.snapshot();
+                // At most the time of one merge in place, which is short.
+                assert!(
+                    t.elapsed() < Duration::from_millis(100),
+                    "snapshot() waited {:?}",
+                    t.elapsed()
+                );
+                for key in ENGINE_KEYS {
+                    assert!(
+                        snap.order(key).is_some(),
+                        "generation {}: no {key:?} order",
+                        snap.generation()
+                    );
+                }
+                assert_eq!(
+                    snap.order(fx_sort::SortKey::Name).map(|o| o.len()),
+                    Some(snap.index().live_count()),
+                    "generation {}: the Name order doesn't hold every entry",
+                    snap.generation()
+                );
+                reads += 1;
+            }
+            reads
+        });
+        for round in 0..30 {
+            source.push(churn(&tree, round));
+            drop(wait_for_tree(&engine, &tree, &format!("round {round}")));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("the reader saw every order");
+        assert!(reads > 0, "the reader read snapshots");
+    });
+    engine.shutdown();
+}

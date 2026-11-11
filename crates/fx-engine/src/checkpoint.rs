@@ -28,7 +28,7 @@ use fx_model::{EntryId, ResumeCursor, VolumeId};
 use fx_sort::{Order, SortKey};
 use fx_store::{MappedIndex, SaveInput, StoreError, create_private_dir, write_checkpoint};
 
-use crate::snapshot::{ENGINE_SORT_KEYS, EngineSnapshot};
+use crate::snapshot::{ENGINE_SORT_KEYS, EngineSnapshot, settled};
 
 /// Why a checkpoint was not written.
 #[derive(Debug)]
@@ -424,7 +424,9 @@ impl Checkpoints {
         if !clean && self.latest_saved(current) {
             return Ok(());
         }
-        let snap = current.load_full();
+        // Never the snapshot of an in-place merge, which has no orders: the
+        // store would then have none to load.
+        let snap = settled(current);
         self.write_snapshot(path, &snap, current, clean)
     }
 
@@ -455,7 +457,7 @@ impl Checkpoints {
             QuitSave::Skip => {}
             QuitSave::WaitForRunning => drop(lock(&self.save_lock)),
             QuitSave::Write => {
-                let snap = current.load_full();
+                let snap = settled(current);
                 self.write_snapshot(path, &snap, current, false)?;
             }
         }
@@ -685,6 +687,7 @@ mod tests {
             }),
             generation,
             priority: None,
+            orders_pending: false,
         }
     }
 

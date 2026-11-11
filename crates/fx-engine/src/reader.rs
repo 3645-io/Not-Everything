@@ -274,6 +274,7 @@ impl StoreReader {
                 generation: 0,
                 // The command line keeps the plain sort.
                 priority: None,
+                orders_pending: false,
             },
             utc_offset: None,
         })
