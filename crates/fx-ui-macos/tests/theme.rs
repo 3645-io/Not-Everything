@@ -433,6 +433,13 @@ fn component_metrics_from_the_canvas() {
     assert_eq!(PATH_COLUMN, (200.0, 1.5));
     assert_eq!((SIZE_COLUMN, DATE_COLUMN), (88.0, 156.0));
     assert_eq!(GRID_MIN_WIDTH, 760.0);
+    assert_eq!(RESIZE_MIN_WIDTHS, [140.0, 120.0, 64.0]);
+    assert_eq!((REST_MIN_WIDTH, RESIZE_MAX_WIDTH), (140.0, 800.0));
+    assert_eq!(RESIZE_STEP, (8.0, 32.0));
+    assert_eq!(DIVIDER_WIDTH, 12.0);
+    assert_eq!(DIVIDER_INSET, (13.0, 9.0));
+    assert_eq!(DIVIDER_LINE, (1.0, 2.0));
+    assert_eq!(DIVIDER_RADIUS, 1.0);
     assert_eq!((GLYPH_SIZE, GLYPH_GAP, SORT_GLYPH_SIZE), (18.0, 10.0, 14.0));
     assert_eq!(SORT_GLYPH_STROKE, 2.0);
     assert_eq!(EMPTY_MAX_WIDTH, 600.0);

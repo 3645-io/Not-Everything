@@ -32,7 +32,6 @@ use fx_model::{Change, ResumeCursor, StartOutcome};
 
 use super::change::{coalesce, map_event};
 use super::cursor::CursorTracker;
-use super::flags::EventFlags;
 use super::stream::{RawEvent, StreamConfig, VolumeStream};
 
 /// An FSEvents [`ChangeSource`] for one volume. See the module docs.
@@ -89,16 +88,13 @@ impl FsEventsSource {
 impl Running {
     /// Maps one raw event and records it in the cursor tracker.
     fn take(&mut self, ev: &RawEvent, out: &mut Vec<Change>) {
-        if ev.flags.contains(EventFlags::HISTORY_DONE) {
-            self.tracker.on_history_done(ev.id);
-        } else {
-            let _ = self.tracker.on_event(ev.id);
-        }
+        // The stream already dropped what is not to be delivered.
+        let _ = self.tracker.on_raw_event(ev.id, ev.flags);
         if let Some(change) = map_event(
             &ev.path,
             ev.flags,
             ev.rescan_subtree,
-            self.stream.mount_point(),
+            self.stream.scope_root(),
         ) {
             out.push(change);
         }
