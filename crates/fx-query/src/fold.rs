@@ -176,10 +176,10 @@ pub fn is_apostrophe(c: char) -> bool {
 /// assert_eq!(fold_str("Plumb’s.pdf", both.without_apostrophes()), "plumbs.pdf");
 /// ```
 pub fn fold_str(s: &str, opts: FoldOptions) -> Cow<'_, str> {
-    if s.is_ascii() {
-        let bytes = s.as_bytes();
-        let drop = opts.drops_apostrophes() && memchr(b'\'', bytes).is_some();
-        let lower = opts.case && bytes.iter().any(u8::is_ascii_uppercase);
+    let bytes = s.as_bytes();
+    if let Some(ascii) = AsciiTraits::of(bytes) {
+        let drop = opts.drops_apostrophes() && ascii.apostrophe;
+        let lower = opts.case && ascii.upper;
         if !drop && !lower {
             return Cow::Borrowed(s);
         }
@@ -192,6 +192,134 @@ pub fn fold_str(s: &str, opts: FoldOptions) -> Cow<'_, str> {
         Cow::Borrowed(s)
     } else {
         Cow::Owned(folded)
+    }
+}
+
+/// Writes [`fold_str`] of `s` under `opts` into `out` (cleared first)
+/// when folding changes `s`, and says whether it did; `false` means `s` is
+/// its own folded form. What it writes is always UTF-8. An ASCII string
+/// (nearly every name) is folded without allocating once `out` has room
+/// for it, so a scan that folds name after name into one buffer pays for
+/// no allocation per name.
+pub(crate) fn fold_into(s: &str, opts: FoldOptions, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let bytes = s.as_bytes();
+    if let Some(ascii) = AsciiTraits::of(bytes) {
+        let drop = opts.drops_apostrophes() && ascii.apostrophe;
+        let lower = opts.case && ascii.upper;
+        if !drop && !lower {
+            return false;
+        }
+        if drop {
+            out.extend(bytes.iter().copied().filter(|&b| b != b'\''));
+            if opts.case {
+                out.make_ascii_lowercase();
+            }
+        } else {
+            push_ascii_lowercase(bytes, out);
+        }
+    } else {
+        let folded = fold_non_ascii(s, opts);
+        if folded == s {
+            return false;
+        }
+        out.extend_from_slice(folded.as_bytes());
+    }
+    true
+}
+
+/// One `u64` of the eight bytes of `bytes` from `at` (little-endian; the
+/// tricks below work on each byte alone, so the order doesn't matter).
+fn word_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
+/// `0x01` in every byte.
+const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+/// `0x80` in every byte.
+const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
+/// For a byte below 0x80, adding this sets its high bit from `A` up...
+const FROM_A: u64 = u64::from_ne_bytes([0x80 - b'A'; 8]);
+/// ...and adding this from just after `Z` up. Neither carries into the
+/// next byte.
+const AFTER_Z: u64 = u64::from_ne_bytes([0x80 - b'Z' - 1; 8]);
+
+/// The high bit of each byte of `w` that is a capital, when every byte of
+/// `w` is ASCII (meaningless otherwise).
+fn capitals(w: u64) -> u64 {
+    w.wrapping_add(FROM_A) & !w.wrapping_add(AFTER_Z) & HIGH
+}
+
+/// Appends ASCII `bytes`, lowercased, to `out`, eight bytes at a time:
+/// each capital's high-bit mark, moved down to 0x20, is the bit that
+/// lowercases it.
+fn push_ascii_lowercase(bytes: &[u8], out: &mut Vec<u8>) {
+    let lower = |w: u64| (w | (capitals(w) >> 2)).to_le_bytes();
+    let n = bytes.len();
+    if n < 8 {
+        out.extend(bytes.iter().map(u8::to_ascii_lowercase));
+        return;
+    }
+    let start = out.len();
+    out.reserve(n);
+    for at in (0..n - 7).step_by(8) {
+        out.extend_from_slice(&lower(word_at(bytes, at)));
+    }
+    // The last eight bytes again, over what is already written with the
+    // same lowercase bytes.
+    if n % 8 != 0 {
+        out.truncate(start + n - 8);
+        out.extend_from_slice(&lower(word_at(bytes, n - 8)));
+    }
+}
+
+/// What the ASCII fast path of folding needs to know about a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsciiTraits {
+    /// It has a capital letter.
+    upper: bool,
+    /// It has an apostrophe (`'`).
+    apostrophe: bool,
+}
+
+impl AsciiTraits {
+    /// The traits of `bytes`, or `None` when a byte isn't ASCII.
+    ///
+    /// One pass over eight bytes at a time in a `u64`, without branches:
+    /// for strings as short as names (17 bytes on average) that is several
+    /// times cheaper than asking the three questions in turn, each with its
+    /// own early exit, and cheaper than a vector loop's set-up. A string
+    /// shorter than eight bytes is padded with zero bytes, which are ASCII,
+    /// not capitals and not apostrophes.
+    fn of(bytes: &[u8]) -> Option<AsciiTraits> {
+        const QUOTE: u64 = u64::from_ne_bytes([b'\''; 8]);
+        let (mut any, mut upper, mut quote) = (0u64, 0u64, 0u64);
+        let mut word = |w: u64| {
+            any |= w;
+            upper |= capitals(w);
+            // A zero byte of `w ^ QUOTE` is an apostrophe.
+            let x = w ^ QUOTE;
+            quote |= x.wrapping_sub(ONES) & !x;
+        };
+        let n = bytes.len();
+        if n >= 8 {
+            for at in (0..n - 7).step_by(8) {
+                word(word_at(bytes, at));
+            }
+            // The last eight bytes again, overlapping: the answers are
+            // unions, so a byte seen twice changes nothing.
+            if n % 8 != 0 {
+                word(word_at(bytes, n - 8));
+            }
+        } else {
+            word(bytes.iter().rev().fold(0, |w, &b| (w << 8) | u64::from(b)));
+        }
+        // With a non-ASCII byte the other two answers are meaningless, but
+        // they are not used then.
+        (any & HIGH == 0).then_some(AsciiTraits {
+            upper: upper & HIGH != 0,
+            apostrophe: quote & HIGH != 0,
+        })
     }
 }
 
@@ -623,5 +751,97 @@ mod tests {
         let mut out = Vec::new();
         fold_bytes(b"A\xffB\xc3\x89", BOTH, &mut out);
         assert_eq!(out, "a\u{fffd}be".as_bytes());
+    }
+
+    #[test]
+    fn folding_into_a_buffer_agrees_with_fold_str() {
+        let names = [
+            "",
+            "plain.txt",
+            "README.md",
+            "it's",
+            "IT'S",
+            "Plumb’s ‘x’ ʼn",
+            "Résumé.PDF",
+            "Re\u{301}sume\u{301}.PDF",
+            "Cafe\u{301}’s",
+            "日本語",
+            "नाम",
+            "İstanbul",
+            "a",
+            "CONFIGURATION-BACKUP.JSON",
+        ];
+        let case_only = FoldOptions {
+            case: true,
+            diacritics: false,
+            keep_apostrophes: true,
+        };
+        let mut out = b"stale bytes from an earlier name".to_vec();
+        for opts in [BOTH, KEEP, case_only, FoldOptions::default()] {
+            for name in names {
+                let want = fold_str(name, opts);
+                let changed = fold_into(name, opts, &mut out);
+                assert_eq!(
+                    changed,
+                    matches!(want, Cow::Owned(_)),
+                    "{name:?} under {opts:?}"
+                );
+                let got = if changed {
+                    std::str::from_utf8(&out).expect("UTF-8")
+                } else {
+                    name
+                };
+                assert_eq!(got, want, "{name:?} under {opts:?}");
+            }
+        }
+        // Every length around the eight-byte steps, capitals anywhere.
+        let alphabet = "AbCdEfGhIjKlMnOpQrStUvWxYz@[`{0'";
+        for len in 0..alphabet.len() {
+            for start in 0..alphabet.len() - len {
+                let name = &alphabet[start..start + len];
+                for opts in [BOTH, KEEP] {
+                    let want = fold_str(name, opts);
+                    let got = if fold_into(name, opts, &mut out) {
+                        std::str::from_utf8(&out).expect("UTF-8")
+                    } else {
+                        name
+                    };
+                    assert_eq!(got, want, "{name:?} under {opts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_traits_find_capitals_apostrophes_and_other_bytes() {
+        let t = |s: &str| AsciiTraits::of(s.as_bytes());
+        let traits = |upper, apostrophe| Some(AsciiTraits { upper, apostrophe });
+        assert_eq!(t(""), traits(false, false));
+        assert_eq!(t("plain-name_01.txt"), traits(false, false));
+        assert_eq!(t("@[`{"), traits(false, false), "neighbours of A-Z");
+        assert_eq!(t("A"), traits(true, false));
+        assert_eq!(t("z.Z"), traits(true, false));
+        assert_eq!(t("it's"), traits(false, true));
+        assert_eq!(t("a long name of thirty-two bytes'"), traits(false, true));
+        assert_eq!(t("IT'S"), traits(true, true));
+        assert_eq!(t("é"), None);
+        assert_eq!(t("a long ASCII name, then: \u{2019}"), None);
+        assert_eq!(t("\u{7f}"), traits(false, false));
+    }
+
+    #[test]
+    fn folding_into_a_buffer_reuses_it() {
+        let mut out = Vec::new();
+        assert!(fold_into("A LONG NAME WITH CAPITALS.TXT", BOTH, &mut out));
+        let (ptr, cap) = (out.as_ptr(), out.capacity());
+        for name in ["Short", "MID LENGTH.md", "X", "IT'S"] {
+            assert!(fold_into(name, BOTH, &mut out), "{name:?}");
+            assert_eq!(
+                (out.as_ptr(), out.capacity()),
+                (ptr, cap),
+                "{name:?} reused the buffer"
+            );
+        }
+        assert_eq!(out, b"its");
     }
 }
