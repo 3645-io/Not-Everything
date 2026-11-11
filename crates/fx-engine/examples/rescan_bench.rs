@@ -39,6 +39,9 @@
 //! call of a reader polling every millisecond while it waited, which shows
 //! how long a search could wait for the writer's merge in place
 //! (`rescan_run<N>_snapshot_wait_max_ms`, `rescan_snapshot_wait_max_ms`).
+//! `--checks N` then commits `2N` batches of one change each, as the
+//! hidden app does all day, and reports `checks_snapshot_wait_max_ms` and
+//! `checks_commit_heap_peak_mb`.
 //! Exit codes: 0 after the rescans,
 //! 1 on an error or timeout, 2 for bad arguments. On hosts other than macOS
 //! it prints a message and exits with 0.
@@ -92,6 +95,9 @@ usage:
   --entries N     materialize a synthetic tree of N entries (default 500000)
   --touch N       before each rescan, replace N files of the synthetic tree
                   (default 0: the rescans find nothing to commit)
+  --checks N      after the rescans, N files added and removed one at a
+                  time in the temporary folder (under the root): small
+                  batches (default 0)
   --root DIR      rescan this folder instead (read only)
   --runs N        rescans to measure, 1..=20 (default 3)
   --stream-kb N   the scanner's buffer in KiB (default: the scanner's own)
@@ -258,6 +264,14 @@ usage:
             st.0.push(Change::RescanSubtree(path.to_path_buf()));
             cursor(st.1 + 1)
         }
+
+        /// Queues a check of the one path `path`, as FSEvents reports a
+        /// single change; returns the cursor published once it is applied.
+        fn check(&self, path: &Path) -> ResumeCursor {
+            let mut st = self.lock();
+            st.0.push(Change::CheckPath(path.to_path_buf()));
+            cursor(st.1 + 1)
+        }
     }
 
     fn cursor(event_id: u64) -> ResumeCursor {
@@ -299,6 +313,7 @@ usage:
     struct Args {
         entries: usize,
         touch: usize,
+        checks: usize,
         root: Option<PathBuf>,
         runs: usize,
         stream_kb: Option<usize>,
@@ -317,6 +332,7 @@ usage:
             &[
                 "--entries",
                 "--touch",
+                "--checks",
                 "--root",
                 "--runs",
                 "--stream-kb",
@@ -347,6 +363,7 @@ usage:
             let a = Args {
                 entries: f.number("--entries", 500_000, 1_000, 20_000_000)? as usize,
                 touch: f.number("--touch", 0, 0, 100_000)? as usize,
+                checks: f.number("--checks", 0, 0, 1_000)? as usize,
                 root: f.get("--root").map(PathBuf::from),
                 runs: f.number("--runs", 3, 1, 20)? as usize,
                 stream_kb: match f.get("--stream-kb") {
@@ -480,6 +497,9 @@ usage:
             after_peak = after_peak.max(after);
             fp_peak_max = fp_peak_max.max(fp_peak.load(Ordering::Relaxed).saturating_sub(fp0));
         }
+        if args.checks > 0 {
+            small_batches(&engine, &source, &root, args)?;
+        }
         stop.store(true, Ordering::Relaxed);
         let _ = sampler.join();
         engine.shutdown();
@@ -502,6 +522,59 @@ usage:
     /// The longest `Engine::snapshot()` call of the current rescan, in
     /// microseconds.
     static SNAPSHOT_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+    /// `--checks N`: after the rescans, `N` small batches of one change each
+    /// (a file this benchmark adds, then removes, in a folder of its own in
+    /// the system's temporary folder, which must lie under the root), as
+    /// the window-hidden app commits them all day. Reports the longest
+    /// `snapshot()` call and the commit's heap peak over them.
+    fn small_batches(
+        engine: &Engine,
+        source: &Trigger,
+        root: &Path,
+        args: &Args,
+    ) -> io::Result<()> {
+        let dir = TempRoot::new("fx-rescan-bench-checks")?;
+        if !dir.path().starts_with(root) {
+            metric(
+                "checks_skipped",
+                "the temporary folder lies outside the root",
+            );
+            return Ok(());
+        }
+        let (mut wait_max, mut peak_max) = (0u64, 0usize);
+        for i in 0..args.checks {
+            let path = dir.path().join(format!("check-{i}.txt"));
+            for add in [true, false] {
+                if add {
+                    std::fs::write(&path, b"x")?;
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+                let heap0 = LIVE.load(Ordering::Relaxed);
+                PHASE.store(BEFORE_WALK, Ordering::Relaxed);
+                PEAK.store(heap0, Ordering::Relaxed);
+                SNAPSHOT_WAIT_MAX_US.store(0, Ordering::Relaxed);
+                let want = source.check(&path);
+                wait(engine, args.timeout, |e| {
+                    let asked = Instant::now();
+                    let snap = e.snapshot();
+                    let us = asked.elapsed().as_micros() as u64;
+                    SNAPSHOT_WAIT_MAX_US.fetch_max(us, Ordering::Relaxed);
+                    snap.cursor() == Some(want)
+                })?;
+                wait_max = wait_max.max(SNAPSHOT_WAIT_MAX_US.load(Ordering::Relaxed));
+                peak_max = peak_max.max(PEAK.load(Ordering::Relaxed).saturating_sub(heap0));
+            }
+        }
+        metric("checks_batches", args.checks * 2);
+        metric(
+            "checks_snapshot_wait_max_ms",
+            format!("{:.3}", wait_max as f64 / 1e3),
+        );
+        metric("checks_commit_heap_peak_mb", mb(peak_max));
+        Ok(())
+    }
 
     /// Bytes as megabytes, with one decimal.
     fn mb(bytes: usize) -> String {
