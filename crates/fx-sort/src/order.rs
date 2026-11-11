@@ -265,10 +265,10 @@ const PAR_CHECK_MIN: usize = 4096;
 
 /// Below this many IDs, the checks run on the calling thread. Handing a
 /// small store's check to the rayon pool costs more than it saves: the
-/// caller waits for a pool thread to wake (or, at the first use, for the
-/// pool to start), which the quick catch-up benchmark measured as about
-/// 35 ms on a busy Mac against 1.5 ms for the whole open of a
-/// 2,000-entry store.
+/// caller waits for the pool's threads, which start at its first use and
+/// are slow to wake on a busy Mac. The quick catch-up benchmark's engine
+/// open of a 2,000-entry store took 38 ms that way, and 0.6 ms with the
+/// check on the calling thread.
 const PAR_CHECK_MIN_ENTRIES: usize = 1 << 16;
 
 /// How a check answers the Name rule for two live entries.
@@ -324,10 +324,19 @@ fn check_orders<S: SortSource + Sync + ?Sized>(
     orders: &[&Order],
     src: &S,
 ) -> Result<(), OrderError> {
+    check_orders_on(orders, src, src.id_bound() >= PAR_CHECK_MIN_ENTRIES)
+}
+
+/// [`check_orders`], on the rayon pool when `parallel`, else on the calling
+/// thread; both give the same result.
+fn check_orders_on<S: SortSource + Sync + ?Sized>(
+    orders: &[&Order],
+    src: &S,
+    parallel: bool,
+) -> Result<(), OrderError> {
     if orders.is_empty() {
         return Ok(());
     }
-    let parallel = src.id_bound() >= PAR_CHECK_MIN_ENTRIES;
     let bound = u32::try_from(src.id_bound()).unwrap_or(u32::MAX);
     let is_live = |&i: &u32| src.is_live(EntryId(i));
     let live = if parallel {
@@ -737,6 +746,125 @@ mod tests {
         let order = Order::build(&src, SortKey::Path);
         assert_eq!(order.ids, vec![3, 2, 4, 1]);
         assert!(order.validate(&src).is_ok());
+    }
+
+    /// A random forest of `n` entries with equal names, sizes and dates,
+    /// removed entries and a few live entries under removed folders.
+    struct Forest {
+        names: Vec<String>,
+        parents: Vec<u32>,
+        live: Vec<bool>,
+        sizes: Vec<u64>,
+    }
+
+    impl Forest {
+        fn new(n: usize, seed: u64) -> Forest {
+            let mut state = seed;
+            let mut next = move |below: u64| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) % below
+            };
+            let mut f = Forest {
+                names: Vec::with_capacity(n),
+                parents: Vec::with_capacity(n),
+                live: Vec::with_capacity(n),
+                sizes: Vec::with_capacity(n),
+            };
+            for i in 0..n {
+                let parent = if i == 0 || next(50) == 0 {
+                    NONE
+                } else {
+                    next(i as u64) as u32
+                };
+                let parent_live = parent == NONE || f.live[parent as usize];
+                // Mostly whole subtrees removed; sometimes an orphan.
+                let live = (parent_live || next(20) == 0) && next(25) != 0;
+                f.names.push(format!("n{}", next(400)));
+                f.parents.push(parent);
+                f.live.push(live);
+                f.sizes.push(next(64));
+            }
+            f
+        }
+    }
+
+    impl SortSource for Forest {
+        fn id_bound(&self) -> usize {
+            self.names.len()
+        }
+        fn is_live(&self, id: EntryId) -> bool {
+            self.live.get(id.index()).copied().unwrap_or(false)
+        }
+        fn name(&self, id: EntryId) -> &str {
+            &self.names[id.index()]
+        }
+        fn parent(&self, id: EntryId) -> EntryId {
+            EntryId(self.parents[id.index()])
+        }
+        fn size(&self, id: EntryId) -> u64 {
+            self.sizes[id.index()]
+        }
+        fn modified(&self, id: EntryId) -> i64 {
+            self.sizes[id.index()] as i64 / 3
+        }
+        fn created(&self, id: EntryId) -> i64 {
+            -(self.sizes[id.index()] as i64)
+        }
+        fn kind(&self, _: EntryId) -> EntryKind {
+            EntryKind::File
+        }
+    }
+
+    #[test]
+    fn checks_on_the_pool_and_on_the_calling_thread_agree() {
+        // Large enough for several parallel tasks per order.
+        for (seed, orphans) in [(1u64, false), (7, true)] {
+            let mut src = Forest::new(40_000, seed);
+            if !orphans {
+                // Only whole subtrees removed: the Path walk fits.
+                for i in 0..src.names.len() {
+                    let p = src.parents[i];
+                    if p != NONE && !src.live[p as usize] {
+                        src.live[i] = false;
+                    }
+                }
+            }
+            let built = Order::build_all(&src);
+            let n = built[0].ids.len();
+            assert!(n > 4 * PAR_CHECK_MIN, "{n} live entries");
+            type Damage<'a> = &'a dyn Fn(&mut Vec<u32>);
+            let damages: [Damage; 5] = [
+                &|_| {},
+                &|ids| ids.swap(n / 3, n / 3 + 1),
+                &|ids| ids.swap(10, n - 10),
+                &|ids| ids[n / 2..].rotate_left(1),
+                &|ids| {
+                    ids.pop();
+                },
+            ];
+            for (d, damage) in damages.iter().enumerate() {
+                for victim in 0..built.len() {
+                    let mut orders = built.clone();
+                    damage(&mut orders[victim].ids);
+                    let refs: Vec<&Order> = orders.iter().collect();
+                    let on_pool = check_orders_on(&refs, &src, true);
+                    let here = check_orders_on(&refs, &src, false);
+                    assert_eq!(on_pool, here, "seed {seed}, damage {d}, order {victim}");
+                    assert_eq!(on_pool.is_ok(), d == 0, "seed {seed}, damage {d}");
+                    for order in &refs {
+                        let alone = [*order];
+                        assert_eq!(
+                            check_orders_on(&alone, &src, true),
+                            check_orders_on(&alone, &src, false),
+                            "seed {seed}, damage {d}, {:?} alone",
+                            order.key
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
