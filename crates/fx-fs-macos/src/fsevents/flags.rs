@@ -127,6 +127,14 @@ impl EventFlags {
     pub const fn is_directory_level(self) -> bool {
         self.0 & (Self::ITEM_ACTION | Self::ITEM_TYPE | Self::SPECIAL) == 0
     }
+
+    /// True if the event asks for a rescan, of its subtree
+    /// (`MustScanSubDirs`) or of the volume ([`Self::VOLUME_RESCAN`]:
+    /// `EventIdsWrapped`, `RootChanged`, `UserDropped`, `KernelDropped`).
+    #[must_use]
+    pub const fn asks_rescan(self) -> bool {
+        self.0 & (Self::MUST_SCAN_SUB_DIRS.0 | Self::VOLUME_RESCAN) != 0
+    }
 }
 
 impl std::ops::BitOr for EventFlags {
