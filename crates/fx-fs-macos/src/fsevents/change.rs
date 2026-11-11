@@ -10,9 +10,18 @@
 //! | event | change |
 //! |---|---|
 //! | `HistoryDone` marker | none |
-//! | `EventIdsWrapped`, `RootChanged`, `Unmount` of the watched volume | [`Change::RescanVolume`] |
-//! | `MustScanSubDirs`, `UserDropped`, `KernelDropped`, a directory rename (`ItemRenamed \| ItemIsDir`), or the stream's `rescan_subtree` field | [`Change::RescanSubtree`] |
-//! | anything else (item create/remove/rename/modify, `Mount`, `Unmount` of another volume, unknown bits) | [`Change::CheckPath`] |
+//! | `EventIdsWrapped`, `RootChanged`, `UserDropped`, `KernelDropped` (any path), `Unmount` of the scope root or the volume root | [`Change::RescanVolume`] |
+//! | on a folder above the scope root: `MustScanSubDirs`, `Mount`, `Unmount`, `ItemCreated`, `ItemRemoved`, `ItemRenamed`, or no item bit | [`Change::RescanSubtree`] of the scope root |
+//! | on a folder above the scope root: anything else (metadata) | none |
+//! | `Mount` on the scope root | [`Change::RescanSubtree`] of the scope root |
+//! | `MustScanSubDirs`, a flag word with no item bit (`kFSEventStreamEventFlagNone`: a change in the directory), a directory rename (`ItemRenamed \| ItemIsDir`), or the stream's `rescan_subtree` field | [`Change::RescanSubtree`] |
+//! | anything else (item create/remove/rename/modify/clone, `OwnEvent`, `Mount` or `Unmount` below the scope root, unknown bits next to an item bit) | [`Change::CheckPath`] |
+//!
+//! The scope root is the root of what the stream delivers: its path filter,
+//! or its volume's mount point (`VolumeStream::scope_root`, macOS).
+//! `UserDropped` and `KernelDropped` rescan everything because `FSEvents.h`
+//! says the client "must do a full scan of any directories (and their
+//! subdirectories, recursively) being monitored by this stream".
 //!
 //! A directory rename is a subtree rescan even live, because FSEvents does
 //! not pair the two sides of a rename and reports nothing for the entries
@@ -30,21 +39,25 @@ use fx_model::Change;
 
 use super::flags::{EventAction, EventFlags, classify};
 
-/// Maps one event to a change. `None` only for the HistoryDone marker.
+/// Maps one event to a change. `None` for the HistoryDone marker and for a
+/// metadata change on a folder above the scope root
+/// ([`EventAction::Ignore`]).
 ///
 /// `rescan_subtree` is the stream's separate rescan field
-/// (`RawEvent::rescan_subtree`, macOS only); `volume_root` is
-/// the watched volume's mount point in the stream's normalised form, so an
-/// `Unmount` of the watched volume itself becomes a volume rescan.
+/// (`RawEvent::rescan_subtree`, macOS only); `scope_root` is the stream's
+/// scope root (`VolumeStream::scope_root`, macOS only: its path filter, or
+/// its volume's mount point) in the stream's normalised form, so an
+/// `Unmount` of it becomes a volume rescan and an event above it a rescan
+/// of it.
 #[must_use]
 pub fn map_event(
     path: &Path,
     flags: EventFlags,
     rescan_subtree: bool,
-    volume_root: &Path,
+    scope_root: &Path,
 ) -> Option<Change> {
-    match classify(path, flags, volume_root) {
-        EventAction::HistoryDone => None,
+    match classify(path, flags, scope_root) {
+        EventAction::HistoryDone | EventAction::Ignore => None,
         EventAction::RescanVolume => Some(Change::RescanVolume),
         EventAction::RescanSubtree(p) => Some(Change::RescanSubtree(p)),
         EventAction::CheckPath(p) => {

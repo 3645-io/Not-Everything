@@ -12,15 +12,31 @@
 //! `press:TAG` (clicks the window's control with that tag: a chip, a
 //! column title, a syntax example), `wait`, `click:ROW` (a mouse-down and
 //! mouse-up on that row, sent to the window as the hardware would send
-//! them), `key:down` and `key:up` (an arrow key) and `type:TEXT` (each
-//! character as a key press, 80 ms apart). Each step logs where the focus
-//! is.
+//! them), `key:down` and `key:up` (an arrow key), `key:space` and
+//! `key:escape` (a key press sent to the window, as the hardware sends it:
+//! Quick Look with the results focused), `type:TEXT` (each character as a
+//! key press, 80 ms apart), `activate` (activates the app and makes the
+//! window key, as a summon does; Quick Look looks for its controller in the
+//! key window), `announce` (posts the result count announcement now, as a
+//! new search does while VoiceOver runs) and `ax` (logs the table's row
+//! counts as AppKit reports them to VoiceOver, the announcement a new
+//! search makes and the Quick Look panel's state). Each step logs where the focus is.
 //!
 //! The column dividers: `divider:I:drag:DX` (a mouse-down on divider I,
 //! 0 Name, 1 Path, 2 Size, dragged DX points and released, as the hardware
 //! sends them), `divider:I:double` (a double-click), `divider:I:key:right`,
 //! `divider:I:key:shift-left` and so on (an arrow key handed to the
 //! divider), and `scrollx:X` (the rows scrolled X points sideways).
+//!
+//! What VoiceOver reads is best seen from outside the app, through the
+//! Accessibility API (`AXUIElementCopyAttributeValue`), as VoiceOver
+//! sees it: asked from inside, AppKit doesn't report every label a control
+//! carries.
+
+use objc2::msg_send;
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2_foundation::{NSArray, NSString};
 
 /// One scripted step.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,7 +57,11 @@ pub(crate) enum Step {
     Wait,
     Click(usize),
     Arrow(Arrow),
+    Key(NamedKey),
     Type(String),
+    Activate,
+    Announce,
+    Ax,
 }
 
 /// What [`Step::Divider`] does to a column divider.
@@ -87,6 +107,28 @@ pub(crate) enum Arrow {
     Down,
 }
 
+/// A key for [`Step::Key`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NamedKey {
+    Space,
+    Escape,
+}
+
+/// How many elements the table's accessibility attribute `name` lists
+/// (`AXRows`, `AXVisibleRows`, `AXSelectedRows`), and how long asking took.
+pub(crate) fn ax_count(element: &AnyObject, name: &str) -> (Option<usize>, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let name = NSString::from_str(name);
+    // SAFETY: `accessibilityAttributeValue:` takes an attribute name and
+    // returns an object or nil; every AppKit object answers it.
+    let value: Option<Retained<AnyObject>> =
+        unsafe { msg_send![element, accessibilityAttributeValue: &*name] };
+    let count = value
+        .and_then(|v| v.downcast::<NSArray>().ok())
+        .map(|a| a.count());
+    (count, start.elapsed())
+}
+
 /// The script from the environment.
 pub(crate) fn script() -> Vec<Step> {
     std::env::var("NE_DEBUG_SCRIPT")
@@ -124,9 +166,14 @@ fn parse(text: &str) -> Vec<Step> {
                 "key" => match arg.trim() {
                     "down" => Some(Step::Arrow(Arrow::Down)),
                     "up" => Some(Step::Arrow(Arrow::Up)),
+                    "space" => Some(Step::Key(NamedKey::Space)),
+                    "escape" => Some(Step::Key(NamedKey::Escape)),
                     _ => None,
                 },
                 "type" => Some(Step::Type(arg.to_owned())),
+                "activate" => Some(Step::Activate),
+                "announce" => Some(Step::Announce),
+                "ax" => Some(Step::Ax),
                 _ => None,
             }
         })
@@ -198,5 +245,22 @@ mod tests {
     #[test]
     fn typing_parses_and_keeps_spaces() {
         assert_eq!(parse("type:bud get"), vec![Step::Type("bud get".into())]);
+    }
+
+    /// Quick Look and VoiceOver are checked in the app: `key:space` and
+    /// `key:escape` press those keys through the window, and `ax` logs
+    /// what AppKit reports to VoiceOver.
+    #[test]
+    fn quick_look_keys_and_the_accessibility_log_parse() {
+        assert_eq!(
+            parse("activate;key:space;ax;key:escape;announce"),
+            vec![
+                Step::Activate,
+                Step::Key(NamedKey::Space),
+                Step::Ax,
+                Step::Key(NamedKey::Escape),
+                Step::Announce
+            ]
+        );
     }
 }

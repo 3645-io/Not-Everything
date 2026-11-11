@@ -390,6 +390,44 @@ pub(crate) fn set_label(view: &NSView, label: &str) {
     view.setAccessibilityLabel(Some(&NSString::from_str(label)));
 }
 
+/// Keeps `view` out of what VoiceOver reads: a glyph, or a text whose
+/// control or row reads it out already. A control (a label, an image view)
+/// answers VoiceOver through its cell, so the cell is hidden too.
+pub(crate) fn hide_from_voiceover(view: &NSView) {
+    use objc2_app_kit::NSAccessibility;
+    view.setAccessibilityElement(false);
+    if let Some(cell) = view.downcast_ref::<NSControl>().and_then(|c| c.cell()) {
+        cell.setAccessibilityElement(false);
+    }
+}
+
+/// Makes VoiceOver read `label` as `spoken` (its accessibility value)
+/// rather than its text: the status bar's " · " separators as commas, key
+/// caps in words ([`crate::accessibility`]). The text drawn is unchanged.
+/// The label answers VoiceOver through its cell, so the value goes there.
+pub(crate) fn set_spoken(label: &NSTextField, spoken: &str) {
+    use objc2_app_kit::NSAccessibility;
+    let value = NSString::from_str(spoken);
+    if let Some(cell) = label.cell() {
+        // SAFETY: the value is an NSString, as a text's value is.
+        unsafe { cell.setAccessibilityValue(Some(&value)) };
+    }
+}
+
+/// A result cell's text as VoiceOver reads it: `spoken`, or, for `None`,
+/// nothing at all (a folder's "—" size). Set every time a reused cell
+/// shows another row, so no row keeps another's reading.
+pub(crate) fn set_speech(label: &NSTextField, spoken: Option<&str>) {
+    use objc2_app_kit::NSAccessibility;
+    let Some(cell) = label.cell() else { return };
+    cell.setAccessibilityElement(spoken.is_some());
+    if let Some(spoken) = spoken {
+        let value = NSString::from_str(spoken);
+        // SAFETY: the value is an NSString, as a text's value is.
+        unsafe { cell.setAccessibilityValue(Some(&value)) };
+    }
+}
+
 // ------------------------------------------------------------------ text
 
 /// How a text wraps and aligns.

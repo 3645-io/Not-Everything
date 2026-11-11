@@ -12,8 +12,11 @@
 //!   state machine for the query, sort, stale-result dropping, throttled
 //!   re-runs on new snapshot generations, cached row windows and the status
 //!   text.
-//! - [`actions`]: the read-only actions (open, reveal in Finder, copy path),
-//!   the key map and the drag-out operation mask (copy and link only).
+//! - [`actions`]: the read-only actions (open, reveal in Finder, copy path,
+//!   Quick Look), the key map and the drag-out operation mask (copy and
+//!   link only).
+//! - [`quick_look`]: what Space and Escape do to the Quick Look panel and
+//!   which selected files it shows.
 //! - [`app_args`]: command-line options of the `fx-ui-macos` app binary and
 //!   the per-root engine store path.
 //! - [`data_folder`]: the data folder's owner-only folders and files.
@@ -78,6 +81,9 @@
 //! - [`column_sizes`]: the column widths the dividers between the column
 //!   titles set (drag, arrow keys, the default layout).
 //! - [`ui_text`]: the search window's copy.
+//! - [`accessibility`]: what VoiceOver reads for the custom-drawn parts
+//!   (result rows, cells, the status bar) and the count a new search
+//!   announces.
 //! - [`surface`]: the surfaces and glyphs rendered into pixels, once per
 //!   theme and size class, for `appkit::window::surfaces` to share.
 //!
@@ -100,11 +106,11 @@
 //! of the `table_spike` example.
 //!
 //! The UI is read-only: Enter opens, Cmd+Enter reveals in Finder,
-//! Option+Cmd+C copies full paths, and dragging a result out offers copy
-//! and link only.
-//! There is no delete, rename, move or trash action. Quick Look on Space is
-//! not built yet.
+//! Option+Cmd+C copies full paths, Space shows Quick Look, and dragging a
+//! result out offers copy and link only.
+//! There is no delete, rename, move or trash action.
 
+pub mod accessibility;
 pub mod actions;
 pub mod app_args;
 pub mod app_icon;
@@ -140,6 +146,7 @@ pub mod menu;
 pub mod model;
 pub mod notices;
 pub mod onboarding;
+pub mod quick_look;
 pub mod quit;
 pub mod settings;
 pub mod settings_view;

@@ -3,12 +3,16 @@
 //! Contract pinned here:
 //! - `fx_fs_macos::fsevents::change` (every OS) holds the pure mapping:
 //!   - `map_event(path: &Path, flags: EventFlags, rescan_subtree: bool,
-//!     volume_root: &Path) -> Option<fx_model::Change>`: `None` only for the
-//!     HistoryDone marker; item create/remove/rename/modify give
-//!     `CheckPath`; `MustScanSubDirs`, `UserDropped`, `KernelDropped`, a
+//!     volume_root: &Path) -> Option<fx_model::Change>`: `None` for the
+//!     HistoryDone marker and for a metadata change above the scope root
+//!     (`volume_root`, run 2.1); item create/remove/rename/modify give
+//!     `CheckPath`; `MustScanSubDirs`, a flag word with no item bit, a
 //!     directory rename (`ITEM_RENAMED | ITEM_IS_DIR`) or `rescan_subtree`
-//!     give `RescanSubtree(path)`; `RootChanged`, `EventIdsWrapped` or an
-//!     unmount of the watched volume give `RescanVolume`.
+//!     give `RescanSubtree(path)`; an event above the scope root that
+//!     rescans, mounts over, creates, removes or renames it gives
+//!     `RescanSubtree(volume_root)`; `RootChanged`, `EventIdsWrapped`,
+//!     `UserDropped`, `KernelDropped` or an unmount of the watched volume
+//!     give `RescanVolume`.
 //!   - `coalesce(changes: Vec<Change>) -> Vec<Change>`: keeps one copy of
 //!     each change, drops a `CheckPath` strictly below a `RescanSubtree` in
 //!     the same batch (component-wise), and never drops a rescan.
@@ -53,7 +57,6 @@ fn item_events_check_the_path() {
         F::ITEM_CREATED | F::ITEM_IS_DIR,
         F::ITEM_REMOVED | F::ITEM_IS_DIR,
         F::ITEM_XATTR_MOD | F::ITEM_IS_FILE,
-        F::NONE,
     ] {
         assert_eq!(
             map("/u/a.txt", flags),
@@ -65,9 +68,17 @@ fn item_events_check_the_path() {
 }
 
 #[test]
-fn coalesced_or_dropped_events_rescan_the_subtree() {
+fn coalesced_events_rescan_the_subtree() {
+    assert_eq!(
+        map("/u/dir", F::MUST_SCAN_SUB_DIRS),
+        Some(subtree("/u/dir"))
+    );
+}
+
+#[test]
+fn dropped_events_rescan_the_volume() {
+    // FSEvents.h: a full scan of everything the stream monitors.
     for flags in [
-        F::MUST_SCAN_SUB_DIRS,
         F::MUST_SCAN_SUB_DIRS | F::USER_DROPPED,
         F::MUST_SCAN_SUB_DIRS | F::KERNEL_DROPPED,
         F::USER_DROPPED,
@@ -75,7 +86,7 @@ fn coalesced_or_dropped_events_rescan_the_subtree() {
     ] {
         assert_eq!(
             map("/u/dir", flags),
-            Some(subtree("/u/dir")),
+            Some(Change::RescanVolume),
             "{:#x}",
             flags.bits()
         );
@@ -129,6 +140,228 @@ fn mount_or_unmount_of_another_volume_checks_the_path() {
 #[test]
 fn history_done_marker_maps_to_nothing() {
     assert_eq!(map("/", F::HISTORY_DONE), None);
+}
+
+/// Run 2.1's acceptance table: every `kFSEventStreamEventFlag*` Apple
+/// documents in `FSEvents.h`, alone and in the combinations the kernel
+/// sends, ends in the change that loses nothing. The scope root is a
+/// folder below the volume root, as with a stream filtered to it.
+#[test]
+fn every_documented_flag_ends_in_a_change_that_loses_nothing() {
+    const SCOPE: &str = "/Users/me/proj";
+    let scope_subtree = || Some(subtree(SCOPE));
+    let cases: Vec<(&str, &str, F, Option<Change>)> = vec![
+        // Directory-level change (no item bit): list the folder.
+        (
+            "None",
+            "/Users/me/proj/d",
+            F::NONE,
+            Some(subtree("/Users/me/proj/d")),
+        ),
+        // Hierarchical coalescing.
+        (
+            "MustScanSubDirs",
+            "/Users/me/proj/d",
+            F::MUST_SCAN_SUB_DIRS,
+            Some(subtree("/Users/me/proj/d")),
+        ),
+        (
+            "MustScanSubDirs above the scope",
+            "/Users/me",
+            F::MUST_SCAN_SUB_DIRS,
+            scope_subtree(),
+        ),
+        // Dropped events: everything the stream watches.
+        (
+            "UserDropped",
+            "/Users/me/proj/d",
+            F::MUST_SCAN_SUB_DIRS | F::USER_DROPPED,
+            Some(Change::RescanVolume),
+        ),
+        (
+            "KernelDropped",
+            "/",
+            F::MUST_SCAN_SUB_DIRS | F::KERNEL_DROPPED,
+            Some(Change::RescanVolume),
+        ),
+        // Event IDs wrapped: the cursor is meaningless.
+        (
+            "EventIdsWrapped",
+            "/",
+            F::EVENT_IDS_WRAPPED,
+            Some(Change::RescanVolume),
+        ),
+        ("HistoryDone", "/", F::HISTORY_DONE, None),
+        (
+            "RootChanged",
+            SCOPE,
+            F::ROOT_CHANGED,
+            Some(Change::RescanVolume),
+        ),
+        (
+            "Mount below the scope",
+            "/Users/me/proj/disk",
+            F::MOUNT,
+            Some(check("/Users/me/proj/disk")),
+        ),
+        ("Mount on the scope root", SCOPE, F::MOUNT, scope_subtree()),
+        (
+            "Mount above the scope",
+            "/Users/me",
+            F::MOUNT,
+            scope_subtree(),
+        ),
+        (
+            "Unmount below the scope",
+            "/Users/me/proj/disk",
+            F::UNMOUNT,
+            Some(check("/Users/me/proj/disk")),
+        ),
+        (
+            "Unmount of the scope root",
+            SCOPE,
+            F::UNMOUNT,
+            Some(Change::RescanVolume),
+        ),
+        (
+            "Unmount above the scope",
+            "/Users/me",
+            F::UNMOUNT,
+            scope_subtree(),
+        ),
+        (
+            "ItemCreated",
+            "/Users/me/proj/f",
+            F::ITEM_CREATED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemRemoved",
+            "/Users/me/proj/f",
+            F::ITEM_REMOVED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemInodeMetaMod",
+            "/Users/me/proj/f",
+            F::ITEM_INODE_META_MOD | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemRenamed file (either side)",
+            "/Users/me/proj/f",
+            F::ITEM_RENAMED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemRenamed folder (either side)",
+            "/Users/me/proj/d",
+            F::ITEM_RENAMED | F::ITEM_IS_DIR,
+            Some(subtree("/Users/me/proj/d")),
+        ),
+        (
+            "ItemRenamed folder above the scope",
+            "/Users/me",
+            F::ITEM_RENAMED | F::ITEM_IS_DIR,
+            scope_subtree(),
+        ),
+        (
+            "ItemRemoved folder above the scope",
+            "/Users",
+            F::ITEM_REMOVED | F::ITEM_IS_DIR,
+            scope_subtree(),
+        ),
+        (
+            "ItemModified",
+            "/Users/me/proj/f",
+            F::ITEM_MODIFIED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemFinderInfoMod",
+            "/Users/me/proj/f",
+            F::ITEM_FINDER_INFO_MOD | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemChangeOwner",
+            "/Users/me/proj/f",
+            F::ITEM_CHANGE_OWNER | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemXattrMod",
+            "/Users/me/proj/f",
+            F::ITEM_XATTR_MOD | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemIsSymlink",
+            "/Users/me/proj/l",
+            F::ITEM_CREATED | F::ITEM_IS_SYMLINK,
+            Some(check("/Users/me/proj/l")),
+        ),
+        (
+            "OwnEvent",
+            "/Users/me/proj/f",
+            F::OWN_EVENT | F::ITEM_MODIFIED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/f")),
+        ),
+        (
+            "ItemIsHardlink",
+            "/Users/me/proj/h",
+            F::ITEM_CREATED | F::ITEM_IS_FILE | F::ITEM_IS_HARDLINK,
+            Some(check("/Users/me/proj/h")),
+        ),
+        (
+            "ItemIsLastHardlink",
+            "/Users/me/proj/h",
+            F::ITEM_REMOVED | F::ITEM_IS_FILE | F::ITEM_IS_LAST_HARDLINK,
+            Some(check("/Users/me/proj/h")),
+        ),
+        (
+            "ItemCloned",
+            "/Users/me/proj/c",
+            F::ITEM_CREATED | F::ITEM_CLONED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/c")),
+        ),
+        // Coalesced: created and removed within one latency window.
+        (
+            "ItemCreated|ItemRemoved",
+            "/Users/me/proj/t",
+            F::ITEM_CREATED | F::ITEM_REMOVED | F::ITEM_IS_FILE,
+            Some(check("/Users/me/proj/t")),
+        ),
+        (
+            "ItemCreated|ItemRemoved|ItemRenamed folder",
+            "/Users/me/proj/d",
+            F::ITEM_CREATED | F::ITEM_REMOVED | F::ITEM_RENAMED | F::ITEM_IS_DIR,
+            Some(subtree("/Users/me/proj/d")),
+        ),
+        // Metadata above the scope: nothing indexed changed.
+        (
+            "ItemInodeMetaMod above the scope",
+            "/Users/me",
+            F::ITEM_INODE_META_MOD | F::ITEM_IS_DIR,
+            None,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, path, flags, want) in &cases {
+        let got = map_event(Path::new(path), *flags, false, Path::new(SCOPE));
+        if &got != want {
+            wrong.push(format!(
+                "{name} ({:#x} on {path}): got {got:?}, want {want:?}",
+                flags.bits()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} routes wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 // ------------------------------------------------------------ coalescing
