@@ -24,7 +24,7 @@ A metric fails when it misses its target or is worse than the baseline by more t
 | Class | Metrics | Allowance |
 | --- | --- | --- |
 | Correctness | C1–C3 | None |
-| Sizes and memory | M1–M5, B7, O1 | 5% |
+| Sizes and memory | M1–M5, B7, O1 | 5%; M1 and M2 at least 30 MB |
 | Timings | S1–S7, F1, F3–F6 | 10% of the median of the runs, and at least the floor below |
 | Launch | F2 | 10% of the median of the launches |
 | Background | B1, B2, B4–B6 | 10%, and at least 0.05 points of a core, 5 mW or 0.5 wakeups a second |
@@ -32,7 +32,7 @@ A metric fails when it misses its target or is worse than the baseline by more t
 
 Small numbers vary a lot between identical runs: in 0.3.0, idle CPU ranged from 0.24% to 0.42% across three runs of one build, and engine search at 2M took 16.7 ms p95 in one run and 7.5 ms in another. So a failing step is re-run alone once, and only a second failure counts.
 
-M1 and M2 vary as much as their allowance. On 10 Nov, two runs of one build an hour apart read 1,383 and 1,317 MB with the window hidden, and 1,421 and 1,337 MB showing a search: the app's footprint starts each launch at a different level, and can step by about 70 MB in the middle of a phase without any CPU or disk activity. A failing M1 or M2 gets the same single re-run.
+M1 and M2 vary as much as their allowance. On 10 Nov, two runs of one build an hour apart read 1,383 and 1,317 MB with the window hidden, and 1,421 and 1,337 MB showing a search: the app's footprint starts each launch at a different level, and can step by about 70 MB in the middle of a phase without any CPU or disk activity. A failing M1 or M2 gets the same single re-run. Since 0.4.0 cut the footprint to about 125 MB, 5% is about 6 MB, while identical builds read 125 to 169 MB, so M1 and M2 allow at least 30 MB (the owner's decision of 11 Nov 2026).
 
 ## Metrics
 
