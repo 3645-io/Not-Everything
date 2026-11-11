@@ -1223,6 +1223,8 @@ impl WinController {
                     unsafe { control.performClick(None) };
                 }
             }
+            Step::Divider(i, step) => ui.card.debug_divider(&ui.window, i, step),
+            Step::ScrollX(x) => ui.card.debug_scroll_x(x),
             Step::Wait => {}
             Step::Click(row) => {
                 let r = ui.table.rectOfRow(row as isize);

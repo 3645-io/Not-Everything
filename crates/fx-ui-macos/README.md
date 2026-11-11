@@ -22,6 +22,20 @@ system appearance.
   main thread. Rows come from `Engine::search`, fetched a window at a time.
 - Clicking a column header sorts through the engine (`set_sort`); AppKit
   never sorts. Clicking it again flips the direction.
+- A thin divider sits between the column titles after Name, Path and
+  Size; it turns green while hovered, focused or dragged. Dragging it
+  resizes the column on its left, in the header and every row together,
+  never below that column's minimum (Name 140, Path 120, Size 64 points)
+  nor above 800; Date Modified takes the rest, never less than 140, and
+  when the columns don't fit, the table scrolls sideways with the titles
+  following it. Double-clicking a divider restores the default widths.
+  With the keyboard focus (Full Keyboard Access on, or VoiceOver running),
+  Left and Right move it 8 points, 32 with Shift; VoiceOver reads each
+  divider as a splitter ("Resize the Name column", its width in points)
+  and moves it with increment and decrement. The widths are saved as the
+  `column_widths` line of the settings file (`300,480,88`; no line for the
+  default layout) and restored at launch. The card draws its own titles
+  and dividers; the table's own header and column resizing are off.
 - A background thread receives the engine's new snapshot generations and
   wakes the main thread, which re-runs the query (at most every 100 ms), so
   results grow during the first scan and update when files change.
@@ -155,7 +169,7 @@ values and rules are pure modules, each pinned by tests:
   state; `key_caps`: key caps in Apple's order and the result hints.
 - `chips`, `main_layout` and `window_view`: the Aa, Path and .* search
   options, where the search window's parts go, and what it shows in each
-  state.
+  state; `column_sizes`: the widths the column dividers set.
 - `ui_text`, `settings_view` and `build_info`: the mockups' copy, the
   Settings copy and the channel tag.
 - `surface`: every surface of the mockups rendered once per theme and size
@@ -554,6 +568,7 @@ The main modules, beside the interface modules above:
 | --- | --- | --- |
 | `source` | any host | `ResultsSource` over the engine (and, with `measure`, synthetic rows) |
 | `columns` | any host | The four columns and the header-click sort state |
+| `column_sizes` | any host | The widths the column dividers set: drag, arrow keys, minimums, the settings value |
 | `controller` | any host | `ResultsController`: query, sort, stale pages, throttled re-runs, status |
 | `actions` | any host | Read-only actions, key map, drag-out mask |
 | `app_args` | any host | Command line of the app, the data folder and the per-root store path |

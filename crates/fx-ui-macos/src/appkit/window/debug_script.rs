@@ -22,6 +22,12 @@
 //! counts as AppKit reports them to VoiceOver, the announcement a new
 //! search makes and the Quick Look panel's state). Each step logs where the focus is.
 //!
+//! The column dividers: `divider:I:drag:DX` (a mouse-down on divider I,
+//! 0 Name, 1 Path, 2 Size, dragged DX points and released, as the hardware
+//! sends them), `divider:I:double` (a double-click), `divider:I:key:right`,
+//! `divider:I:key:shift-left` and so on (an arrow key handed to the
+//! divider), and `scrollx:X` (the rows scrolled X points sideways).
+//!
 //! What VoiceOver reads is best seen from outside the app, through the
 //! Accessibility API (`AXUIElementCopyAttributeValue`), as VoiceOver
 //! sees it: asked from inside, AppKit doesn't report every label a control
@@ -46,6 +52,8 @@ pub(crate) enum Step {
     Dark(bool),
     Escape,
     Press(isize),
+    Divider(usize, DividerStep),
+    ScrollX(f64),
     Wait,
     Click(usize),
     Arrow(Arrow),
@@ -54,6 +62,42 @@ pub(crate) enum Step {
     Activate,
     Announce,
     Ax,
+}
+
+/// What [`Step::Divider`] does to a column divider.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DividerStep {
+    /// Pressed, dragged this many points and released.
+    Drag(f64),
+    /// Double-clicked.
+    DoubleClick,
+    /// Left or Right, with Shift or not.
+    Key { right: bool, shift: bool },
+}
+
+/// A `divider:` step's argument: `I:drag:DX`, `I:double` or
+/// `I:key:[shift-]left|right`.
+fn divider_step(arg: &str) -> Option<Step> {
+    let mut parts = arg.trim().splitn(3, ':');
+    let index = parts.next()?.parse().ok()?;
+    let step = match (parts.next()?, parts.next()) {
+        ("drag", Some(dx)) => DividerStep::Drag(dx.parse().ok()?),
+        ("double", None) => DividerStep::DoubleClick,
+        ("key", Some(key)) => {
+            let (shift, key) = match key.strip_prefix("shift-") {
+                Some(key) => (true, key),
+                None => (false, key),
+            };
+            let right = match key {
+                "right" => true,
+                "left" => false,
+                _ => return None,
+            };
+            DividerStep::Key { right, shift }
+        }
+        _ => return None,
+    };
+    Some(Step::Divider(index, step))
 }
 
 /// An arrow key for [`Step::Arrow`].
@@ -115,6 +159,8 @@ fn parse(text: &str) -> Vec<Step> {
                 "appearance" => Some(Step::Dark(arg.trim() == "dark")),
                 "escape" => Some(Step::Escape),
                 "press" => arg.trim().parse().ok().map(Step::Press),
+                "divider" => divider_step(arg),
+                "scrollx" => arg.trim().parse().ok().map(Step::ScrollX),
                 "wait" => Some(Step::Wait),
                 "click" => arg.trim().parse().ok().map(Step::Click),
                 "key" => match arg.trim() {
@@ -167,6 +213,31 @@ mod tests {
             ]
         );
         assert_eq!(parse("click:x;key:left"), vec![]);
+    }
+
+    /// The column dividers can be dragged, double-clicked and stepped with
+    /// the arrow keys, and the rows scrolled sideways, for screenshots.
+    #[test]
+    fn divider_steps_parse() {
+        assert_eq!(
+            parse("divider:0:drag:-60.5;divider:2:double;divider:1:key:shift-right;scrollx:200"),
+            vec![
+                Step::Divider(0, DividerStep::Drag(-60.5)),
+                Step::Divider(2, DividerStep::DoubleClick),
+                Step::Divider(
+                    1,
+                    DividerStep::Key {
+                        right: true,
+                        shift: true
+                    }
+                ),
+                Step::ScrollX(200.0),
+            ]
+        );
+        assert_eq!(
+            parse("divider:x:double;divider:0:drag;divider:0:key:up;divider:1:double:2"),
+            vec![]
+        );
     }
 
     /// `type:TEXT` types each character as a key press into whatever has

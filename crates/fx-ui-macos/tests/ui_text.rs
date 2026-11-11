@@ -46,6 +46,18 @@ fn sort_header_labels() {
     );
 }
 
+/// The column dividers' labels and tooltip (`.ne-col-handle`'s
+/// `aria-label` and `title`).
+#[test]
+fn column_divider_labels() {
+    assert_eq!(ui_text::resize_label("Name"), "Resize the Name column");
+    assert_eq!(ui_text::resize_label("Size"), "Resize the Size column");
+    assert_eq!(
+        ui_text::RESIZE_HINT,
+        "Drag to resize. Double-click to reset."
+    );
+}
+
 #[test]
 fn the_no_matches_state() {
     assert_eq!(
