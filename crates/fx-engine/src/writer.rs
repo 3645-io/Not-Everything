@@ -44,7 +44,10 @@ const BACKGROUND_SLICE: Duration = Duration::from_millis(250);
 pub(crate) const IN_PLACE_BUDGET: Duration = Duration::from_millis(50);
 
 /// How many order entries one batch entry counts for in `merge_units`.
-const BATCH_WEIGHT: f64 = 512.0;
+/// Measured on the M4 Pro (11 Nov, whole disk, 3.73M entries, batches of
+/// 74,000 to 126,000 changes): a merge in place took 1.1 to 1.65 s, about
+/// 10 µs per batch entry, some 800 units at [`FIRST_NS_PER_UNIT`].
+const BATCH_WEIGHT: f64 = 1024.0;
 
 /// The expected cost of a merge in place per unit, in nanoseconds, until
 /// the first one is timed: a cautious guess, so the first is tried only on
@@ -52,8 +55,12 @@ const BATCH_WEIGHT: f64 = 512.0;
 /// merge goes by the time the last one took.
 const FIRST_NS_PER_UNIT: f64 = 12.0;
 
-/// What a refused merge in place takes off the cost estimate.
-const COST_DECAY: f64 = 0.95;
+/// What a refused merge in place takes off the cost estimate. Slow on
+/// purpose: hidden commits come every few seconds under steady changes,
+/// and a merge timed past the budget should be tried again only minutes
+/// later (about 80 refusals from 1.5 times the budget), each retry being
+/// a chance of a wait past the bound.
+const COST_DECAY: f64 = 0.995;
 
 /// A removal postponed to the end of the batch, so that an entry that only
 /// moved (reported at its old path first) is found at its new path before
@@ -1070,13 +1077,17 @@ mod tests {
     #[test]
     fn a_merge_expected_past_the_budget_is_not_done_in_place() {
         // The first estimate: a small batch over a few million entries
-        // fits; a batch big enough to sort and place for long doesn't.
+        // fits; the whole-disk rescans measured on 11 Nov (74,000 changes
+        // and more, 1.1 s and more in place) don't, nor does a far smaller
+        // batch.
         let budget = IN_PLACE_BUDGET.as_nanos() as f64;
         let entries = 3_500_000.0;
-        assert!(FIRST_NS_PER_UNIT * entries <= budget);
-        let big_batch = 20_000.0;
-        assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * big_batch) > budget);
-        // A refusal lowers a timed estimate, so the path is tried again.
+        assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * 100.0) <= budget);
+        for batch in [1_000.0, 74_000.0] {
+            assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * batch) > budget);
+        }
+        // A refusal lowers a timed estimate, so the path is tried again,
+        // but only after many commits (minutes of steady changes).
         let slow = budget / entries * 1.5;
         let mut cost = slow;
         let mut refusals = 0;
@@ -1084,6 +1095,6 @@ mod tests {
             cost *= COST_DECAY;
             refusals += 1;
         }
-        assert!((1..=10).contains(&refusals), "{refusals} refusals");
+        assert!((50..=120).contains(&refusals), "{refusals} refusals");
     }
 }
