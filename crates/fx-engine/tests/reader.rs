@@ -234,9 +234,80 @@ fn reader_matches_engine_search_for_queries_sorts_and_pages() {
     let dir = TempDir::new("same");
     let store = dir.store();
     let engine = engine_with_store(&store);
-    let snap = engine.snapshot();
     let reader = open(&store);
+    assert_same_as_engine(&engine, &reader, "");
+    engine.shutdown();
+}
 
+/// A store holding the fixture, saved with orders that are permutations
+/// of the live entries but not sorted: `scramble` of each right order, as
+/// a store saved under other sort rules could hold. Its checksums and the
+/// permutation checks pass, so only comparing entries finds them wrong.
+fn store_with_scrambled_orders(dir: &TempDir, scramble: fn(Vec<u32>) -> Vec<u32>) -> PathBuf {
+    let store = dir.store();
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let snap = fixture_index().snapshot();
+    let parts = snap.to_parts();
+    // The key codes the engine saves its orders under.
+    let orders: Vec<(u8, Vec<u32>)> = [
+        (1, SortKey::Name),
+        (2, SortKey::Path),
+        (3, SortKey::Size),
+        (4, SortKey::Modified),
+    ]
+    .into_iter()
+    .map(|(code, key)| (code, scramble(fx_sort::Order::build(&*snap, key).ids)))
+    .collect();
+    let orders: Vec<(u8, &[u32])> = orders
+        .iter()
+        .map(|(code, ids)| (*code, ids.as_slice()))
+        .collect();
+    fx_store::write_checkpoint(
+        &store,
+        &fx_store::SaveInput {
+            parts: &parts,
+            volumes: &[],
+            orders: &orders,
+            clean_shutdown: true,
+        },
+    )
+    .expect("store written");
+    store
+}
+
+#[test]
+fn saved_orders_that_do_not_fit_the_index_still_sort_like_the_engine() {
+    let reference = TempDir::new("scrambled-engine");
+    let engine = engine_with_store(&reference.store());
+    let scrambles: [(&str, fn(Vec<u32>) -> Vec<u32>); 3] = [
+        // Every pair of matches out of order.
+        ("reversed", |mut ids| {
+            ids.reverse();
+            ids
+        }),
+        // Wrong only at the ends: some queries' matches still fit.
+        ("ends swapped", |mut ids| {
+            let last = ids.len() - 1;
+            ids.swap(0, last);
+            ids
+        }),
+        ("rotated", |mut ids| {
+            ids.rotate_left(1);
+            ids
+        }),
+    ];
+    for (what, scramble) in scrambles {
+        let dir = TempDir::new("scrambled");
+        let reader = open(&store_with_scrambled_orders(&dir, scramble));
+        assert_same_as_engine(&engine, &reader, what);
+    }
+    engine.shutdown();
+}
+
+/// Every query, sort, direction and window gives the engine's total and
+/// rows (compared by full path).
+fn assert_same_as_engine(engine: &Engine, reader: &StoreReader, store: &str) {
+    let snap = engine.snapshot();
     let queries = [
         "",
         "report",
@@ -272,12 +343,12 @@ fn reader_matches_engine_search_for_queries_sorts_and_pages() {
                     let got = reader
                         .search(query, &defaults(), sort, direction, offset, limit)
                         .unwrap_or_else(|_| panic!("reader search {query:?}"));
-                    let what = format!("{query:?} {sort:?} {direction:?} {offset}+{limit}");
+                    let what = format!("{store} {query:?} {sort:?} {direction:?} {offset}+{limit}");
                     assert_eq!(got.total, want.total, "total for {what}");
                     let want_paths: Vec<String> =
                         want.ids.iter().map(|&id| engine_path(&snap, id)).collect();
                     assert_eq!(
-                        reader_paths(&reader, &got.ids),
+                        reader_paths(reader, &got.ids),
                         want_paths,
                         "rows for {what}"
                     );
@@ -285,7 +356,6 @@ fn reader_matches_engine_search_for_queries_sorts_and_pages() {
             }
         }
     }
-    engine.shutdown();
 }
 
 #[test]
