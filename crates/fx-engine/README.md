@@ -49,10 +49,12 @@ cargo test -p fx-engine
   reported under a folder's old path in the same batch as the folder's
   move removed the entry), which run 2.17 fixed; the bug's two tests now
   run with the rest (see the file's documentation).
-- `tests/case_rename.rs` (macOS only, ignored) shows a bug the soak found:
-  after a case-only rename on a case-insensitive volume, an event for the
-  old spelling puts the old name back, because `MacPathStat` names an
-  entry after the path it is given.
+- `tests/case_rename.rs` (macOS only) covers a bug the soak found: after a
+  case-only rename on a case-insensitive volume, an event or a rescan for
+  the old spelling put the old name back, because `MacPathStat` named an
+  entry after the path it was given. It now reads the name stored on disk,
+  and the tests check both event orders, the old spelling alone and a
+  folder rescanned under its old spelling, with the real stat and scanner.
 
 fx-fs-macos is a dev-dependency under
 `[target.'cfg(target_os = "macos")'.dev-dependencies]` only; the library

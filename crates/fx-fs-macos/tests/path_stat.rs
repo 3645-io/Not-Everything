@@ -7,6 +7,10 @@
 //! - A stat'ed entry carries the same key, parent key, name, kind and size
 //!   that `MacScanner` reports for the same path.
 //! - A missing path, or a path whose parent vanished, is `Ok(None)`.
+//! - The name is the one stored on disk, whatever spelling the path used:
+//!   on a case-insensitive volume the old spelling of a case-only rename
+//!   still finds the entry, and must not bring the old name back. The
+//!   root, mount points, firmlinks and hard links keep the path's name.
 
 #![cfg(target_os = "macos")]
 
@@ -110,5 +114,82 @@ fn matches_what_the_scanner_reports() {
         assert_eq!(got.kind, want.kind, "{rel}: kind");
         assert_eq!(got.size, want.size, "{rel}: size");
         assert_eq!(got.modified, want.modified, "{rel}: modified");
+    }
+}
+
+/// Whether the spelling `other` finds the entry at `path` (a case-insensitive
+/// volume).
+fn folds_case(path: &Path, other: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok() && fs::symlink_metadata(other).is_ok()
+}
+
+#[test]
+fn an_old_spelling_reports_the_name_stored_on_disk() {
+    let root = TempRoot::new("case");
+    let renames = [
+        ("Report.txt", "REPORT.TXT"),
+        ("Docs", "docs"),
+        ("Link", "LINK"),
+        ("\u{e9}t\u{e9}.txt", "\u{c9}T\u{c9}.TXT"),
+    ];
+    fs::write(root.0.join(renames[0].0), b"r").expect("write");
+    fs::create_dir(root.0.join(renames[1].0)).expect("mkdir");
+    std::os::unix::fs::symlink("nowhere", root.0.join(renames[2].0)).expect("symlink");
+    fs::write(root.0.join(renames[3].0), b"e").expect("write");
+    if !folds_case(&root.0.join(renames[0].0), &root.0.join(renames[0].1)) {
+        // A case-sensitive volume: the two spellings are two names.
+        return;
+    }
+    for (old, new) in renames {
+        fs::rename(root.0.join(old), root.0.join(new)).expect("rename");
+    }
+
+    let mut scanned = Vec::new();
+    MacScanner::new(ScanOptions::default())
+        .enumerate(&root.0, &mut |e| scanned.push(e))
+        .expect("enumerate");
+    for (old, new) in renames {
+        let got = stat(&root.0.join(old)).unwrap_or_else(|| panic!("{old} still finds {new}"));
+        assert_eq!(got.name, new, "{old}: the stored name");
+        assert_eq!(got, stat(&root.0.join(new)).expect("new spelling"), "{old}");
+        let listed = scanned
+            .iter()
+            .find(|e| e.key == got.key)
+            .unwrap_or_else(|| panic!("scanner reported no entry with {new}'s key"));
+        assert_eq!(got.name, listed.name, "{old}: the scanner's name");
+    }
+}
+
+#[test]
+fn hard_links_keep_the_name_the_path_gives() {
+    let root = TempRoot::new("links");
+    fs::create_dir(root.0.join("sub")).expect("mkdir");
+    let first = root.0.join("first.txt");
+    fs::write(&first, b"x").expect("write");
+    fs::hard_link(&first, root.0.join("second.txt")).expect("link");
+    fs::hard_link(&first, root.0.join("sub/Third.txt")).expect("link");
+
+    let key = stat(&first).expect("first").key;
+    for (rel, name) in [
+        ("first.txt", "first.txt"),
+        ("second.txt", "second.txt"),
+        ("sub/Third.txt", "Third.txt"),
+    ] {
+        let got = stat(&root.0.join(rel)).unwrap_or_else(|| panic!("{rel} exists"));
+        assert_eq!(got.key, key, "{rel}: one file");
+        assert_eq!(got.name, name, "{rel}: the link's own name");
+    }
+}
+
+#[test]
+fn the_root_mount_points_and_firmlinks_keep_their_folder_names() {
+    // `getattrlist` names a volume's root after the volume ("Macintosh HD"
+    // for `/`, "Macintosh HD - Data" for the Data volume): the index needs
+    // the folder's name, as its parent lists it.
+    assert_eq!(stat(Path::new("/")).expect("/").name, "/");
+    for (path, name) in [("/System/Volumes/Data", "Data"), ("/Users", "Users")] {
+        if let Some(got) = stat(Path::new(path)) {
+            assert_eq!(got.name, name, "{path}");
+        }
     }
 }
