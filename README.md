@@ -77,9 +77,8 @@ or trash action in the app or the CLI. The supported actions are:
 - **Return** in the search field moves to the results; the arrow keys pick a file.
 - **Enter** in the results opens the selected file.
 - **Cmd+Enter** reveals it in Finder.
+- **Space** shows it in Quick Look; Space again or Escape closes the panel.
 - **Copy full path**.
-
-Quick Look on Space is planned for Phase 2.
 
 Dragging a result out of the window offers copy and link only, never move or delete, so
 dropping it on the Trash or a Finder folder cannot remove the file. Indexing never triggers

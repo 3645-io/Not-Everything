@@ -6,6 +6,10 @@
 //!
 //! The views are made once; an update sets the texts that changed and
 //! moves the slots, and nothing redraws while the window is idle.
+//!
+//! VoiceOver reads each text in words ([`crate::accessibility`]): "8
+//! results, 2,014,377 objects", "Up to date, 9 ms", and each hint as one
+//! element, "Reveal in Finder, Command Return", with its caps hidden.
 
 use std::cell::{Cell, RefCell};
 
@@ -18,9 +22,10 @@ use objc2_app_kit::{
 use objc2_foundation::{NSArray, NSMutableAttributedString, NSPoint, NSRect, NSSize};
 
 use super::views::{
-    FlippedView, Flow, SurfaceView, color, label, place, place_line, set_text, styled,
-    surface_image, text_width,
+    FlippedView, Flow, SurfaceView, color, hide_from_voiceover, label, place, place_line,
+    set_spoken, set_text, styled, surface_image, text_width,
 };
+use crate::accessibility::{hint_label, spoken};
 use crate::key_caps::RESULT_HINTS;
 use crate::main_layout::{Rect, STATUS_LINE, hints, key_width, status_bar};
 use crate::status_view::{IndexSlot, Middle, StatusView};
@@ -139,12 +144,15 @@ impl StatusBar {
                         let surface = SurfaceView::new(mtm);
                         let label = label(mtm);
                         label.setAlignment(NSTextAlignment::Center);
+                        // The hint's label reads its keys in words.
+                        hide_from_voiceover(&label);
                         hints_view.addSubview(&surface);
                         hints_view.addSubview(&label);
                         KeyCap { surface, label }
                     })
                     .collect();
                 let label = label(mtm);
+                set_spoken(&label, &hint_label(h));
                 hints_view.addSubview(&label);
                 Hint { keys, label }
             })
@@ -249,6 +257,7 @@ impl StatusBar {
             left,
         ));
         self.counts.setAttributedStringValue(&counts);
+        set_spoken(&self.counts, &spoken(&status.counts.text()));
         let counts_w = text_width(&self.counts);
 
         let middle_w = match &status.middle {
@@ -264,6 +273,7 @@ impl StatusBar {
             }
             Middle::Note(text) => {
                 set_text(&self.note, text, &styles::STATUS_TEXT, Token::Muted, left);
+                set_spoken(&self.note, &spoken(text));
                 self.note.setHidden(false);
                 self.hints.setHidden(true);
                 Some(text_width(&self.note))
@@ -281,6 +291,7 @@ impl StatusBar {
             IndexSlot::Error(text) => (text, Token::DangerInk, None),
         };
         set_text(&self.index, text, &styles::STATUS_INDEX, token, left);
+        set_spoken(&self.index, &spoken(text));
         let text_w = text_width(&self.index);
         let index_w = lead.map_or(0.0, |(w, gap)| w + gap) + text_w;
 

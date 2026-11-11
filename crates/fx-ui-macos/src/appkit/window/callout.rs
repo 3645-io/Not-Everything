@@ -9,8 +9,8 @@ use objc2_app_kit::{NSTextAlignment, NSTextField, NSView};
 use objc2_foundation::NSMutableAttributedString;
 
 use super::views::{
-    FlippedView, Flow, HitButton, SurfaceView, label, place, place_line, place_text, set_text,
-    styled, text_height, text_width, wrapping_label,
+    FlippedView, Flow, HitButton, SurfaceView, hide_from_voiceover, label, place, place_line,
+    place_text, set_text, styled, text_height, text_width, wrapping_label,
 };
 use crate::main_layout::{BannerLayout, Rect, banner};
 use crate::surface::Surface;
@@ -48,6 +48,8 @@ impl Callout {
             let surface = SurfaceView::new(mtm);
             let label = label(mtm);
             label.setAlignment(NSTextAlignment::Center);
+            // The button reads its title; VoiceOver would read it twice.
+            hide_from_voiceover(&label);
             let hit = HitButton::new(mtm, target, action, 0, title, false, false);
             view.addSubview(&surface);
             view.addSubview(&label);
