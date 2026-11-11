@@ -91,12 +91,14 @@ pub struct EngineSnapshot {
     pub(crate) orders_pending: bool,
 }
 
-/// How long [`settled`] waits for the writer to finish merging the orders
-/// in place. The merge takes a few milliseconds per million entries; the
-/// limit only guards against a writer that never publishes again, and the
-/// snapshot it then returns is still correct (an order it lacks is built
-/// on the spot, see `order_or_build`).
-const SETTLE_LIMIT: Duration = Duration::from_secs(1);
+/// The longest [`settled`] waits for the writer to finish merging the
+/// orders in place: the owner's bound (11 Nov) for a search waiting on a
+/// hidden merge. The writer merges in place only when it expects to finish
+/// well inside it (`writer::IN_PLACE_BUDGET`). Past it, `settled` returns
+/// the snapshot without orders, which is still correct: a search builds the
+/// order it needs on the spot (`order_or_build`), and a save writes the
+/// store without orders, which are then built at the next launch.
+pub(crate) const SETTLE_LIMIT: Duration = Duration::from_millis(100);
 
 /// The latest published snapshot whose orders are in place.
 ///
@@ -202,7 +204,12 @@ mod tests {
         let current = ArcSwap::from_pointee(snapshot(1, true));
         let start = Instant::now();
         let snap = settled(&current);
+        let waited = start.elapsed();
         assert!(snap.orders_pending, "the only snapshot there is");
-        assert!(start.elapsed() >= SETTLE_LIMIT);
+        assert!(waited >= SETTLE_LIMIT);
+        // The owner's bound: a search waits under 100 ms for a merge (with
+        // some room for the last sleep on a busy machine).
+        assert_eq!(SETTLE_LIMIT, Duration::from_millis(100));
+        assert!(waited < Duration::from_millis(150), "waited {waited:?}");
     }
 }

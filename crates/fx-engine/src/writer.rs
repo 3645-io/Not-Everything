@@ -38,6 +38,23 @@ const PAUSE_POLL: Duration = Duration::from_millis(20);
 /// is not, since nothing is pending then.
 const BACKGROUND_SLICE: Duration = Duration::from_millis(250);
 
+/// The longest the writer expects readers to wait for a merge in place
+/// (`Writer::take_orders`): half of `snapshot::SETTLE_LIMIT`, the owner's
+/// 100 ms bound, so a merge slower than expected still ends inside it.
+pub(crate) const IN_PLACE_BUDGET: Duration = Duration::from_millis(50);
+
+/// How many order entries one batch entry counts for in `merge_units`.
+const BATCH_WEIGHT: f64 = 512.0;
+
+/// The expected cost of a merge in place per unit, in nanoseconds, until
+/// the first one is timed: a cautious guess, so the first is tried only on
+/// an index of up to about 4M entries with a small batch. Every later
+/// merge goes by the time the last one took.
+const FIRST_NS_PER_UNIT: f64 = 12.0;
+
+/// What a refused merge in place takes off the cost estimate.
+const COST_DECAY: f64 = 0.95;
+
 /// A removal postponed to the end of the batch, so that an entry that only
 /// moved (reported at its old path first) is found at its new path before
 /// anything is removed.
@@ -82,6 +99,11 @@ pub(crate) struct Writer<C, P, V> {
     /// the next publish asks for that exact snapshot to be saved, so the
     /// base can then be served from the saved file (run 2.17 step 2).
     pub(crate) fresh_base: bool,
+    /// What the last merge in place took per unit of `merge_units`, in
+    /// nanoseconds, from publishing the snapshot without orders to
+    /// publishing the result: what readers could wait. `None` before the
+    /// first.
+    pub(crate) in_place_cost: Option<f64>,
 }
 
 /// What the writer must do before it reads the change source again.
@@ -712,8 +734,9 @@ where
         let snap = self.index.snapshot();
         let rebuild = self.orders_stale || self.batch.len() > self.index.live_count() / 2;
         self.orders_stale = false;
-        // `_pending` is held until the new snapshot is published.
-        let (mut orders, _pending): (Vec<Order>, Option<Pending>) = if rebuild {
+        let units = self.merge_units();
+        // `pending` is held until the new snapshot is published.
+        let (mut orders, pending): (Vec<Order>, Option<Pending>) = if rebuild {
             // One Name sort shared by every order (a first scan lands here).
             let keys: Vec<_> = self.orders.iter().map(|o| o.key).collect();
             (Order::build_keys(&*snap, &keys), None)
@@ -751,6 +774,11 @@ where
         self.group_stale = true;
         self.generation += 1;
         self.publish(cursor);
+        if let Some(pending) = pending {
+            // How long readers could have waited: the next estimate.
+            self.in_place_cost = Some(pending.since.elapsed().as_nanos() as f64 / units);
+            drop(pending);
+        }
         if std::mem::take(&mut self.fresh_base) {
             // The snapshot just published holds exactly the new base: its
             // delta is empty and nothing is removed yet.
@@ -832,9 +860,37 @@ where
         self.shared.notify(self.generation);
     }
 
+    /// The work of merging the batch into the orders, in the units of
+    /// `in_place_cost`: each order is read once or twice whole, and each
+    /// entry of the batch is sorted and placed by halving in every order
+    /// (some 25 name comparisons each), counted as [`BATCH_WEIGHT`] order
+    /// entries.
+    fn merge_units(&self) -> f64 {
+        self.index.live_count() as f64 + BATCH_WEIGHT * self.batch.len() as f64
+    }
+
+    /// Whether a merge in place is expected to end within
+    /// [`IN_PLACE_BUDGET`], from the time the last one took per unit (or
+    /// [`FIRST_NS_PER_UNIT`] before any). A refusal lowers the estimate a
+    /// little, so a merge timed during a busy moment doesn't rule the
+    /// in-place path out for good: it is tried, and timed, again later.
+    fn in_place_fits(&mut self) -> bool {
+        let per_unit = self.in_place_cost.unwrap_or(FIRST_NS_PER_UNIT);
+        let expected = per_unit * self.merge_units();
+        if expected <= IN_PLACE_BUDGET.as_nanos() as f64 {
+            return true;
+        }
+        if let Some(cost) = &mut self.in_place_cost {
+            *cost *= COST_DECAY;
+        }
+        false
+    }
+
     /// Takes the published orders over, so the batch can be merged into
-    /// them in place: only while no window shows, and only when nothing
-    /// but the writer and the published snapshot holds them.
+    /// them in place: only while no window shows, when no compaction is
+    /// due, when the merge is expected to end well inside the wait readers
+    /// accept ([`in_place_fits`](Self::in_place_fits)), and only when
+    /// nothing but the writer and the published snapshot holds them.
     ///
     /// The writer always merged into a copy of each order, since the
     /// published snapshot still held the old one: 16 B per entry at every
@@ -848,7 +904,9 @@ where
     /// While a window shows, searches never wait for a merge: the orders
     /// are copied, as before.
     fn take_orders(&mut self) -> Option<(Vec<Order>, Pending)> {
-        if self.foreground() {
+        // A compaction would run while readers wait; a merge expected to
+        // take long would keep them waiting past `snapshot::SETTLE_LIMIT`.
+        if self.foreground() || self.compaction_due() || !self.in_place_fits() {
             return None;
         }
         let current = self.shared.current.load_full();
@@ -864,10 +922,12 @@ where
         drop(current);
         // The swap settles the loans of readers that are still reading the
         // old snapshot (arc-swap's `load`), so the counts below are exact.
+        let since = Instant::now();
         let old = self.shared.current.swap(Arc::clone(&interim));
         let pending = Pending {
             shared: Arc::clone(&self.shared),
             interim,
+            since,
         };
         let mut old = match Arc::try_unwrap(old) {
             Ok(old) => old,
@@ -899,6 +959,8 @@ where
 struct Pending {
     shared: Arc<Shared>,
     interim: Arc<EngineSnapshot>,
+    /// When it was published: readers may wait from then on.
+    since: Instant,
 }
 
 impl Drop for Pending {
@@ -970,6 +1032,7 @@ mod tests {
         let pending = Pending {
             shared: Arc::clone(&shared),
             interim,
+            since: Instant::now(),
         };
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _pending = pending;
@@ -988,10 +1051,39 @@ mod tests {
         let pending = Pending {
             shared: Arc::clone(&shared),
             interim,
+            since: Instant::now(),
         };
         let published = Arc::new(snapshot(4, false));
         shared.current.store(Arc::clone(&published));
         drop(pending);
         assert!(Arc::ptr_eq(&shared.current.load_full(), &published));
+    }
+
+    #[test]
+    fn the_writer_waits_less_than_the_readers_accept() {
+        // The owner's bound for a search waiting on a hidden merge (11 Nov),
+        // and the writer's own budget well inside it.
+        assert!(crate::snapshot::SETTLE_LIMIT <= Duration::from_millis(100));
+        assert!(IN_PLACE_BUDGET * 2 <= crate::snapshot::SETTLE_LIMIT);
+    }
+
+    #[test]
+    fn a_merge_expected_past_the_budget_is_not_done_in_place() {
+        // The first estimate: a small batch over a few million entries
+        // fits; a batch big enough to sort and place for long doesn't.
+        let budget = IN_PLACE_BUDGET.as_nanos() as f64;
+        let entries = 3_500_000.0;
+        assert!(FIRST_NS_PER_UNIT * entries <= budget);
+        let big_batch = 20_000.0;
+        assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * big_batch) > budget);
+        // A refusal lowers a timed estimate, so the path is tried again.
+        let slow = budget / entries * 1.5;
+        let mut cost = slow;
+        let mut refusals = 0;
+        while cost * entries > budget {
+            cost *= COST_DECAY;
+            refusals += 1;
+        }
+        assert!((1..=10).contains(&refusals), "{refusals} refusals");
     }
 }

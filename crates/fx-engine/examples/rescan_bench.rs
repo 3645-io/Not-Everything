@@ -34,8 +34,12 @@
 //! Output: `metric=value` lines (see the crate README): `rescan_entries`,
 //! `rescan_p50_ms`, `rescan_max_ms`, `rescan_walk_heap_peak_mb`,
 //! `rescan_after_walk_heap_peak_mb`, `rescan_heap_peak_mb` and
-//! `rescan_footprint_peak_mb` (the largest over the runs), and the heap
-//! peaks of each run (`rescan_run<N>_…`). Exit codes: 0 after the rescans,
+//! `rescan_footprint_peak_mb` (the largest over the runs), the heap peaks
+//! of each run (`rescan_run<N>_…`), and the longest `Engine::snapshot()`
+//! call of a reader polling every millisecond while it waited, which shows
+//! how long a search could wait for the writer's merge in place
+//! (`rescan_run<N>_snapshot_wait_max_ms`, `rescan_snapshot_wait_max_ms`).
+//! Exit codes: 0 after the rescans,
 //! 1 on an error or timeout, 2 for bad arguments. On hosts other than macOS
 //! it prints a message and exits with 0.
 //!
@@ -429,6 +433,7 @@ usage:
         let mut walk_peak = 0usize;
         let mut after_peak = 0usize;
         let mut fp_peak_max = 0u64;
+        let mut snapshot_wait_max = 0u64;
         let mut touched: Vec<PathBuf> = Vec::new();
         for run in 1..=args.runs {
             touch(&root, run, args.touch, &mut touched)?;
@@ -445,10 +450,23 @@ usage:
 
             let t = Instant::now();
             let want = source.rescan(&root);
+            SNAPSHOT_WAIT_MAX_US.store(0, Ordering::Relaxed);
             wait(&engine, args.timeout, |e| {
-                e.snapshot().cursor() == Some(want)
+                // A reader every millisecond: how long `snapshot()` keeps
+                // it while the writer merges the orders in place.
+                let asked = Instant::now();
+                let snap = e.snapshot();
+                let us = asked.elapsed().as_micros() as u64;
+                SNAPSHOT_WAIT_MAX_US.fetch_max(us, Ordering::Relaxed);
+                snap.cursor() == Some(want)
             })?;
             times.push(t.elapsed());
+            let waited = SNAPSHOT_WAIT_MAX_US.load(Ordering::Relaxed);
+            snapshot_wait_max = snapshot_wait_max.max(waited);
+            metric(
+                &format!("rescan_run{run}_snapshot_wait_max_ms"),
+                format!("{:.3}", waited as f64 / 1e3),
+            );
             let above = |peak: &AtomicUsize| peak.load(Ordering::Relaxed).saturating_sub(heap0);
             let (whole, walk, after) = (above(&PEAK), above(&WALK_PEAK), above(&AFTER_PEAK));
             metric(&format!("rescan_run{run}_walk_heap_peak_mb"), mb(walk));
@@ -474,8 +492,16 @@ usage:
             "rescan_footprint_peak_mb",
             format!("{:.1}", fp_peak_max as f64 / 1e6),
         );
+        metric(
+            "rescan_snapshot_wait_max_ms",
+            format!("{:.3}", snapshot_wait_max as f64 / 1e3),
+        );
         Ok(())
     }
+
+    /// The longest `Engine::snapshot()` call of the current rescan, in
+    /// microseconds.
+    static SNAPSHOT_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
 
     /// Bytes as megabytes, with one decimal.
     fn mb(bytes: usize) -> String {

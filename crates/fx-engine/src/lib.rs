@@ -330,6 +330,7 @@ impl Engine {
             group,
             group_stale: false,
             fresh_base: false,
+            in_place_cost: None,
         };
         let handle = thread::Builder::new()
             .name("fx-engine-writer".into())
