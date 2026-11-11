@@ -231,7 +231,8 @@ impl Order {
     /// ascending by its key: every pair of neighbours in the order that
     /// [`SortKey::compare`] gives them.
     ///
-    /// The comparisons run in parallel on the rayon pool. A Path order is
+    /// The comparisons run in parallel on the rayon pool, except over a
+    /// small source (below `PAR_CHECK_MIN_ENTRIES` IDs). A Path order is
     /// checked in one walk of the folder tree instead of a comparison of
     /// full paths per pair (see `path_walk_fits`); only when the walk
     /// doesn't fit (a wrong order, or live entries the walk can't reach)
@@ -261,6 +262,14 @@ impl Order {
 
 /// Below this many neighbour pairs, a parallel check stops splitting.
 const PAR_CHECK_MIN: usize = 4096;
+
+/// Below this many IDs, the checks run on the calling thread. Handing a
+/// small store's check to the rayon pool costs more than it saves: the
+/// caller waits for a pool thread to wake (or, at the first use, for the
+/// pool to start), which the quick catch-up benchmark measured as about
+/// 35 ms on a busy Mac against 1.5 ms for the whole open of a
+/// 2,000-entry store.
+const PAR_CHECK_MIN_ENTRIES: usize = 1 << 16;
 
 /// How a check answers the Name rule for two live entries.
 #[derive(Clone, Copy)]
@@ -318,15 +327,20 @@ fn check_orders<S: SortSource + Sync + ?Sized>(
     if orders.is_empty() {
         return Ok(());
     }
+    let parallel = src.id_bound() >= PAR_CHECK_MIN_ENTRIES;
     let bound = u32::try_from(src.id_bound()).unwrap_or(u32::MAX);
-    let live = (0..bound)
-        .into_par_iter()
-        .filter(|&i| src.is_live(EntryId(i)))
-        .count();
-    let permutations: Vec<Result<(), OrderError>> = orders
-        .par_iter()
-        .map(|order| check_permutation(&order.ids, src, live))
-        .collect();
+    let is_live = |&i: &u32| src.is_live(EntryId(i));
+    let live = if parallel {
+        (0..bound).into_par_iter().filter(is_live).count()
+    } else {
+        (0..bound).filter(is_live).count()
+    };
+    let permutation = |order: &&Order| check_permutation(&order.ids, src, live);
+    let permutations: Vec<Result<(), OrderError>> = if parallel {
+        orders.par_iter().map(permutation).collect()
+    } else {
+        orders.iter().map(permutation).collect()
+    };
     permutations.into_iter().collect::<Result<(), _>>()?;
     // Ranks are only as good as the order they come from: the Name order
     // passes its own check, comparing names, before any other order uses
@@ -334,23 +348,24 @@ fn check_orders<S: SortSource + Sync + ?Sized>(
     let by_name = orders.iter().position(|order| order.key == SortKey::Name);
     let ranks = match by_name {
         Some(i) => {
-            check_key_order(orders[i], src, Names::Compare)?;
+            check_key_order(orders[i], src, Names::Compare, parallel)?;
             Some(name_ranks(src.id_bound(), &orders[i].ids))
         }
         None => None,
     };
     let names = ranks.as_deref().map_or(Names::Compare, Names::Ranks);
-    let sorted: Vec<Result<(), OrderError>> = orders
-        .par_iter()
-        .enumerate()
-        .map(|(i, order)| {
-            if Some(i) == by_name {
-                Ok(())
-            } else {
-                check_key_order(order, src, names)
-            }
-        })
-        .collect();
+    let sorted = |(i, order): (usize, &&Order)| {
+        if Some(i) == by_name {
+            Ok(())
+        } else {
+            check_key_order(order, src, names, parallel)
+        }
+    };
+    let sorted: Vec<Result<(), OrderError>> = if parallel {
+        orders.par_iter().enumerate().map(sorted).collect()
+    } else {
+        orders.iter().enumerate().map(sorted).collect()
+    };
     sorted.into_iter().collect()
 }
 
@@ -384,23 +399,29 @@ fn check_permutation<S: SortSource + ?Sized>(
 }
 
 /// Checks that `order`, a permutation of the live IDs, is strictly
-/// ascending by its key, with the Name rule answered by `names`.
+/// ascending by its key, with the Name rule answered by `names`; the pairs
+/// are compared on the rayon pool when `parallel`.
 fn check_key_order<S: SortSource + Sync + ?Sized>(
     order: &Order,
     src: &S,
     names: Names<'_>,
+    parallel: bool,
 ) -> Result<(), OrderError> {
     let ids = &order.ids;
     if order.key == SortKey::Path && path_walk_fits(ids, src, names) {
         return Ok(());
     }
     let key = order.key;
-    let first = ids
-        .par_windows(2)
-        .with_min_len(PAR_CHECK_MIN)
-        .position_first(|pair| {
-            compare_with(key, src, names, EntryId(pair[0]), EntryId(pair[1])) != Ordering::Less
-        });
+    let unordered = |pair: &[u32]| {
+        compare_with(key, src, names, EntryId(pair[0]), EntryId(pair[1])) != Ordering::Less
+    };
+    let first = if parallel {
+        ids.par_windows(2)
+            .with_min_len(PAR_CHECK_MIN)
+            .position_first(unordered)
+    } else {
+        ids.windows(2).position(unordered)
+    };
     match first {
         Some(position) => Err(OrderError::OutOfOrder { position }),
         None => Ok(()),
