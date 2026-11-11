@@ -17,6 +17,8 @@ use std::fmt;
 
 use fx_model::{ResumeCursor, StartOutcome};
 
+use super::flags::EventFlags;
+
 /// `kFSEventStreamEventIdSinceNow` from `FSEvents.h`: start with events
 /// that happen after the stream is created.
 pub const EVENT_ID_SINCE_NOW: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -162,7 +164,12 @@ pub fn decide_start(
 /// A replaying tracker also decides which events are delivered: FSEvents
 /// may replay events at or before the saved event ID, which were already
 /// applied. [`CursorTracker::on_event`] rejects those and counts them in
-/// [`CursorTracker::dropped_before_cursor`].
+/// [`CursorTracker::dropped_before_cursor`]. That rule is for item events
+/// only: [`CursorTracker::on_raw_event`] always delivers the special events
+/// (a rescan request, a mount or unmount, RootChanged, whose event ID
+/// `FSEvents.h` gives as zero) and handles an EventIdsWrapped event, after
+/// which every earlier ID is meaningless
+/// ([`CursorTracker::on_ids_wrapped`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorTracker {
     /// The event ID a resume cursor may hold.
@@ -213,15 +220,68 @@ impl CursorTracker {
             self.dropped_before_cursor += 1;
             return false;
         }
-        if id == EVENT_ID_SINCE_NOW {
+        self.record(id);
+        true
+    }
+
+    /// Records one event of any kind, the HistoryDone marker included, and
+    /// returns whether it is to be delivered:
+    ///
+    /// * the HistoryDone marker: [`CursorTracker::on_history_done`];
+    /// * `EventIdsWrapped`: [`CursorTracker::on_ids_wrapped`];
+    /// * any other special event (`MustScanSubDirs`, `UserDropped`,
+    ///   `KernelDropped`, `RootChanged`, `Mount`, `Unmount`): always
+    ///   delivered, even at or before the replay start, because it asks for
+    ///   work no earlier event covered and `FSEvents.h` gives RootChanged an
+    ///   event ID of zero; an ID of zero moves nothing;
+    /// * any other event: [`CursorTracker::on_event`].
+    pub fn on_raw_event(&mut self, id: u64, flags: EventFlags) -> bool {
+        if flags.contains(EventFlags::HISTORY_DONE) {
+            self.on_history_done(id);
             return true;
+        }
+        if flags.contains(EventFlags::EVENT_IDS_WRAPPED) {
+            self.on_ids_wrapped(id);
+            return true;
+        }
+        if flags.0 & EventFlags::SPECIAL != 0 {
+            self.record(id);
+            return true;
+        }
+        self.on_event(id)
+    }
+
+    /// Records an `EventIdsWrapped` event with its (post-wrap) ID.
+    ///
+    /// The 64-bit counter wrapped, so every earlier ID is meaningless: a
+    /// replaying stream stops dropping events at or below its replay start
+    /// (every later ID is below it), the replay counts as done (the event
+    /// rescans the volume, which covers every historical event), and the
+    /// cursor moves to `id`, from where later events advance it. Without
+    /// that the cursor would stay at the pre-wrap maximum, and a replaying
+    /// stream would drop every later event. The `kFSEventStreamEventIdSinceNow`
+    /// sentinel leaves the cursor where it is: a restart from it then sees
+    /// a saved ID above the current one, a gap, and rescans.
+    pub fn on_ids_wrapped(&mut self, id: u64) {
+        self.replay_start = None;
+        self.history_done = true;
+        if id != EVENT_ID_SINCE_NOW {
+            self.cursor_id = id;
+            self.highest_seen = id;
+        }
+    }
+
+    /// Moves the cursor (live) or the highest replayed ID (replay) up to
+    /// `id`; the SinceNow sentinel and 0 (special events) move nothing.
+    fn record(&mut self, id: u64) {
+        if id == EVENT_ID_SINCE_NOW || id == 0 {
+            return;
         }
         if self.history_done {
             self.cursor_id = self.cursor_id.max(id);
         } else {
             self.highest_seen = self.highest_seen.max(id);
         }
-        true
     }
 
     /// How many replayed events at or before the replay start were
