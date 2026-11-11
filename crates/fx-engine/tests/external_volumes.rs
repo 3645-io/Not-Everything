@@ -359,3 +359,125 @@ fn offline_volumes_survive_a_save_and_a_restart() {
     engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------- hidden from searches
+
+/// The paths `query` finds, sorted.
+fn found(engine: &fx_engine::Engine, query: &str) -> Vec<String> {
+    let page = engine
+        .search(
+            query,
+            fx_engine::QueryOptions::default(),
+            fx_sort::SortKey::Path,
+            fx_sort::Direction::Ascending,
+            0,
+            1_000,
+        )
+        .expect("search");
+    let snap = engine.snapshot();
+    let idx = snap.index();
+    let mut paths: Vec<String> = page
+        .ids
+        .iter()
+        .filter_map(|&id| rel_path(&snap, idx.key(fx_model::EntryId(id))))
+        .collect();
+    paths.sort();
+    assert_eq!(
+        page.total,
+        paths.len(),
+        "{query}: total counts what is shown"
+    );
+    paths
+}
+
+#[test]
+fn an_offline_volume_is_left_out_of_searches_until_it_is_mounted_again() {
+    // Until the interface has an offline marker (the owner, 11 Nov), the
+    // entries are kept but no search returns them.
+    let tree = tree_with_drive();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = start(&tree, &source, tree.build_index(), volumes_config());
+    assert_eq!(
+        found(&engine, "beach"),
+        vec!["Volumes/Drive/photos/beach.jpg"]
+    );
+    assert_eq!(found(&engine, "Drive").len(), 2, "the volume and a file");
+
+    tree.remove("/vol/Volumes/Drive");
+    source.push(vec![check("/vol/Volumes/Drive")]);
+    let snap = wait_offline(&engine, "offline");
+    assert!(
+        found(&engine, "beach").is_empty(),
+        "offline files are hidden"
+    );
+    assert!(
+        found(&engine, "Drive").is_empty(),
+        "so is the volume itself"
+    );
+    let everything = found(&engine, "");
+    assert!(
+        everything.iter().all(|p| !p.starts_with("Volumes/Drive")),
+        "an empty search lists no offline entry: {everything:?}"
+    );
+    assert!(everything.contains(&"home.txt".to_string()));
+    assert!(everything.contains(&"Volumes".to_string()));
+    // Still in the index, so a remount replaces them.
+    assert!(by_path(&snap).contains_key("Volumes/Drive/photos/beach.jpg"));
+
+    mount_drive(&tree, "Drive", 5);
+    source.push(vec![check("/vol/Volumes/Drive")]);
+    wait_for_tree(&engine, &tree, "the drive is back");
+    assert_eq!(
+        found(&engine, "beach"),
+        vec!["Volumes/Drive/photos/beach.jpg"]
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn the_command_line_reader_leaves_offline_volumes_out_too() {
+    let dir = std::env::temp_dir().join(format!("fx-offline-reader-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = dir.join("index.fxstore");
+    let tree = tree_with_drive();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = start(
+        &tree,
+        &source,
+        tree.build_index(),
+        volumes_config().with_store_path(&store),
+    );
+    tree.remove("/vol/Volumes/Drive");
+    source.push(vec![check("/vol/Volumes/Drive")]);
+    wait_offline(&engine, "offline");
+    engine.shutdown();
+
+    let reader = fx_engine::StoreReader::open(&store).expect("open the store");
+    let opts = fx_engine::ReadOptions::default();
+    let search = |q: &str| {
+        reader
+            .search(
+                q,
+                &opts,
+                fx_sort::SortKey::Path,
+                fx_sort::Direction::Ascending,
+                0,
+                1_000,
+            )
+            .expect("search")
+    };
+    let beach = search("beach");
+    assert_eq!(
+        (beach.total, beach.ids.len()),
+        (0, 0),
+        "offline file hidden"
+    );
+    assert_eq!(search("home").total, 1, "the root volume's files are found");
+    let all = search("");
+    assert_eq!(all.total, all.ids.len());
+    assert_eq!(
+        all.total, 3,
+        "the root, Volumes and home.txt; none of the drive's five entries"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

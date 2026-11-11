@@ -80,6 +80,10 @@ pub struct EngineSnapshot {
     pub(crate) orders: Arc<Vec<Order>>,
     pub(crate) cursor: Option<ResumeCursor>,
     pub(crate) generation: u64,
+    /// The index may hold offline entries: searches check every hit and
+    /// leave them out ([`EngineSnapshot::is_offline`]). Off when the
+    /// engine knows there are none, so a search pays nothing for it.
+    pub(crate) hide_offline: bool,
     /// The priority group of this index; `None` without priority folders.
     pub(crate) priority: Option<Arc<MatchSet>>,
 }
@@ -94,6 +98,10 @@ impl EngineSnapshot {
     /// and is kept in the index (run 2.4,
     /// [`EngineConfig::with_volumes_folder`](crate::EngineConfig::with_volumes_folder)).
     /// Its path no longer exists until the volume is mounted again.
+    ///
+    /// Searches leave offline entries out (the owner, 11 Nov 2026: hidden
+    /// until the interface has a marker for them); they stay in the index
+    /// so that the volume, mounted again, replaces them.
     ///
     /// # Panics
     ///

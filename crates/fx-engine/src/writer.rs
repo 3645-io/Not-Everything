@@ -944,6 +944,7 @@ where
             orders: Arc::clone(&self.orders),
             cursor: current.cursor,
             generation: self.generation,
+            hide_offline: current.hide_offline,
             priority: self.group.clone(),
         };
         self.shared.current.store(Arc::new(snap));
@@ -964,6 +965,7 @@ where
             orders: Arc::clone(&current.orders),
             cursor,
             generation: current.generation,
+            hide_offline: current.hide_offline,
             priority: current.priority.clone(),
         };
         self.shared.current.store(Arc::new(snap));
@@ -983,11 +985,16 @@ where
             self.group = self.priority.group(&self.index, &index, &self.orders);
             self.group_stale = false;
         }
+        // A look at the volumes folder's children: offline entries are
+        // hidden from searches only when there are some.
+        let hide_offline =
+            paths::has_offline(&self.index, &self.root, self.volumes_folder.as_deref());
         let snap = EngineSnapshot {
             index,
             orders: Arc::clone(&self.orders),
             cursor,
             generation: self.generation,
+            hide_offline,
             priority: self.group.clone(),
         };
         self.shared.current.store(Arc::new(snap));

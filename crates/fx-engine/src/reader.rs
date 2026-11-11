@@ -272,6 +272,10 @@ impl StoreReader {
                 orders: Arc::new(orders),
                 cursor: None,
                 generation: 0,
+                // The reader doesn't know where volumes are mounted, and
+                // finding offline entries would read every key: each hit is
+                // checked instead, so offline entries stay hidden here too.
+                hide_offline: true,
                 // The command line keeps the plain sort.
                 priority: None,
             },

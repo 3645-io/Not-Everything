@@ -78,6 +78,8 @@
 //! change source reports. When it is unmounted, its entries stay, re-keyed
 //! onto a reserved offline volume ID ([`EngineSnapshot::is_offline`]), and
 //! rescans keep them until a volume mounted with its name replaces them.
+//! Searches ([`Engine::search`], [`StoreReader::search`]) leave offline
+//! entries out until the interface has a marker for them.
 //!
 //! Read-only access (for the command line): [`StoreReader::open`] loads a
 //! checkpoint without a change source, threads or any write to the store,
@@ -296,6 +298,7 @@ impl Engine {
                 orders: Arc::clone(&orders),
                 cursor: config.resume_from(),
                 generation: 0,
+                hide_offline: paths::has_offline(&index, config.root(), config.volumes_folder()),
                 priority: group.clone(),
             }),
             subscribers: Mutex::new(Vec::new()),

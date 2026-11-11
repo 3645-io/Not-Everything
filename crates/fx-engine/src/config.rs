@@ -86,9 +86,10 @@ impl EngineConfig {
     /// entered, keyed by the mounted volume's root). When a volume root
     /// disappears from the disk (its path is gone, or a rescan does not
     /// list it), the volume goes offline instead of away: its entries stay
-    /// searchable, re-keyed onto a reserved offline volume ID
+    /// in the index, re-keyed onto a reserved offline volume ID
     /// ([`fx_model::VolumeId::is_offline`];
-    /// [`EngineSnapshot::is_offline`](crate::EngineSnapshot::is_offline)).
+    /// [`EngineSnapshot::is_offline`](crate::EngineSnapshot::is_offline)),
+    /// and searches leave them out until the interface can mark them.
     /// Rescans keep offline entries, and a volume mounted with the same
     /// name in the folder replaces them. Without a volumes folder (the
     /// default) a vanished mount point is removed like any folder.

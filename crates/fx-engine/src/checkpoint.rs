@@ -684,6 +684,7 @@ mod tests {
                 db_uuid: [7; 16],
             }),
             generation,
+            hide_offline: false,
             priority: None,
         }
     }
