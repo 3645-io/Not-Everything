@@ -14,20 +14,30 @@
 //! times. For each rescan it reads the live heap (counted by this binary's
 //! allocator) and the physical footprint (`proc_pid_rusage`, every 5 ms),
 //! both above their values just before it, after freed pages were handed
-//! back as the app does every 15 s. The heap is read twice: its peak while
-//! the scanner walks the folder (the walk's own share, the scanner's buffer
-//! included) and its peak over the whole rescan, which adds the commit that
-//! publishes the result.
+//! back as the app does every 15 s. The heap is read three times: its peak
+//! while the scanner walks the folder (the walk's own share, the scanner's
+//! buffer included), its peak after the walk (the removal of whatever the
+//! walk didn't list, then the commit that merges the changes into the sort
+//! orders and publishes the result) and its peak over the whole rescan.
+//!
+//! A rescan commits only when it found a change. A real folder usually has
+//! some; in the synthetic tree, `--touch N` makes some: before each rescan
+//! it removes the files the previous one added and adds `N` new ones.
+//!
+//! The engine runs as the app does while its window is hidden, which is
+//! when macOS's rescans usually come (`Engine::set_foreground(false)`);
+//! `--window shown` runs it as with the window on screen.
 //!
 //! `--stream-kb N` sets the scanner's buffer (`ScanOptions::stream_budget`)
 //! to compare sizes; the default is the scanner's own.
 //!
 //! Output: `metric=value` lines (see the crate README): `rescan_entries`,
 //! `rescan_p50_ms`, `rescan_max_ms`, `rescan_walk_heap_peak_mb`,
-//! `rescan_heap_peak_mb` and `rescan_footprint_peak_mb` (the largest over
-//! the runs). Exit codes: 0
-//! after the rescans, 1 on an error or timeout, 2 for bad arguments. On
-//! hosts other than macOS it prints a message and exits with 0.
+//! `rescan_after_walk_heap_peak_mb`, `rescan_heap_peak_mb` and
+//! `rescan_footprint_peak_mb` (the largest over the runs), and the heap
+//! peaks of each run (`rescan_run<N>_…`). Exit codes: 0 after the rescans,
+//! 1 on an error or timeout, 2 for bad arguments. On hosts other than macOS
+//! it prints a message and exits with 0.
 //!
 //! It writes only its own temporary folder (with `--entries`) and removes
 //! it at the end; with `--root` it only reads directory listings.
@@ -55,7 +65,7 @@ mod bench {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -71,13 +81,17 @@ mod bench {
 
     const USAGE: &str = "\
 usage:
-  rescan_bench [--entries N | --root DIR] [--runs N] [--stream-kb N]
-               [--timeout SECS] [--cache warm|cold|unknown]
+  rescan_bench [--entries N [--touch N] | --root DIR] [--runs N]
+               [--stream-kb N] [--window hidden|shown] [--timeout SECS]
+               [--cache warm|cold|unknown]
 
   --entries N     materialize a synthetic tree of N entries (default 500000)
+  --touch N       before each rescan, replace N files of the synthetic tree
+                  (default 0: the rescans find nothing to commit)
   --root DIR      rescan this folder instead (read only)
   --runs N        rescans to measure, 1..=20 (default 3)
   --stream-kb N   the scanner's buffer in KiB (default: the scanner's own)
+  --window STATE  hidden (default, as when macOS asks for a rescan) or shown
   --timeout SECS  give up on a scan after SECS (default 600)
   --cache STATE   cache state label for the report (default unknown)";
 
@@ -89,29 +103,39 @@ usage:
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     /// The most `LIVE` has reached since it was last reset.
     static PEAK: AtomicUsize = AtomicUsize::new(0);
-    /// Set while the scanner walks ([`Walk`]).
-    static WALKING: AtomicBool = AtomicBool::new(false);
+    /// Where the rescan is: [`BEFORE_WALK`], [`WALKING`] or [`AFTER_WALK`].
+    static PHASE: AtomicU8 = AtomicU8::new(BEFORE_WALK);
+    const BEFORE_WALK: u8 = 0;
+    const WALKING: u8 = 1;
+    const AFTER_WALK: u8 = 2;
     /// The most `LIVE` has reached while the scanner walked, since it was
     /// last reset.
     static WALK_PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// The most `LIVE` has reached after the walk (the rest of the rescan
+    /// and its commit), since it was last reset.
+    static AFTER_PEAK: AtomicUsize = AtomicUsize::new(0);
 
     fn grew(by: usize) {
         let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
         PEAK.fetch_max(now, Ordering::Relaxed);
-        if WALKING.load(Ordering::Relaxed) {
-            WALK_PEAK.fetch_max(now, Ordering::Relaxed);
-        }
+        match PHASE.load(Ordering::Relaxed) {
+            WALKING => WALK_PEAK.fetch_max(now, Ordering::Relaxed),
+            AFTER_WALK => AFTER_PEAK.fetch_max(now, Ordering::Relaxed),
+            _ => 0,
+        };
     }
 
-    /// The macOS scanner, with the heap's peak read while it walks.
+    /// The macOS scanner, with the heap's peak read while it walks and
+    /// after it.
     struct Walk(MacScanner);
 
     impl VolumeEnumerator for Walk {
         fn enumerate(&self, root: &Path, sink: &mut dyn FnMut(Entry)) -> fx_fs::Result<()> {
             WALK_PEAK.fetch_max(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
-            WALKING.store(true, Ordering::Relaxed);
+            PHASE.store(WALKING, Ordering::Relaxed);
             let listed = self.0.enumerate(root, sink);
-            WALKING.store(false, Ordering::Relaxed);
+            AFTER_PEAK.fetch_max(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+            PHASE.store(AFTER_WALK, Ordering::Relaxed);
             listed
         }
     }
@@ -270,9 +294,11 @@ usage:
 
     struct Args {
         entries: usize,
+        touch: usize,
         root: Option<PathBuf>,
         runs: usize,
         stream_kb: Option<usize>,
+        hidden: bool,
         timeout: Duration,
     }
 
@@ -286,9 +312,11 @@ usage:
             &args,
             &[
                 "--entries",
+                "--touch",
                 "--root",
                 "--runs",
                 "--stream-kb",
+                "--window",
                 "--timeout",
                 "--cache",
             ],
@@ -298,15 +326,31 @@ usage:
             if f.get("--root").is_some() && f.get("--entries").is_some() {
                 return Err(UsageError("give --entries or --root, not both".into()));
             }
+            if f.get("--root").is_some() && f.get("--touch").is_some() {
+                return Err(UsageError(
+                    "--touch changes the synthetic tree only; --root is read only".into(),
+                ));
+            }
+            let hidden = match f.get("--window") {
+                None | Some("hidden") => true,
+                Some("shown") => false,
+                Some(other) => {
+                    return Err(UsageError(format!(
+                        "--window expects hidden or shown, got '{other}'"
+                    )));
+                }
+            };
             let a = Args {
                 entries: f.number("--entries", 500_000, 1_000, 20_000_000)? as usize,
+                touch: f.number("--touch", 0, 0, 100_000)? as usize,
                 root: f.get("--root").map(PathBuf::from),
                 runs: f.number("--runs", 3, 1, 20)? as usize,
                 stream_kb: match f.get("--stream-kb") {
                     Some(_) => Some(f.number("--stream-kb", 0, 1, 4 << 20)? as usize),
                     None => None,
                 },
-                timeout: Duration::from_secs(f.number("--timeout", 600, 1, 86_400)?),
+                hidden,
+                timeout:Duration::from_secs(f.number("--timeout", 600, 1, 86_400)?),
             };
             Ok((a, f.cache()?))
         });
@@ -345,6 +389,8 @@ usage:
             opts.stream_budget = kb << 10;
         }
         metric("stream_budget_bytes", opts.stream_budget);
+        metric("window", if args.hidden { "hidden" } else { "shown" });
+        metric("touch", args.touch);
 
         let source = Trigger::new();
         let engine = Engine::start(
@@ -356,6 +402,7 @@ usage:
             MacPathStat::new(),
             Walk(MacScanner::new(opts)),
         )?;
+        engine.set_foreground(!args.hidden);
         let t = Instant::now();
         wait(&engine, args.timeout, |e| {
             e.health() == EngineHealth::Live && e.snapshot().generation() > 0
@@ -380,14 +427,19 @@ usage:
         let mut times = Vec::new();
         let mut heap_peak = 0usize;
         let mut walk_peak = 0usize;
+        let mut after_peak = 0usize;
         let mut fp_peak_max = 0u64;
-        for _ in 0..args.runs {
+        let mut touched: Vec<PathBuf> = Vec::new();
+        for run in 1..=args.runs {
+            touch(&root, run, args.touch, &mut touched)?;
             relieve();
             std::thread::sleep(Duration::from_millis(300));
             relieve();
             let heap0 = LIVE.load(Ordering::Relaxed);
+            PHASE.store(BEFORE_WALK, Ordering::Relaxed);
             PEAK.store(heap0, Ordering::Relaxed);
             WALK_PEAK.store(heap0, Ordering::Relaxed);
+            AFTER_PEAK.store(heap0, Ordering::Relaxed);
             let fp0 = footprint();
             fp_peak.store(fp0, Ordering::Relaxed);
 
@@ -397,8 +449,14 @@ usage:
                 e.snapshot().cursor() == Some(want)
             })?;
             times.push(t.elapsed());
-            heap_peak = heap_peak.max(PEAK.load(Ordering::Relaxed).saturating_sub(heap0));
-            walk_peak = walk_peak.max(WALK_PEAK.load(Ordering::Relaxed).saturating_sub(heap0));
+            let above = |peak: &AtomicUsize| peak.load(Ordering::Relaxed).saturating_sub(heap0);
+            let (whole, walk, after) = (above(&PEAK), above(&WALK_PEAK), above(&AFTER_PEAK));
+            metric(&format!("rescan_run{run}_walk_heap_peak_mb"), mb(walk));
+            metric(&format!("rescan_run{run}_after_walk_heap_peak_mb"), mb(after));
+            metric(&format!("rescan_run{run}_heap_peak_mb"), mb(whole));
+            heap_peak = heap_peak.max(whole);
+            walk_peak = walk_peak.max(walk);
+            after_peak = after_peak.max(after);
             fp_peak_max = fp_peak_max.max(fp_peak.load(Ordering::Relaxed).saturating_sub(fp0));
         }
         stop.store(true, Ordering::Relaxed);
@@ -406,18 +464,35 @@ usage:
         engine.shutdown();
 
         stats("rescan", &times);
-        metric(
-            "rescan_walk_heap_peak_mb",
-            format!("{:.1}", walk_peak as f64 / 1e6),
-        );
-        metric(
-            "rescan_heap_peak_mb",
-            format!("{:.1}", heap_peak as f64 / 1e6),
-        );
+        metric("rescan_walk_heap_peak_mb", mb(walk_peak));
+        metric("rescan_after_walk_heap_peak_mb", mb(after_peak));
+        metric("rescan_heap_peak_mb", mb(heap_peak));
         metric(
             "rescan_footprint_peak_mb",
             format!("{:.1}", fp_peak_max as f64 / 1e6),
         );
+        Ok(())
+    }
+
+    /// Bytes as megabytes, with one decimal.
+    fn mb(bytes: usize) -> String {
+        format!("{:.1}", bytes as f64 / 1e6)
+    }
+
+    /// Before rescan `run` of the synthetic tree: removes the files the
+    /// previous run added (`touched`) and adds `count` new ones in the
+    /// tree's top folder, so the rescan has removals and new entries to
+    /// commit. Only files this benchmark made in its own temporary folder
+    /// are removed.
+    fn touch(root: &Path, run: usize, count: usize, touched: &mut Vec<PathBuf>) -> io::Result<()> {
+        for path in touched.drain(..) {
+            std::fs::remove_file(path)?;
+        }
+        for i in 0..count {
+            let path = root.join(format!("rescan-touch-{run}-{i}.txt"));
+            std::fs::write(&path, b"x")?;
+            touched.push(path);
+        }
         Ok(())
     }
 

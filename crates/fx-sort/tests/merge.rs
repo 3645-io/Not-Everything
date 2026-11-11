@@ -1020,3 +1020,98 @@ fn applied_with_an_empty_batch_is_a_copy() {
         assert_eq!(order.applied(&m, &Batch::new()), order);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Merging in place: an order's buffer grows by little (the engine merges
+// its orders in place when no snapshot shares them).
+// ---------------------------------------------------------------------------
+
+/// The capacity `apply` may leave an order of `len` IDs after growing it:
+/// the new length plus a small spare (1/256 of it), never twice the size.
+fn grown_capacity_bound(len: usize) -> usize {
+    len + len / 256 + 1
+}
+
+#[test]
+fn apply_grows_a_full_order_by_a_small_spare_only() {
+    let mut m = Mock::default();
+    let root = m.push("root", EntryId::NONE, EntryKind::Dir);
+    for i in 0..20_000u32 {
+        let id = m.push(&format!("f{i:05}"), EntryId(root), EntryKind::File);
+        m.sizes[id as usize] = u64::from(i * 7 % 1000);
+    }
+    let mut orders = build_all(&m);
+    for order in &mut orders {
+        order.ids.shrink_to_fit();
+    }
+
+    // New entries: every order must grow past its full buffer.
+    let mut batch = Batch::new();
+    for i in 0..10u32 {
+        batch.upsert(EntryId(m.push(&format!("new{i}"), EntryId(root), EntryKind::File)));
+    }
+    apply_and_check(&mut orders, &m, &batch, "ten new entries");
+    for order in &orders {
+        assert!(
+            order.ids.capacity() <= grown_capacity_bound(order.len()),
+            "{:?}: {} IDs in a buffer of {}: grown by more than a small spare",
+            order.key,
+            order.len(),
+            order.ids.capacity()
+        );
+    }
+
+    // A few more fit in the spare: the buffer stays where it is.
+    let buffers: Vec<(usize, *const u32)> = orders
+        .iter()
+        .map(|o| (o.ids.capacity(), o.ids.as_ptr()))
+        .collect();
+    let mut batch = Batch::new();
+    for i in 0..5u32 {
+        batch.upsert(EntryId(m.push(&format!("more{i}"), EntryId(root), EntryKind::File)));
+    }
+    apply_and_check(&mut orders, &m, &batch, "five more entries");
+    for (order, &(capacity, ptr)) in orders.iter().zip(&buffers) {
+        assert_eq!(
+            (order.ids.capacity(), order.ids.as_ptr()),
+            (capacity, ptr),
+            "{:?}: entries that fit in the spare moved the buffer",
+            order.key
+        );
+    }
+}
+
+#[test]
+fn apply_without_new_entries_keeps_the_buffer() {
+    let mut rng = Rng::new(0xB0FF_E400);
+    let mut m = random_mock(&mut rng, 400);
+    let mut orders = build_all(&m);
+    for round in 0..40 {
+        let buffers: Vec<(usize, *const u32)> = orders
+            .iter()
+            .map(|o| (o.ids.capacity(), o.ids.as_ptr()))
+            .collect();
+        // Attribute changes and removals only: nothing grows.
+        let mut batch = Batch::new();
+        let live = m.live_ids();
+        for _ in 0..1 + rng.below(8) {
+            let id = *rng.pick(&live);
+            if rng.chance(30) && m.kinds[id as usize] == EntryKind::File {
+                m.live[id as usize] = false;
+                batch.remove(EntryId(id));
+            } else {
+                m.sizes[id as usize] = random_size(&mut rng);
+                batch.upsert(EntryId(id));
+            }
+        }
+        apply_and_check(&mut orders, &m, &batch, &format!("round {round}"));
+        for (order, &(capacity, ptr)) in orders.iter().zip(&buffers) {
+            assert_eq!(
+                (order.ids.capacity(), order.ids.as_ptr()),
+                (capacity, ptr),
+                "round {round}: {:?} reallocated without growing",
+                order.key
+            );
+        }
+    }
+}
