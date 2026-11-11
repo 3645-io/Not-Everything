@@ -14,6 +14,11 @@
 #          hidden and 30 showing a search with no scripted activity (the Mac
 #          in daily use), plus the DMG size with --dmg.
 #
+# The soak (C3) runs only when named: --step soak at the rc tier runs the
+# engine over a fresh folder in the scratch folder under a seeded stream of
+# random file operations for --soak-minutes (default 1440, 24 h) and counts
+# the differences from a fresh scan. It holds the lock for that long.
+#
 # Output in <out>: one <step>.log per step, metrics.txt (the metric=value
 # lines perf-compare reads), summary.md (the table that goes in the PR) and
 # run.txt (machine, build, load). The exit code is perf-compare's: 0 when
@@ -50,6 +55,7 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
                              [--machine LABEL] [--cache warm|cold]
                              [--baseline FILE] [--bg-minutes N]
                              [--churn-rate N] [--query TEXT] [--dmg FILE]
+                             [--soak-minutes N]
 
   --tier TIER       quick, pr or rc (see docs/gates/performance.md)
   --out NEW_DIR     directory for the logs and summary.md; must not exist yet
@@ -57,7 +63,8 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
                     e.g. --only fx-query. Unmeasured metrics are then SKIPPED
   --step STEP       run only this step (repeatable), to re-run one benchmark
                     alone: matcher, startup, catchup, freshness, first-run,
-                    cli, gate-probe, summon, sort, background, dmg
+                    cli, gate-probe, summon, sort, background, dmg; and
+                    soak (rc tier only), which no tier runs by itself
   --machine LABEL   machine label for run.txt (default: the CPU and memory)
   --cache STATE     warm (default) or cold (the first run after a reboot)
   --baseline FILE   default docs/gates/perf-baseline.toml
@@ -67,6 +74,7 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
   --query TEXT      the search shown in the "showing a search" phase
                     (default "report")
   --dmg FILE        rc tier: the release candidate's DMG, for its size
+  --soak-minutes N  with --step soak: how long the soak runs (default 1440)
 
 Run it from a quiet Mac: plugged in, nothing heavy running. cargo must be on
 PATH. The script never runs sudo or flushes caches itself.
@@ -94,10 +102,11 @@ BG_MINUTES=""
 CHURN_RATE=""
 QUERY=report
 DMG=""
+SOAK_MINUTES=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tier | --out | --only | --step | --machine | --cache | --baseline | --bg-minutes | --churn-rate | --query | --dmg)
+        --tier | --out | --only | --step | --machine | --cache | --baseline | --bg-minutes | --churn-rate | --query | --dmg | --soak-minutes)
             [ $# -ge 2 ] || die_usage "$1 needs a value"
             case "$1" in
                 --tier) TIER=$2 ;;
@@ -111,6 +120,7 @@ while [ $# -gt 0 ]; do
                 --churn-rate) CHURN_RATE=$2 ;;
                 --query) QUERY=$2 ;;
                 --dmg) DMG=$2 ;;
+                --soak-minutes) SOAK_MINUTES=$2 ;;
             esac
             shift 2
             ;;
@@ -152,12 +162,21 @@ fi
 if [ -n "$DMG" ] && [ ! -f "$DMG" ]; then
     die_usage "--dmg '$DMG' is not a file"
 fi
+if [ -n "$SOAK_MINUTES" ]; then
+    is_count "$SOAK_MINUTES" || die_usage "--soak-minutes must be a whole number, got '$SOAK_MINUTES'"
+    [ "$SOAK_MINUTES" -gt 0 ] || die_usage "--soak-minutes must be above 0"
+fi
 for s in $STEPS; do
     case "$s" in
         matcher | startup | catchup | freshness | first-run | cli | gate-probe | summon | sort | background | dmg) ;;
+        soak) [ "$TIER" = rc ] || die_usage "--step soak runs at the rc tier only" ;;
         *) die_usage "unknown --step '$s'" ;;
     esac
 done
+case " $STEPS " in
+    *" soak "*) : "${SOAK_MINUTES:=1440}" ;;
+    *) [ -z "$SOAK_MINUTES" ] || die_usage "--soak-minutes needs --step soak" ;;
+esac
 if [ -e "$OUT" ] || [ -L "$OUT" ]; then
     echo "perf-check: '$OUT' already exists; pass a new directory (nothing was changed)" >&2
     exit 2
@@ -384,6 +403,9 @@ displays() {
     echo "scratch: $SCRATCH (scan root $SCAN_ROOT)"
     if wants background; then
         echo "background: $BG_MINUTES min per phase, churn $CHURN_RATE ops/s, query '$QUERY'"
+    fi
+    if wants soak; then
+        echo "soak: $SOAK_MINUTES min, seed 1"
     fi
 } >"$OUT/run.txt"
 
@@ -643,7 +665,18 @@ step_dmg() {
     emit dmg_bytes "$(stat -f %z "$DMG")"
 }
 
-for s in matcher startup catchup freshness first-run cli gate-probe summon sort background dmg; do
+step_soak() {
+    # C3: the engine with the real FSEvents source over a fresh folder in
+    # the scratch folder, under a seeded stream of random file operations,
+    # compared with a fresh scan every 30 s and restarted from its saved
+    # index every 10 checks. The soak removes its own folder at the end.
+    run_step soak "$EX/soak" --duration "${SOAK_MINUTES}m" --dir "$SCRATCH" --seed 1
+    emit soak_differences $(value_of soak_differences "$OUT/soak.log")
+    emit soak_ops $(value_of soak_ops "$OUT/soak.log")
+    emit soak_minutes $(value_of soak_minutes "$OUT/soak.log")
+}
+
+for s in matcher startup catchup freshness first-run cli gate-probe summon sort background soak dmg; do
     wants "$s" || continue
     case "$s" in
         matcher) step_matcher ;;
@@ -656,6 +689,7 @@ for s in matcher startup catchup freshness first-run cli gate-probe summon sort 
         summon) step_summon ;;
         sort) step_sort ;;
         background) step_background ;;
+        soak) step_soak ;;
         dmg) [ -n "$DMG" ] && step_dmg ;;
     esac
 done
