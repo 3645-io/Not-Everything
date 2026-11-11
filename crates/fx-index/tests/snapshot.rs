@@ -393,3 +393,115 @@ fn snapshot_heap_bytes_counts_the_delta_and_stays_frozen() {
     assert_eq!(compacted.heap_bytes(), base_heap, "snapshot is frozen");
     assert_eq!(updated.heap_bytes(), updated_heap, "snapshot is frozen");
 }
+
+/// The delta overlay's bytes in `snap`'s heap report.
+fn delta_overlay(snap: &Snapshot) -> usize {
+    snap.heap_columns()
+        .into_iter()
+        .find(|&(label, _)| label == "delta_overlay")
+        .map(|(_, bytes)| bytes)
+        .expect("the heap report lists the delta overlay")
+}
+
+/// A compacted base of 20,041 entries (one root, 40 folders of 500 files),
+/// large enough that one bit per entry outweighs a few delta rows.
+fn big_base() -> Index {
+    let mut index = Index::new();
+    index.upsert(dir(1, None, "vol")).unwrap();
+    for d in 0..40u64 {
+        index
+            .upsert(dir(10 + d, Some(1), &format!("dir{d}")))
+            .unwrap();
+        for f in 0..500u64 {
+            let k = 100_000 + d * 1_000 + f;
+            index
+                .upsert(file(k, 10 + d, &format!("File{f}.DAT")))
+                .unwrap();
+        }
+    }
+    index.compact();
+    index.set_compact_fraction(f64::INFINITY);
+    index
+}
+
+#[test]
+fn overridden_base_entries_cost_one_bit_each_once_there_is_one() {
+    let mut index = big_base();
+    let bitmap = index.id_bound().div_ceil(64) * 8;
+
+    // New entries alone override nothing: no bitmap yet.
+    index.upsert(file(900_000, 10, "new.txt")).unwrap();
+    let only_new = index.snapshot();
+    assert!(
+        delta_overlay(&only_new) < bitmap,
+        "no bitmap without an override: {} < {bitmap}",
+        delta_overlay(&only_new)
+    );
+
+    // The first override of a base entry marks it in a bitmap over the base.
+    let mut e = file(100_007, 10, "File7.DAT");
+    e.size = 4_242;
+    index.upsert(e).unwrap();
+    let overridden = index.snapshot();
+    assert!(
+        delta_overlay(&overridden) >= delta_overlay(&only_new) + bitmap,
+        "the bitmap is counted: {} >= {} + {bitmap}",
+        delta_overlay(&overridden),
+        delta_overlay(&only_new)
+    );
+    assert!(
+        overridden.heap_bytes() >= only_new.heap_bytes() + bitmap,
+        "and in the snapshot's heap bytes"
+    );
+
+    // A compaction bakes the overrides into the base: the bitmap goes.
+    index.compact();
+    assert!(delta_overlay(&index.snapshot()) < bitmap);
+}
+
+#[test]
+fn reads_follow_overrides_and_skip_them_for_untouched_entries() {
+    let mut index = big_base();
+    let id = |index: &Index, k: u64| index.lookup(key(k)).unwrap();
+    let renamed = id(&index, 100_001);
+    let moved = id(&index, 100_002);
+    let updated = id(&index, 100_003);
+    let removed = id(&index, 100_004);
+    let untouched = id(&index, 100_005);
+    // In another word of the bitmap.
+    let far = id(&index, 100_090);
+    let before = index.snapshot();
+
+    index.upsert(file(100_001, 10, "Renamed.txt")).unwrap();
+    index.upsert(file(100_002, 11, "File2.DAT")).unwrap();
+    let mut e = file(100_003, 10, "File3.DAT");
+    e.size = 77;
+    e.modified = 5;
+    index.upsert(e).unwrap();
+    index.upsert(file(100_004, 10, "Gone.txt")).unwrap();
+    index.remove(key(100_004));
+    let snap = index.snapshot();
+
+    assert_eq!(snap.name(renamed), "Renamed.txt");
+    assert_eq!(snap.path(renamed), "vol/dir0/Renamed.txt");
+    assert_eq!(snap.parent(moved), id(&index, 11));
+    assert_eq!(snap.path(moved), "vol/dir1/File2.DAT");
+    assert_eq!((snap.size(updated), snap.modified(updated)), (77, 5));
+    assert_eq!(snap.name(updated), "File3.DAT");
+    assert!(!snap.is_live(removed));
+    assert_eq!(
+        snap.name(removed),
+        "Gone.txt",
+        "a dead slot reads its last values"
+    );
+    for id in [untouched, far] {
+        assert_eq!(snap.name(id), before.name(id));
+        assert_eq!(snap.parent(id), before.parent(id));
+        assert_eq!(snap.size(id), before.size(id));
+        assert_eq!(snap.key(id), before.key(id));
+        assert!(snap.is_live(id));
+    }
+    // The earlier snapshot still reads the base.
+    assert_eq!(before.name(renamed), "File1.DAT");
+    assert_eq!(before.size(updated), 100_003 * 7);
+}
