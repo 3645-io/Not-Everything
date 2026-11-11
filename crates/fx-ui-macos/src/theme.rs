@@ -734,6 +734,12 @@ pub mod styles {
     pub const ICON_NAME: TypeStyle = TypeStyle::new(13.0, 18.0, 650);
     /// A tag such as "Default" (`.tag`).
     pub const TAG: TypeStyle = TypeStyle::new(11.0, 14.0, 700).caps(0.04);
+    /// The shortcut recorder's "Type shortcut" before a key is held
+    /// (`.rec-hint`).
+    pub const RECORDER_HINT: TypeStyle = TypeStyle::new(13.0, 18.0, 400);
+    /// A link-style button: the recorder's "Use Default"
+    /// (`.linkbtn.rec-reset`).
+    pub const LINK_BUTTON: TypeStyle = TypeStyle::new(13.0, 18.0, 700);
 }
 
 /// Sizes and gaps of the canvas's components, in points (the `ne-` classes

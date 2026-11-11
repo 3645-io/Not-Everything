@@ -132,8 +132,8 @@ modes.
 `open_or_rebuild(path, verify, rebuild)` (module `checkpoint`) is the
 startup policy from the plan's startup flow:
 
-1. It removes this checkpoint's own stale temp files of interrupted
-   writes (`cleanup_stale_temps(path)`, best effort).
+1. It removes this checkpoint's own temp files of interrupted writes
+   (`cleanup_stale_temps(path)`, best effort).
 2. It opens the file with `MappedIndex::open`. With `VerifyMode::Full` it
    also runs `verify_checksums`; `VerifyMode::HeaderOnly` doesn't read
    the columns.
@@ -160,14 +160,16 @@ target's directory it removes only regular files named like the writer's
 temp files for that target: `temp_name_prefix(target)` (`.<name>.tmp.`)
 followed by `<pid>.<counter>` in decimal. Temp files of other checkpoints
 in the same directory, other files, directories and symlinks are kept.
-Temp files that may belong to a running writer are skipped: those that
-carry the current process's ID, and those modified less than
-`STALE_TEMP_MIN_AGE` (10 minutes) ago, or with an unreadable or future
-modification time. fx-store has no direct libc dependency for
-`kill(pid, 0)`, so the age threshold stands in for a liveness check; a
-checkpoint write takes seconds, so a younger temp is assumed to be in
-progress and is removed by a later start. It returns how many files it
-removed.
+A temp file whose process no longer runs (`kill(pid, 0)` fails with
+`ESRCH`, on Unix) is removed at once: its writer was killed, crashed or
+quit during a checkpoint, so the next start cleans up after it. Temp files
+that may belong to a running writer are skipped: those that carry the
+current process's ID, and, while a process with their ID runs, those
+modified less than `STALE_TEMP_MIN_AGE` (10 minutes) ago, or with an
+unreadable or future modification time. A checkpoint write takes seconds,
+so a younger temp is assumed to be in progress; a process ID reused by an
+unrelated process only delays the removal to a later start. It returns how
+many files it removed.
 
 ## Benchmark: load to first result
 

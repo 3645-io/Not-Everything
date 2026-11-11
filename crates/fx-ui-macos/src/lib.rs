@@ -44,6 +44,9 @@
 //! - [`app_icon`]: the six approved app icon designs and their embedded
 //!   light and dark images.
 //! - [`settings_view`]: the Settings window's copy and contents.
+//! - [`shortcut_recorder`]: the Settings recorder that picks a new summon
+//!   hotkey; [`hotkey_slot`]: the registered hotkey and how a picked one
+//!   replaces it, the new one registered before the old one goes.
 //! - [`quit`]: the steps of quitting, in order (menu-bar item and windows
 //!   first, then the index save, which usually writes nothing).
 //! - [`notices`]: the third-party notices the About panel shows.
@@ -81,8 +84,11 @@
 //! virtual row model over synthetic names from `fx-bench`), `frame_stats`
 //! (per-frame scroll timings and the frame-time gate), `spike_args` (the
 //! command line of the `table_spike` example), `gate_probe` (the Phase 1
-//! gate probe behind `--gate-probe <out>`) and `source::SyntheticSource`
-//! (millions of synthetic rows, for measuring the window without an index).
+//! gate probe behind `--gate-probe <out>`), `summon_probe` and `sort_probe`
+//! (the shortcut-to-ready-window and re-sort-to-repaint probes behind
+//! `--summon-probe <out>` and `--sort-probe <out>`), `latency_probe` (their
+//! report) and `source::SyntheticSource` (millions of synthetic rows, for
+//! measuring the window without an index).
 //!
 //! On macOS, `appkit` (built only for `target_os = "macos"`) is the AppKit
 //! layer: the product window (`appkit::window`: search field, sortable
@@ -118,10 +124,14 @@ pub mod frame_stats;
 #[cfg(feature = "measure")]
 pub mod gate_probe;
 pub mod hotkey;
+pub mod hotkey_slot;
 pub mod key_caps;
+#[cfg(feature = "measure")]
+pub mod latency_probe;
 pub mod limited;
 pub mod main_layout;
 pub mod main_menu;
+pub mod memory_relief;
 pub mod menu;
 #[cfg(feature = "measure")]
 pub mod model;
@@ -130,10 +140,15 @@ pub mod onboarding;
 pub mod quit;
 pub mod settings;
 pub mod settings_view;
+pub mod shortcut_recorder;
+#[cfg(feature = "measure")]
+pub mod sort_probe;
 pub mod source;
 #[cfg(feature = "measure")]
 pub mod spike_args;
 pub mod status_view;
+#[cfg(feature = "measure")]
+pub mod summon_probe;
 pub mod surface;
 pub mod switchable;
 pub mod theme;

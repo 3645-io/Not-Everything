@@ -1,0 +1,33 @@
+name: performance report
+
+# A pull request that changes code the app or the command ships must carry
+# the summary of `scripts/perf-check.sh --tier pr` in its description
+# (.agents/rules/performance.md). The measurements themselves run on the
+# owner's Mac, not here: GitHub's shared macOS runners vary too much for
+# timing and have no real disk to index. This job only reads the
+# description, so it runs on Linux and again whenever the description is
+# edited, without re-running the macOS checks in ci.yml.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  perf-report:
+    name: performance summary in the PR description
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The description goes in through the environment, never into the
+      # command text, so nothing in it can run as shell.
+      - name: performance summary present when shipped code changed
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: sh scripts/check-perf-report.sh "$BASE_SHA" "$HEAD_SHA"

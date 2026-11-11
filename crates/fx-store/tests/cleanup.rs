@@ -1,8 +1,10 @@
 //! `cleanup_stale_temps(target)` is scoped to one checkpoint: it removes
 //! only `temp_name_prefix(target)` + `<pid>.<counter>` files in the
-//! target's directory, older than `STALE_TEMP_MIN_AGE`, and never temps of
-//! this process. `cleanup_stale_temps_older_than` (hidden, for tests) takes
-//! the age threshold as a parameter.
+//! target's directory, and never temps of this process. A temp whose
+//! process no longer runs is removed whatever its age (on Unix); one whose
+//! process may still be writing it only once it is older than
+//! `STALE_TEMP_MIN_AGE`. `cleanup_stale_temps_older_than` (hidden, for
+//! tests) takes the age threshold as a parameter.
 //!
 //! Clean-room: written from docs/PLAN.md and the in-repo code only.
 
@@ -69,10 +71,29 @@ fn temp_name(target: &Path, pid: u32, n: u64) -> String {
     name.to_string_lossy().into_owned()
 }
 
-/// A process ID that is not this process.
+/// A process ID that is not this process, and names no running process
+/// either: above macOS's highest process ID (99,999) and Linux's default.
 fn other_pid() -> u32 {
     let me = std::process::id();
     if me == 999_983 { 999_979 } else { 999_983 }
+}
+
+/// The ID of a process that is running and is not this one: the process
+/// that started this test binary.
+fn live_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+/// The ID of a process that has exited and been reaped, so it names no
+/// running process (process IDs are not reused this soon).
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("start a short-lived process");
+    let pid = child.id();
+    child.wait().expect("reap it");
+    pid
 }
 
 /// Writes a file whose modification time is `age` in the past.
@@ -131,7 +152,8 @@ fn other_targets_temps_are_kept() {
 fn fresh_temps_are_kept_by_the_age_threshold() {
     let dir = TempDir::new("age");
     let target = dir.file("index.fxs");
-    let pid = other_pid();
+    // The writer may still be running: only the age tells.
+    let pid = live_pid();
     let fresh = temp_name(&target, pid, 1);
     let recent = temp_name(&target, pid, 2);
     let stale = temp_name(&target, pid, 3);
@@ -158,7 +180,7 @@ fn fresh_temps_are_kept_by_the_age_threshold() {
 fn future_mtime_counts_as_fresh() {
     let dir = TempDir::new("future");
     let target = dir.file("index.fxs");
-    let name = temp_name(&target, other_pid(), 1);
+    let name = temp_name(&target, live_pid(), 1);
     let path = dir.file(&name);
     fs::write(&path, b"x").expect("write");
     fs::File::options()
@@ -168,6 +190,39 @@ fn future_mtime_counts_as_fresh() {
         .expect("set mtime");
     assert_eq!(cleanup_stale_temps(&target).expect("cleanup"), 0);
     assert_eq!(dir.entries(), vec![name]);
+}
+
+#[test]
+fn young_temps_of_a_writer_that_no_longer_runs_are_removed() {
+    // A writer killed during a checkpoint (`kill -9`, a crash, a quit
+    // during a background save) leaves its temp file behind; the next start
+    // removes it at once instead of ten minutes later.
+    let dir = TempDir::new("dead");
+    let target = dir.file("index.fxs");
+    let dead = dead_pid();
+    let fresh = temp_name(&target, dead, 1);
+    let future = temp_name(&target, dead, 2);
+    let unknown = temp_name(&target, other_pid(), 3);
+    let running = temp_name(&target, live_pid(), 4);
+    let other_target = temp_name(&dir.file("other.fxs"), dead, 5);
+    write_aged(&dir.file(&fresh), Duration::ZERO);
+    write_aged(&dir.file(&unknown), Duration::from_secs(1));
+    write_aged(&dir.file(&running), Duration::ZERO);
+    write_aged(&dir.file(&other_target), Duration::ZERO);
+    fs::write(dir.file(&future), b"x").expect("write");
+    fs::File::options()
+        .write(true)
+        .open(dir.file(&future))
+        .and_then(|f| f.set_modified(SystemTime::now() + Duration::from_secs(3600)))
+        .expect("set mtime");
+
+    let removed = cleanup_stale_temps(&target).expect("cleanup");
+    assert_eq!(removed, 3);
+    assert_eq!(
+        dir.entries(),
+        sorted(vec![running, other_target]),
+        "the dead writers' temps are gone; a running writer's and another target's are kept"
+    );
 }
 
 #[test]

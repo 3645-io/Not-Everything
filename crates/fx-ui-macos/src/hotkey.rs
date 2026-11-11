@@ -20,8 +20,20 @@
 //! betas), so both can run at once ([`HotkeySpec::default_for`]; this
 //! build's is [`HotkeySpec::default`], spelled [`DEFAULT_SUMMON_HOTKEY`]).
 //! Cmd+Space is Spotlight's and Ctrl+Space switches input sources, so
-//! neither is taken by default; the user can pick another combination in
-//! the settings file.
+//! neither is taken by default; the user picks another combination in
+//! Settings (or the settings file).
+//!
+//! # Recording in Settings
+//!
+//! The Settings recorder reads a key press as a spec:
+//! [`Key::from_carbon_code`] maps `NSEvent.keyCode` back to a key and
+//! [`Modifiers::from_event_flags`] reads `NSEvent.modifierFlags`
+//! ([`EVENT_SHIFT`], [`EVENT_CONTROL`], [`EVENT_OPTION`],
+//! [`EVENT_COMMAND`]). Before macOS is asked, [`HotkeySpec::check`] refuses
+//! a shortcut that would break typing or every app's own commands, or that
+//! macOS uses itself; [`Refusal`] says why, in the words the Settings row
+//! shows. A file edited by hand is not checked: whatever parses is
+//! registered.
 //!
 //! # Carbon mapping
 //!
@@ -50,6 +62,18 @@ pub const CARBON_OPTION_KEY: u32 = 1 << 11;
 /// Carbon `controlKey` modifier bit.
 pub const CARBON_CONTROL_KEY: u32 = 1 << 12;
 
+/// `NSEventModifierFlagShift` in `NSEvent.modifierFlags`.
+pub const EVENT_SHIFT: u64 = 1 << 17;
+/// `NSEventModifierFlagControl`.
+pub const EVENT_CONTROL: u64 = 1 << 18;
+/// `NSEventModifierFlagOption`.
+pub const EVENT_OPTION: u64 = 1 << 19;
+/// `NSEventModifierFlagCommand`.
+pub const EVENT_COMMAND: u64 = 1 << 20;
+
+/// `kVK_Escape`: cancels recording in Settings.
+pub const KVK_ESCAPE: u32 = 0x35;
+
 /// The modifier keys of a hotkey.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Modifiers {
@@ -67,6 +91,24 @@ impl Modifiers {
     /// Whether no modifier is set.
     pub const fn is_empty(&self) -> bool {
         !(self.cmd || self.shift || self.option || self.control)
+    }
+
+    /// The modifiers held in `NSEvent.modifierFlags`. Caps Lock, the
+    /// numeric pad, Help, fn (which F1 to F12 report) and the left or right
+    /// key bits are not modifiers of a shortcut, so they are ignored.
+    pub const fn from_event_flags(flags: u64) -> Modifiers {
+        Modifiers {
+            cmd: flags & EVENT_COMMAND != 0,
+            shift: flags & EVENT_SHIFT != 0,
+            option: flags & EVENT_OPTION != 0,
+            control: flags & EVENT_CONTROL != 0,
+        }
+    }
+
+    /// Whether only `cmd`, `shift`, `option` and `control` (those given as
+    /// `true`) are set.
+    const fn exactly(&self, cmd: bool, shift: bool, option: bool, control: bool) -> bool {
+        self.cmd == cmd && self.shift == shift && self.option == option && self.control == control
     }
 
     /// The Carbon modifier mask (`cmdKey`, `shiftKey`, `optionKey`,
@@ -240,9 +282,36 @@ impl Key {
             .map(|(k, _, _)| *k)
     }
 
+    /// The key at macOS virtual key code `code` (`NSEvent.keyCode`), or
+    /// `None` for a key a shortcut can't use (Return, Tab, the arrows,
+    /// punctuation, the keypad, F13 and up).
+    pub fn from_carbon_code(code: u32) -> Option<Key> {
+        KEYS.iter().find(|(_, _, c)| *c == code).map(|(k, _, _)| *k)
+    }
+
     /// Every key, in table order.
     pub fn all() -> impl Iterator<Item = Key> {
         KEYS.iter().map(|(k, _, _)| *k)
+    }
+
+    /// Whether the key types a character: a letter or a digit.
+    fn types_a_character(self) -> bool {
+        !matches!(
+            self,
+            Key::Space
+                | Key::F1
+                | Key::F2
+                | Key::F3
+                | Key::F4
+                | Key::F5
+                | Key::F6
+                | Key::F7
+                | Key::F8
+                | Key::F9
+                | Key::F10
+                | Key::F11
+                | Key::F12
+        )
     }
 }
 
@@ -306,6 +375,87 @@ impl fmt::Display for HotkeyError {
 
 impl std::error::Error for HotkeyError {}
 
+/// macOS's own shortcuts that Settings refuses ([`Refusal::System`]), in
+/// canonical form, with the feature each one opens: macOS's defaults for
+/// Spotlight, input sources, emoji, screenshots, the Apple menu's Lock
+/// Screen and Log Out, the Dock and full screen. macOS would let the app
+/// register most of them and then never hand them over.
+const SYSTEM_SHORTCUTS: [(&str, &str); 13] = [
+    ("cmd+space", "Spotlight"),
+    ("cmd+option+space", "Finder search"),
+    ("control+space", "input sources"),
+    ("option+control+space", "input sources"),
+    ("cmd+control+space", "emoji and symbols"),
+    ("cmd+shift+3", "screenshots"),
+    ("cmd+shift+4", "screenshots"),
+    ("cmd+shift+5", "screenshots"),
+    ("cmd+shift+6", "screenshots"),
+    ("cmd+control+q", "Lock Screen"),
+    ("cmd+shift+q", "Log Out"),
+    ("cmd+option+d", "hiding the Dock"),
+    ("cmd+control+f", "full screen"),
+];
+
+/// Why a shortcut picked in Settings was refused; its
+/// [`Display`](fmt::Display) form is the reason the Settings row shows in
+/// place of its caption. The shortcut appears in its menu form
+/// ([`HotkeySpec::symbols`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Command with only a letter or digit: every app's own commands
+    /// (⌘Q, ⌘W, ⌘C…).
+    UsedByApps(HotkeySpec),
+    /// Shift or Option (or both) with a letter or digit, or Shift with
+    /// Space: in every text field it types a character.
+    TypesCharacter(HotkeySpec),
+    /// One of macOS's own shortcuts, with the feature it opens.
+    System(HotkeySpec, &'static str),
+    /// A key a shortcut can't use (see [`Key::from_carbon_code`]).
+    UnsupportedKey,
+    /// macOS didn't register it, usually because another app holds it.
+    NotAccepted(HotkeySpec),
+    /// The saved shortcut failed to register when the app opened.
+    NotAcceptedAtLaunch(HotkeySpec),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::UsedByApps(spec) => write!(
+                f,
+                "{} is used by every app. Try another shortcut.",
+                spec.symbols()
+            ),
+            Refusal::TypesCharacter(spec) => write!(
+                f,
+                "{} types a character. Try another shortcut.",
+                spec.symbols()
+            ),
+            Refusal::System(spec, feature) => write!(
+                f,
+                "macOS uses {} for {feature}. Try another shortcut.",
+                spec.symbols()
+            ),
+            Refusal::UnsupportedKey => f.write_str(
+                "That key can\u{2019}t be used. Use a letter, digit, Space or F1\u{2013}F12.",
+            ),
+            Refusal::NotAccepted(spec) => write!(
+                f,
+                "macOS didn\u{2019}t accept {}. Another app may be using it.",
+                spec.symbols()
+            ),
+            Refusal::NotAcceptedAtLaunch(spec) => write!(
+                f,
+                "macOS didn\u{2019}t accept {} when the app opened. Click the keys to pick \
+                 another.",
+                spec.symbols()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
 impl HotkeySpec {
     /// The default summon hotkey of the app built for `channel`
     /// ([`Channel::default_hotkey`]): option+space for the release app,
@@ -360,6 +510,36 @@ impl HotkeySpec {
             return Err(HotkeyError::NoModifier);
         }
         Ok(HotkeySpec { modifiers, key })
+    }
+
+    /// Whether Settings may take this shortcut, before macOS is asked.
+    ///
+    /// Every shortcut needs Command or Control, except Space and F1 to
+    /// F12, which may use Option, Shift or both (so both apps' defaults,
+    /// ⌥Space and ⌥⇧Space, pass). Refused: macOS's own shortcuts
+    /// ([`Refusal::System`]); Command alone with a letter or digit
+    /// ([`Refusal::UsedByApps`]); Shift alone with a letter, digit or
+    /// Space, and Option with or without Shift on a letter or digit
+    /// ([`Refusal::TypesCharacter`]).
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`] saying why.
+    pub fn check(&self) -> Result<(), Refusal> {
+        let canonical = self.to_string();
+        if let Some((_, feature)) = SYSTEM_SHORTCUTS.iter().find(|(s, _)| *s == canonical) {
+            return Err(Refusal::System(*self, feature));
+        }
+        let m = &self.modifiers;
+        let types = self.key.types_a_character();
+        if types && m.exactly(true, false, false, false) {
+            return Err(Refusal::UsedByApps(*self));
+        }
+        let shift_alone = m.exactly(false, true, false, false);
+        if (shift_alone && (types || self.key == Key::Space)) || (types && !m.cmd && !m.control) {
+            return Err(Refusal::TypesCharacter(*self));
+        }
+        Ok(())
     }
 
     /// The macOS virtual key code and Carbon modifier mask, for registering

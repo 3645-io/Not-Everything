@@ -243,6 +243,11 @@ pub enum Surface {
     IconPickHover,
     /// The chosen app icon pick.
     IconPickSelected,
+    /// The shortcut recorder's caps under the pointer (`.rec.is-hover`).
+    RecorderHover,
+    /// The shortcut recorder while it records (`.rec[aria-pressed=true]`):
+    /// pressed and rimmed in green, as a selected pick or row is.
+    Recording,
     /// The progress bar's track (`.progress .track`).
     ProgressTrack,
     /// The access callout (`.callout`).
@@ -257,7 +262,7 @@ pub enum Surface {
 
 impl Surface {
     /// Every surface.
-    pub const ALL: FixedList<Surface, 27> = FixedList([
+    pub const ALL: FixedList<Surface, 29> = FixedList([
         Surface::Panel,
         Surface::TopBar,
         Surface::Field,
@@ -280,6 +285,8 @@ impl Surface {
         Surface::SegmentOn,
         Surface::IconPickHover,
         Surface::IconPickSelected,
+        Surface::RecorderHover,
+        Surface::Recording,
         Surface::ProgressTrack,
         Surface::Callout,
         Surface::Dot,
@@ -329,13 +336,15 @@ impl Surface {
                 Corners::all(RADIUS_MD),
                 shadow(ShadowToken::Raised),
             ),
-            Surface::ChipOn | Surface::RowSelected => (
+            Surface::ChipOn | Surface::RowSelected | Surface::Recording => (
                 fill(Token::GreenWash),
                 border(rim, Token::GreenInk),
                 Corners::all(RADIUS_MD),
                 shadow(ShadowToken::Pressed),
             ),
-            Surface::RowHover => (fill(Token::Well), None, Corners::all(RADIUS_MD), vec![]),
+            Surface::RowHover | Surface::RecorderHover => {
+                (fill(Token::Well), None, Corners::all(RADIUS_MD), vec![])
+            }
             Surface::Key => (
                 fill(Token::Panel),
                 None,

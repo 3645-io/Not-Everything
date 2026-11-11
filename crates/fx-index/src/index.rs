@@ -4,16 +4,18 @@
 //! Clean-room: written from docs/PLAN.md ("Data layout", "Updates and
 //! concurrency") only.
 
+use std::cell::OnceCell;
 use std::fmt;
-use std::mem::size_of;
 use std::sync::Arc;
 
 use fx_model::{Change, Entry, EntryId, FileKey};
 
+use crate::kids::{BaseKids, DeltaKids, name_hash};
+
 use crate::extensions::{ExtId, extension_of};
 use crate::meta::PackedMeta;
 use crate::names::{NameBuffer, NameError};
-use crate::parts::{self, IndexParts, PartsError};
+use crate::parts::{self, IndexParts, PartsError, SharedParts};
 use crate::snapshot::Snapshot;
 use crate::store::{Base, Bitset, Delta, Row, State};
 
@@ -105,6 +107,19 @@ pub enum Applied {
     Removed(usize),
 }
 
+/// What [`Index::upsert_reporting`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upserted {
+    /// The entry was already stored exactly so.
+    Unchanged,
+    /// Size, kind, flags or dates changed; name and parent did not.
+    Updated,
+    /// The name or the parent changed: a rename or a move.
+    Moved,
+    /// The key was new.
+    Inserted,
+}
+
 /// The in-memory index of one or more volumes.
 ///
 /// Columns are indexed by [`EntryId`]. IDs are stable until the next
@@ -115,13 +130,17 @@ pub enum Applied {
 /// automatic compactions is collected for [`take_auto_remap`](Index::take_auto_remap).
 ///
 /// Readers use [`snapshot`](Index::snapshot); the index itself is meant for
-/// one writer.
+/// one writer, which also navigates it: children by parent and by name,
+/// subtrees, and entries read back by key.
 #[derive(Debug)]
 pub struct Index {
     state: State,
-    /// Live children per ID, so removing a leaf needs no scan. Writer-only;
-    /// snapshots do not carry it.
-    children: Vec<u32>,
+    /// The base IDs by parent, built at the first navigation after a load
+    /// or a compaction (a reader that only searches, such as the command,
+    /// never builds it). Writer-only; snapshots do not carry it.
+    base_kids: OnceCell<BaseKids>,
+    /// The live delta rows by parent and name. Writer-only.
+    delta_kids: DeltaKids,
     compact_fraction: f64,
     /// Composition of the remaps of compactions since the first automatic
     /// one not yet taken, indexed by the IDs valid before it.
@@ -139,7 +158,8 @@ impl Index {
     pub fn new() -> Self {
         Index {
             state: State::default(),
-            children: Vec::new(),
+            base_kids: OnceCell::new(),
+            delta_kids: DeltaKids::default(),
             compact_fraction: DEFAULT_COMPACT_FRACTION,
             auto_remap: None,
         }
@@ -161,18 +181,86 @@ impl Index {
     /// extension ID is not in the table, or two live entries share a key.
     /// Never panics on bad input.
     pub fn from_parts(parts: IndexParts) -> Result<Index, IndexError> {
-        let (state, children) = parts::restore(parts)?;
+        let state = parts::restore(parts)?;
         Ok(Index {
+            base_kids: OnceCell::new(),
+            delta_kids: DeltaKids::default(),
             state,
-            children,
             compact_fraction: DEFAULT_COMPACT_FRACTION,
             auto_remap: None,
         })
     }
 
+    /// [`from_parts`](Index::from_parts) for columns that stay in a
+    /// [`Backing`](crate::Backing), such as a saved index's memory map: the
+    /// same checks and the same index, but the base columns are served from
+    /// the backing instead of being copied to the heap. Only the key table,
+    /// the extension table and the deletion bitset are built on the heap.
+    ///
+    /// Errors: as [`from_parts`](Index::from_parts), and
+    /// [`PartsError::SharedColumn`] when a range is out of bounds or isn't a
+    /// whole number of values.
+    pub fn from_shared(parts: SharedParts) -> Result<Index, IndexError> {
+        Ok(Index::from_state(parts::restore_shared(parts)?))
+    }
+
+    /// Serves the base columns from `restored`, an index restored from a
+    /// save of `saved`, when `saved` held exactly this index's base: the
+    /// same base, an empty delta and no removals, as right after a first
+    /// scan or a compaction. Changes made since `saved` stay in the delta
+    /// and the deletion bitset, which refer to the same entry IDs. Returns
+    /// whether the base was swapped; it isn't when the base has been
+    /// compacted since, or `saved` wasn't exactly the base.
+    pub fn adopt_base(&mut self, saved: &Snapshot, restored: Index) -> bool {
+        let saved = &saved.state;
+        let exact = Arc::ptr_eq(&self.state.base, &saved.base)
+            && saved.delta.len() == 0
+            && saved.deleted.ones == 0;
+        let restored = restored.state;
+        if !exact
+            || restored.base.len() != self.state.base.len()
+            || restored.deleted.ones != 0
+            || restored.delta.len() != 0
+        {
+            return false;
+        }
+        self.state.base = restored.base;
+        true
+    }
+
+    /// Bytes of the base columns served from a backing instead of the heap
+    /// ([`from_shared`](Index::from_shared)). They are part of
+    /// [`heap_bytes`](Index::heap_bytes), which counts every column the
+    /// index holds, so that figure keeps its meaning.
+    pub fn mapped_bytes(&self) -> usize {
+        self.state.base.mapped_bytes()
+    }
+
+    /// An index over `state`, whose delta is empty ([`IndexBuilder`](crate::IndexBuilder)).
+    pub(crate) fn from_state(state: State) -> Index {
+        Index {
+            base_kids: OnceCell::new(),
+            delta_kids: DeltaKids::default(),
+            state,
+            compact_fraction: DEFAULT_COMPACT_FRACTION,
+            auto_remap: None,
+        }
+    }
+
     /// Number of live entries.
     pub fn live_count(&self) -> usize {
         self.state.live
+    }
+
+    /// One past the largest entry ID handed out since the last compaction
+    /// (live and removed IDs alike).
+    pub fn id_bound(&self) -> usize {
+        self.state.total()
+    }
+
+    /// Whether `id` is a live entry.
+    pub fn is_live(&self, id: EntryId) -> bool {
+        self.state.is_live(id.0)
     }
 
     /// The live entry with this key, if any.
@@ -236,6 +324,13 @@ impl Index {
     /// key is not live, [`IndexError::Cycle`] if the entry would become its
     /// own ancestor, [`IndexError::InvalidName`], [`IndexError::Full`].
     pub fn upsert(&mut self, entry: Entry) -> Result<EntryId, IndexError> {
+        self.upsert_reporting(entry).map(|(id, _)| id)
+    }
+
+    /// [`upsert`](Index::upsert), also saying what changed, so the writer
+    /// knows whether the sort orders need the entry re-sorted, and whether
+    /// its subtree moved with it ([`Upserted::Moved`]).
+    pub fn upsert_reporting(&mut self, entry: Entry) -> Result<(EntryId, Upserted), IndexError> {
         let key = entry.key;
         if entry.name.is_empty() {
             return Err(IndexError::InvalidName {
@@ -284,53 +379,170 @@ impl Index {
             modified: entry.modified,
             created: entry.created,
         };
-        let id = match existing {
+        let (id, what) = match existing {
             Some(id) => {
-                if !self.update(id, row) {
-                    return Ok(id);
+                let what = self.update(id, row);
+                if what == Upserted::Unchanged {
+                    return Ok((id, what));
                 }
-                id
+                (id, what)
             }
-            None => self.insert_new(row),
+            None => (self.insert_new(row), Upserted::Inserted),
         };
-        Ok(match self.maybe_compact() {
+        let id = match self.maybe_compact() {
             Some(remap) => remap[id.index()],
             None => id,
-        })
+        };
+        Ok((id, what))
     }
 
     /// Removes the entry with this key and all its descendants. Returns how
     /// many entries were removed: 0 for an unknown or already removed key.
     ///
-    /// Cost: removing a leaf is O(1) apart from any automatic compaction it
-    /// triggers. Removing a non-leaf entry (one with live children) scans
-    /// every ID to find the subtree, so it is O(n) in the total number of
-    /// entries (live, delta and removed-but-not-compacted), however small
-    /// the subtree. The 1.8 writer, which applies FSEvents batches that may
-    /// remove many folders, may need per-entry child lists or a
-    /// first-child/next-sibling column to make this proportional to the
-    /// subtree size.
+    /// Cost: proportional to the size of the subtree, found through the
+    /// children index ([`subtree`](Index::subtree)), apart from any
+    /// automatic compaction it triggers.
     pub fn remove(&mut self, key: FileKey) -> usize {
         let Some(id) = self.state.lookup(key) else {
             return 0;
         };
-        let parent = self.state.parent(id);
-        if !parent.is_none() {
-            self.children[parent.index()] -= 1;
+        let doomed = self.subtree(id);
+        for &d in &doomed {
+            self.delete_one(d);
         }
-        let removed = if self.children[id.index()] == 0 {
-            self.delete_one(id);
-            1
-        } else {
-            let doomed = self.subtree(id);
-            for &d in &doomed {
-                self.delete_one(EntryId(d));
-            }
-            doomed.len()
-        };
-        self.state.live -= removed;
+        self.state.live -= doomed.len();
         self.maybe_compact();
-        removed
+        doomed.len()
+    }
+
+    /// The key of entry `id`, live or removed but not yet compacted away.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of range.
+    pub fn key(&self, id: EntryId) -> FileKey {
+        self.state.key(id)
+    }
+
+    /// The live entry with this key, read back as an [`Entry`]: what the
+    /// last upsert stored (sizes beyond 2^56 - 1 bytes are clamped, as
+    /// stored).
+    pub fn get(&self, key: FileKey) -> Option<Entry> {
+        let id = self.state.lookup(key)?;
+        let row = self.state.row(id);
+        let parent = (row.parent != u32::MAX).then(|| self.state.key(EntryId(row.parent)));
+        Some(Entry {
+            key: row.key,
+            parent,
+            name: row.name.into_string(),
+            kind: row.meta.kind(),
+            flags: row.meta.flags(),
+            size: row.meta.size(),
+            modified: row.modified,
+            created: row.created,
+        })
+    }
+
+    /// The live children of `parent` ([`EntryId::NONE`]: the roots), the
+    /// delta's first (the most recently added first), then the base's.
+    pub fn children(&self, parent: EntryId) -> Vec<EntryId> {
+        let mut out = self.delta_children(parent, None);
+        out.extend(
+            self.base_kids()
+                .group(&self.state.base, parent.0)
+                .iter()
+                .copied()
+                .filter(|&m| self.base_current(m))
+                .map(EntryId),
+        );
+        out
+    }
+
+    /// The live entries with no parent, the most recently added first.
+    pub fn roots(&self) -> Vec<EntryId> {
+        self.children(EntryId::NONE)
+    }
+
+    /// The live children of `parent` named `name` (exact bytes), the most
+    /// recently added first. Usually one; two while a replaced entry waits
+    /// for its removal.
+    pub fn children_named(&self, parent: EntryId, name: &str) -> Vec<EntryId> {
+        let mut out = self.delta_children(parent, Some(name));
+        out.extend(
+            self.base_kids()
+                .named(&self.state.base, parent.0, name)
+                .filter(|&m| self.base_current(m))
+                .map(EntryId),
+        );
+        out
+    }
+
+    /// The most recently added live child of `parent` named `name`.
+    pub fn child(&self, parent: EntryId, name: &str) -> Option<EntryId> {
+        self.children_named(parent, name).first().copied()
+    }
+
+    /// `id` and every live entry below it, each after its parent. Empty if
+    /// `id` is not live.
+    pub fn subtree(&self, id: EntryId) -> Vec<EntryId> {
+        if !self.state.is_live(id.0) {
+            return Vec::new();
+        }
+        let mut out = vec![id];
+        let mut i = 0;
+        while i < out.len() {
+            let kids = self.children(out[i]);
+            out.extend(kids);
+            i += 1;
+        }
+        out
+    }
+
+    /// The base IDs by parent, built on first use.
+    fn base_kids(&self) -> &BaseKids {
+        self.base_kids
+            .get_or_init(|| BaseKids::build(&self.state.base))
+    }
+
+    /// Whether base entry `m` is live and still stored in the base (not
+    /// overridden by a delta row, which [`DeltaKids`] lists instead).
+    fn base_current(&self, m: u32) -> bool {
+        !self.state.deleted.get(m as usize) && !self.state.delta.overrides.contains_key(&m)
+    }
+
+    /// The live delta rows under `parent` (named `name`, if given), new
+    /// rows before overrides and each newest ID first.
+    fn delta_children(&self, parent: EntryId, name: Option<&str>) -> Vec<EntryId> {
+        let mut out: Vec<EntryId> = match name {
+            Some(name) => self
+                .delta_kids
+                .hashed(parent.0, name_hash(name))
+                .filter(|&id| self.state.name(EntryId(id)) == name)
+                .map(EntryId)
+                .collect(),
+            None => self.delta_kids.children(parent.0).map(EntryId).collect(),
+        };
+        out.retain(|id| self.state.is_live(id.0));
+        let base_len = self.state.base.len();
+        out.sort_unstable_by(|a, b| {
+            let new_a = a.index() >= base_len;
+            let new_b = b.index() >= base_len;
+            new_b.cmp(&new_a).then(b.0.cmp(&a.0))
+        });
+        out
+    }
+
+    /// Where a delta row of `id` sits in [`DeltaKids`]: its parent and name
+    /// hash; `None` when `id` has no delta row.
+    fn delta_place(&self, id: EntryId) -> Option<(u32, u64)> {
+        let i = id.index();
+        let base_len = self.state.base.len();
+        let row = if i >= base_len {
+            self.state.delta.new.get(i - base_len)
+        } else {
+            self.state.delta.overrides.get(&id.0)
+        }?;
+        Some((row.parent, name_hash(&row.name)))
     }
 
     /// Rebuilds a dense base from the live entries, dropping removed ones
@@ -355,11 +567,12 @@ impl Index {
     }
 
     /// Heap memory held by the index, in bytes (allocated capacity of every
-    /// column, the key table, the delta, the bitset and the child counts).
-    /// Snapshots share most of it.
+    /// column, the key table, the delta, the bitset and the children
+    /// index). Snapshots share most of it.
     pub fn heap_bytes(&self) -> usize {
         self.state.heap_bytes()
-            + self.children.capacity() * size_of::<u32>()
+            + self.base_kids.get().map_or(0, BaseKids::heap_bytes)
+            + self.delta_kids.heap_bytes()
             + self.auto_remap.as_ref().map_or(0, |r| r.capacity() * 4)
     }
 
@@ -384,26 +597,22 @@ impl Index {
         Arc::make_mut(&mut self.state.exts).intern(name)
     }
 
-    /// Replaces the row of live entry `id`. Returns false if nothing
-    /// changed.
-    fn update(&mut self, id: EntryId, row: Row) -> bool {
+    /// Replaces the row of live entry `id` and says what changed.
+    fn update(&mut self, id: EntryId, row: Row) -> Upserted {
         let old = self.state.row(id);
-        if *old.name == *row.name
-            && old.parent == row.parent
+        let moved = *old.name != *row.name || old.parent != row.parent;
+        if !moved
             && old.meta == row.meta
             && old.modified == row.modified
             && old.created == row.created
         {
-            return false;
+            return Upserted::Unchanged;
         }
-        if old.parent != row.parent {
-            if old.parent != u32::MAX {
-                self.children[old.parent as usize] -= 1;
-            }
-            if row.parent != u32::MAX {
-                self.children[row.parent as usize] += 1;
-            }
+        if let Some((parent, hash)) = self.delta_place(id) {
+            self.delta_kids.remove(parent, hash, id.0);
         }
+        self.delta_kids
+            .insert(row.parent, name_hash(&row.name), id.0);
         let base_len = self.state.base.len();
         let delta = Arc::make_mut(&mut self.state.delta);
         let i = id.index();
@@ -418,15 +627,17 @@ impl Index {
         } else {
             delta.new[i - base_len] = row;
         }
-        true
+        if moved {
+            Upserted::Moved
+        } else {
+            Upserted::Updated
+        }
     }
 
     fn insert_new(&mut self, row: Row) -> EntryId {
         let id = EntryId(self.state.total() as u32);
-        if row.parent != u32::MAX {
-            self.children[row.parent as usize] += 1;
-        }
-        self.children.push(0);
+        self.delta_kids
+            .insert(row.parent, name_hash(&row.name), id.0);
         Arc::make_mut(&mut self.state.deleted).push_clear();
         let delta = Arc::make_mut(&mut self.state.delta);
         delta.name_bytes += row.name.len() + 1;
@@ -436,7 +647,7 @@ impl Index {
         id
     }
 
-    /// Marks one entry removed (no child-count or live-count bookkeeping).
+    /// Marks one entry removed (no live-count bookkeeping).
     ///
     /// A removed base entry keeps any override row, so its dead slot reads
     /// back the entry's last stored values (as [`Snapshot`] documents) rather
@@ -444,6 +655,9 @@ impl Index {
     /// restore from [`Snapshot::to_parts`], which bakes overrides into the
     /// base, behave exactly like the original on later removals.
     fn delete_one(&mut self, id: EntryId) {
+        if let Some((parent, hash)) = self.delta_place(id) {
+            self.delta_kids.remove(parent, hash, id.0);
+        }
         let i = id.index();
         let base_len = self.state.base.len();
         Arc::make_mut(&mut self.state.deleted).set(i);
@@ -452,42 +666,6 @@ impl Index {
             let key = delta.new[i - base_len].key;
             delta.keys.remove(&key);
         }
-    }
-
-    /// Live IDs of `root` and every descendant, found with one memoized pass
-    /// over all IDs.
-    fn subtree(&self, root: EntryId) -> Vec<u32> {
-        const UNKNOWN: u8 = 0;
-        const INSIDE: u8 = 1;
-        const OUTSIDE: u8 = 2;
-        let total = self.state.total();
-        let mut mark = vec![UNKNOWN; total];
-        mark[root.index()] = INSIDE;
-        let mut chain = Vec::new();
-        for i in 0..total {
-            if mark[i] != UNKNOWN || self.state.deleted.get(i) {
-                continue;
-            }
-            let mut cur = EntryId(i as u32);
-            let verdict = loop {
-                match mark[cur.index()] {
-                    UNKNOWN => {}
-                    m => break m,
-                }
-                chain.push(cur.index());
-                cur = self.state.parent(cur);
-                if cur.is_none() {
-                    break OUTSIDE;
-                }
-            };
-            for j in chain.drain(..) {
-                mark[j] = verdict;
-            }
-        }
-        (0..total)
-            .filter(|&i| mark[i] == INSIDE)
-            .map(|i| i as u32)
-            .collect()
     }
 
     /// Compacts automatically if the delta or the removed entries pass the
@@ -532,16 +710,15 @@ impl Index {
         }
         let mut base = Base {
             names: NameBuffer::with_capacity(live, name_bytes),
-            parent: Vec::with_capacity(live),
-            meta: Vec::with_capacity(live),
-            modified: Vec::with_capacity(live),
-            created: Vec::with_capacity(live),
-            ext: Vec::with_capacity(live),
-            volume: Vec::with_capacity(live),
-            file_id: Vec::with_capacity(live),
+            parent: Vec::with_capacity(live).into(),
+            meta: Vec::with_capacity(live).into(),
+            modified: Vec::with_capacity(live).into(),
+            created: Vec::with_capacity(live).into(),
+            ext: Vec::with_capacity(live).into(),
+            volume: Vec::with_capacity(live).into(),
+            file_id: Vec::with_capacity(live).into(),
             table: Vec::new(),
         };
-        let mut children = vec![0u32; live];
         for i in 0..total {
             if state.deleted.get(i) {
                 continue;
@@ -559,19 +736,20 @@ impl Index {
             } else {
                 let p = remap[parent.index()];
                 debug_assert!(!p.is_none(), "live entry with a removed parent");
-                children[p.index()] += 1;
                 p.0
             };
             base.parent.push(new_parent);
             base.meta.push(state.meta(id).0);
             base.modified.push(state.modified(id));
             base.created.push(state.created(id));
-            base.ext.push(state.ext(id));
+            base.ext.push(state.ext(id).0);
             let key = state.key(id);
             base.volume.push(key.volume.0);
             base.file_id.push(key.file_id);
         }
         base.build_table();
+        self.base_kids = OnceCell::new();
+        self.delta_kids.clear();
         self.state = State {
             base: Arc::new(base),
             delta: Arc::new(Delta::default()),
@@ -579,7 +757,6 @@ impl Index {
             exts: Arc::clone(&self.state.exts),
             live,
         };
-        self.children = children;
         remap
     }
 }

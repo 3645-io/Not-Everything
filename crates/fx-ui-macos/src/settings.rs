@@ -248,12 +248,16 @@ impl Settings {
 }
 
 /// The settings file path for the home directory `home`:
-/// `<home>/Library/Application Support/Not-Everything/settings`.
+/// `<home>/Library/Application Support/Not-Everything/settings`, the
+/// settings file in [`crate::app_args::app_data_folder`].
 pub fn settings_path(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join(APP_DIR_NAME)
-        .join(SETTINGS_FILE_NAME)
+    settings_path_in(&crate::app_args::app_data_folder(home))
+}
+
+/// The settings file in the data folder `data`: `data/settings`. A
+/// `--data-dir` run passes its own folder.
+pub fn settings_path_in(data: &Path) -> PathBuf {
+    data.join(SETTINGS_FILE_NAME)
 }
 
 /// The settings file path for the current user, from `$HOME`; `None` when

@@ -63,6 +63,8 @@ struct State {
     saves: usize,
     row_generations: Vec<Generation>,
     subscribers: Vec<Sender<Generation>>,
+    /// Every `set_window_visible` call, in order.
+    window_visible: Vec<bool>,
 }
 
 /// A source over a list of names; clones share one state.
@@ -252,6 +254,10 @@ impl ResultsSource for Fake {
     fn save_for_quit(&self) -> Result<(), String> {
         self.lock().saves += 1;
         Ok(())
+    }
+
+    fn set_window_visible(&self, visible: bool) {
+        self.lock().window_visible.push(visible);
     }
 }
 
@@ -772,4 +778,25 @@ fn a_kept_selection_survives_the_switch_in_the_grouped_order() {
     );
     assert_eq!(new.lookups(), [true]);
     assert!(old.lookups().is_empty(), "the old index is not asked");
+}
+
+#[test]
+fn the_window_state_goes_to_the_current_source_and_to_the_next_at_a_switch() {
+    let limited = limited();
+    let full = full();
+    let source = SwitchableSource::new(shared(&limited));
+    source.set_window_visible(false);
+    assert_eq!(limited.lock().window_visible, vec![false]);
+
+    // The full-access engine opens while the window is hidden: it starts
+    // in the background too, so it batches changes like the one before it.
+    let _previous = source.switch_to(shared(&full));
+    assert_eq!(full.lock().window_visible, vec![false]);
+    source.set_window_visible(true);
+    assert_eq!(full.lock().window_visible, vec![false, true]);
+    assert_eq!(
+        limited.lock().window_visible,
+        vec![false],
+        "the old source is left alone"
+    );
 }

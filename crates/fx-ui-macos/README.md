@@ -306,8 +306,9 @@ Settings stays in front. The app keeps running either way.
 ## Measurement builds
 
 The measurement modes, the `table_spike` example and the code behind them
-(`model`, `frame_stats`, `spike_args`, `gate_probe`,
-`source::SyntheticSource`, `appkit::spike` and the `fx-bench` dependency)
+(`model`, `frame_stats`, `spike_args`, `gate_probe`, `summon_probe`,
+`sort_probe`, `latency_probe`, `source::SyntheticSource`, `appkit::spike`,
+`appkit::window::probes` and the `fx-bench` dependency)
 build only with the `measure` feature. Release builds leave it off, so a
 release app rejects these options as unknown and carries none of that code.
 The gate scripts (`scripts/phase0-gate.sh`, `scripts/phase1-gate.sh`)
@@ -327,6 +328,17 @@ The app's measurement options:
 | `--autoscroll` | Scroll 600 frames (5 rows each), print frame stats and the GATE line, exit |
 | `--launch-probe` | Print launch-to-first-paint and launch-to-results times, exit |
 | `--gate-probe OUT` | Phase 1 gate probe over the real index: write `GATE` lines for first result, keystroke to repaint and autoscroll frames to `OUT`, a new file, exit (not with `--synthetic`; see below) |
+| `--summon-probe OUT` | Shortcut probe: hide the window as Escape does and show it as the global hotkey does, 50 times; write the shortcut-to-ready-window times to `OUT`, a new file, exit (see below) |
+| `--sort-probe OUT` | Re-sort probe: with every entry listed, sort by every column both ways, one untimed round then 5 timed rounds; write the re-sort-to-repaint times to `OUT`, a new file, exit (see below) |
+| `--data-dir DIR` | Keep the stores and settings in `DIR`, an existing folder, instead of the app's data folder; register no global hotkey and leave the login item alone |
+| `--window hidden` | Start the resident app and hide the window as Escape does once it is active; then run until quit or SIGTERM |
+| `--window search --query TEXT` | Start the resident app showing the search for `TEXT` and its results; then run until quit or SIGTERM |
+
+A probe is a measurement of its own: `--summon-probe` and `--sort-probe`
+refuse each other, `--gate-probe`, `--autoscroll` and `--launch-probe`.
+`--window` refuses every measurement option, `search` needs `--query`, and
+`--query` needs `search`. A bad combination exits with code 2, as any bad
+option does.
 
 Measurements on the real window (release build, one at a time):
 
@@ -380,7 +392,13 @@ target/release/fx-ui-macos --root /Volumes/Bench2M --gate-probe ui-probe.log
 | `ui autoscroll frame p95` | 600 autoscroll frames (5 rows each) over all entries (empty query) of the real engine | p95 ≤16.7 ms |
 
 Each line has the form `GATE <criterion>: PASS|FAIL (<detail>)`, which the
-fx-bench gate summary parses; the report's header names the entry count. A
+fx-bench gate summary parses; the report's header names the entry count.
+After the GATE lines come the measured values, one `key=value` line each,
+for the performance gate's script: `launch_ms` (process start to the first
+result painted), `keystroke_p95_ms`, `scroll_p95_ms` (the autoscroll frame
+p95) and `ui_entries`. Times are milliseconds with two decimals; a value
+without samples has no line, and the lines before them read as they always
+have, as `scripts/phase1-gate.sh` parses them. A
 criterion without samples is a FAIL line. A keystroke whose repaint does not
 come within 10 s is recorded as that slow; no first result within 60 s
 leaves goal 1 without a sample. A watchdog exits with code 1 after 900 s, and
@@ -394,6 +412,92 @@ The pure parts (argument parsing, the keystroke script, the
 report) live in `src/gate_probe.rs` and are tested on any host
 (`tests/gate_probe.rs`, with `--features measure`); the AppKit glue only
 performs the actions `ProbeRun::tick` asks for.
+
+## Shortcut and re-sort probes
+
+Two more probes time the window for the performance gate. Both run on
+`--synthetic` rows (cheap and the same every run) or on the engine over
+`--root`, wait until the list is steady (the first results painted, the
+index not scanning, no new page for 300 ms; at most 300 s), write their
+report to `OUT`, a new file, print it and exit: code 0, or 1 without samples
+or when `OUT` cannot be written. A watchdog exits with code 1 after 1,200 s.
+
+```sh
+cargo build --release -p fx-ui-macos --features measure
+DATA=$(mktemp -d)
+target/release/fx-ui-macos --synthetic 200000 --data-dir "$DATA" --summon-probe summon.txt
+target/release/fx-ui-macos --synthetic 200000 --data-dir "$DATA" --sort-probe sort.txt
+```
+
+The report of each:
+
+```text
+fx-ui-macos summon probe: <n> entries
+GATE ui shortcut to window ready p95 <= 100 ms: PASS|FAIL (p95=<x>ms p50=<y>ms n=<k>)
+summon_p95_ms=<x>
+summon_p50_ms=<y>
+summon_samples=<k>
+summon_entries=<n>
+```
+
+The sort probe's is the same with `sort probe`, `GATE ui re-sort to repaint
+p95 <= 50 ms` and `sort_` keys. Without samples the GATE line is
+`FAIL (no samples)` and the p95 and p50 lines are left out.
+
+| Probe | What is timed | Budget |
+| --- | --- | --- |
+| `--summon-probe` | 50 cycles. The window is hidden with what Escape in the empty field calls, and the probe waits until it is off screen and the app no longer active, then 100 ms more. The sample starts at the call the global hotkey's handler makes (`toggle_window`) and ends when the window is ready: on screen, the key window of the active app, the search field holding the focus, and its display pass drawn and committed | p95 ≤100 ms |
+| `--sort-probe` | With the empty query (every entry listed), each column title is clicked twice per round (Name, Path, Size, Date Modified, so every column both ways). The sample runs from sending the title's action, as a click does, to the first table draw after the re-sorted page is applied. One untimed round first, then 5 timed rounds (40 samples) | p95 ≤50 ms |
+
+**Window ready.** The probe looks at the window every millisecond. Once it
+is on screen, key and active with the search field focused, the probe runs
+the window's display pass (`displayIfNeeded`, what AppKit runs at the end
+of the run-loop turn) and flushes the Core Animation transaction to the
+window server; the sample ends when that returns. The window server shows
+that frame at its next refresh, up to one frame later, which the sample
+leaves out. The sample starts at the app's hotkey handler, not at the key
+press: posting real key presses needs the Accessibility permission, which a
+measurement run should not ask for, so the system's hotkey dispatch and the
+app's wake-up are not in it. A window that will not go off screen within
+3 s skips its cycle; one not ready within 5 s is recorded as that slow.
+
+**Repainted.** As for the keystroke gate: the first draw of the results
+table after the page answering the new sort is applied. A click not
+repainted within 10 s is recorded as that slow. The untimed round is there
+because `SyntheticSource` builds each column's sort order the first time it
+is asked for, which the engine never does.
+
+## Background runs: `--window` and `--data-dir`
+
+For CPU, energy and memory sampling the app runs as it does every day,
+resident with its menu-bar item, only started in a known state:
+
+```sh
+DATA=$(mktemp -d)
+target/release/fx-ui-macos --root / --data-dir "$DATA" --window hidden &
+target/release/fx-ui-macos --root / --data-dir "$DATA" --window search --query main &
+```
+
+- `--window hidden`: once the launched app is active (at most 3 s), the
+  window is hidden with what Escape calls, so the app hides and the previous
+  app takes the focus; for 2 s more it is hidden again if it comes back,
+  then no probe timer is left running.
+- `--window search --query TEXT`: the window shows with `TEXT` in the
+  search field and its results listed, set as typing sets them.
+
+Either way the app then runs until it is quit or gets SIGTERM, which ends
+it at once (in about 10 ms in a smoke run), without the quit's index save.
+There is no watchdog.
+
+`--data-dir DIR` makes `DIR`, which must exist, the data folder: the stores
+go to `DIR/stores/` or `DIR/stores-limited/` and the settings to
+`DIR/settings`, so a measurement never touches the daily app's (or the
+Preview app's) index or settings. `DIR` and the folders in it are made
+owner-only (0700), as the default data folder is, since the index lists the
+names of files in protected folders; a folder from `mktemp -d` already is.
+A run with `--data-dir` registers no global hotkey, so it never takes the
+daily app's shortcut, and leaves the login item alone: it reports Launch at
+Login as unavailable and refuses to change it.
 
 ## What the spike is
 
@@ -418,13 +522,16 @@ The main modules, beside the interface modules above:
 | `columns` | any host | The four columns and the header-click sort state |
 | `controller` | any host | `ResultsController`: query, sort, stale pages, throttled re-runs, status |
 | `actions` | any host | Read-only actions, key map, drag-out mask |
-| `app_args` | any host | Command line of the app and the per-root store path |
+| `app_args` | any host | Command line of the app, the data folder and the per-root store path |
 | `data_folder` | any host | The data folder's owner-only folders and files |
 | `bundle` | any host | `.app` bundle writer and signer, and `dir_size` |
 | `model` | any host, `measure` | Virtual row model: cell text, size and date formatting, filter |
 | `frame_stats` | any host, `measure` | Per-frame timings, percentiles and the GATE line |
 | `spike_args` | any host, `measure` | Command-line options of `table_spike` |
 | `gate_probe` | any host, `measure` | The Phase 1 gate probe's script, timings and report |
+| `summon_probe` | any host, `measure` | The shortcut probe's cycles and timing |
+| `sort_probe` | any host, `measure` | The re-sort probe's clicks and timing |
+| `latency_probe` | any host, `measure` | The shortcut and re-sort probes' report |
 | `appkit` | macOS only | `appkit::window` (product window), `appkit::app` (what the binary runs) and, with `measure`, `appkit::spike` (the spike window) |
 
 `objc2`, `objc2-foundation`, `objc2-app-kit`, `global-hotkey` and

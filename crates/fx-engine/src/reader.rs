@@ -247,7 +247,7 @@ impl StoreReader {
             other => rejected(other),
         })?;
         mapped.verify_checksums().map_err(rejected)?;
-        let index = mapped.to_index().map_err(|e| {
+        let index = mapped.share_index().map_err(|e| {
             rejected(LoadError::Malformed {
                 reason: format!("the index does not rebuild: {e}"),
             })

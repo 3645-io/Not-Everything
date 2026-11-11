@@ -4,8 +4,12 @@ Synthetic file names and file trees, an on-disk tree materializer, and a
 small benchmark harness that reports nearest-rank p50 and p95, and a
 `gate-summary` command that collects the benchmarks' `GATE` lines into one
 results table, and a `phase1-summary` command that evaluates the Phase 1
-gate from benchmark results and writes `summary.md`. The crate uses only
-the Rust standard library.
+gate from benchmark results and writes `summary.md`. For the performance
+gate it adds `sample` (a process's CPU, energy, wakeups, disk writes and
+memory over time), `churn` (a steady stream of file changes to measure
+against) and `perf-compare` (metrics against a baseline file). The crate
+uses only the Rust standard library; on macOS, `sample` also calls
+libSystem through its own `extern "C"` declarations.
 
 ## Usage
 
@@ -48,8 +52,9 @@ The harness stops the timer as soon as the closure returns; the closure's
 result is then passed through `std::hint::black_box` and dropped outside
 the timed region, so deallocation is never part of a sample.
 Bad arguments print usage to stderr and exit with code 2; I/O errors exit
-with code 1 (except in `gate-summary` and `phase1-summary`; see
-[Gate summary](#gate-summary) and [Phase 1 summary](#phase-1-summary)).
+with code 1 (except in `gate-summary`, `phase1-summary` and `perf-compare`;
+see [Gate summary](#gate-summary), [Phase 1 summary](#phase-1-summary) and
+[Performance comparison](#performance-comparison)).
 
 From Rust, use `generate_names`, `generate_tree`, `materialize` and `run`
 (see the crate docs).
@@ -85,6 +90,32 @@ numbers (for example in `docs/gates/`):
   macOS). Use `unknown` if you cannot tell.
 - Record the exact command, including `--count`, `--seed` and
   `--iterations`, alongside p50 and p95.
+
+## Release notes: perf-release
+
+`perf-release` writes the Performance section of a release's GitHub notes:
+this release's metrics against the previous release's and the targets of
+the baseline file.
+
+```sh
+cargo run --release -p fx-bench -- perf-release \
+    --baseline docs/gates/perf-baseline.toml \
+    --previous docs/gates/releases/0.3.2.txt --previous-label 0.3.2 \
+    --label 0.4.0-RC-1 [--notes perf/notes.md] [--out performance.md] \
+    perf/metrics.txt
+```
+
+The section, headed `### Performance` like the other sections of the notes, is a summary table of the IDs in the baseline's `[meta]`
+`summary` (by name, without IDs), the `--notes` file's lines, and then every
+metric of the baseline in a `<details>` block, grouped by the first letter
+of its ID. GitHub strips text colour from release notes, so each row has a
+dot beside its words: Change is 🟢 better, ⚪ the same (within 1%), 🟡
+worse but within the metric's allowance, or 🔴 worse than the allowance,
+measured from the previous release's value; Target met is 🟢 met, 🟡 not
+yet, or 🔴 missed though the previous release met it, with "(tracked)" for
+an ungated metric. A metric without a value reads "not measured". It exits
+0, or 2 for bad arguments, an unreadable or malformed file, a baseline
+without a `summary`, or an existing `--out` file.
 
 ## Gate summary
 
@@ -216,3 +247,211 @@ From Rust, use the `gate1` module: `parse_results`, `read_results_dir`,
 `evaluate` (the rules alone), `evaluate_gate` (the verdict
 `phase1-summary` reports, with the cold and scale checks), `gate_scale`,
 `all_pass` and `render_summary`.
+
+## Sample
+
+`sample` (macOS only) reads a running process's resource counters
+(`proc_pid_rusage` with `RUSAGE_INFO_V6`) at a fixed interval, so idle CPU,
+energy, wakeups, disk writes and memory can be gated like search speed. It
+needs no root for a process of the same user.
+
+```sh
+cargo run --release -p fx-bench -- sample --pid 12345 --duration 1800 --out /tmp/idle-run
+cargo run --release -p fx-bench -- sample --pid 12345 --duration 60 --interval 1 \
+    --label churn --burst-pct 100 --out /tmp/churn-run
+```
+
+`--pid`, `--duration` (seconds) and `--out` are required; `--interval`
+defaults to 10 s, `--label` to `app` (`[a-z0-9_]`) and `--burst-pct` to
+150 (% of one core). `--out` must not exist; `sample` creates it and writes:
+
+- `rusage.csv`: one row per reading, with its wall-clock time, the seconds
+  since the first reading and the cumulative counters (CPU times, energy,
+  wakeups, disk bytes, footprints, instructions, CPU time per QoS class).
+- `intervals.csv`: per interval, its start and real length, CPU as % of
+  one core, CPU energy in mW, wakeups per second (package idle plus
+  interrupt), disk bytes read and written, and the footprint at its end.
+- `metrics.txt`: the lines it also prints to stdout.
+- `burst-<n>.txt`: when an interval's CPU passes `--burst-pct`,
+  `/usr/bin/sample` records the process's stacks for 3 s, once per burst
+  and at most 3 times per run, so a burst's cause can be traced.
+
+The kernel's `ri_*_time` counters are in mach absolute time units, which
+`sample` converts with `mach_timebase_info` (125/3 on Apple silicon, not
+1). Every rate divides by the real time between two readings, because a
+burst capture blocks the loop for several seconds. The run stops at
+`--duration` or when the process exits; a process that has exited but not
+yet been reaped still gives its final counters, dated at its exit.
+
+The printed `key=value` lines, each key prefixed with the label:
+
+| Key | Meaning |
+|---|---|
+| `<label>_cpu_pct` | average CPU over the run, % of one core |
+| `<label>_cpu_max_interval_pct` | the busiest interval |
+| `<label>_energy_mw` | average CPU energy, mW (`ri_energy_nj`) |
+| `<label>_wakeups_per_s` | package-idle plus interrupt wakeups per second |
+| `<label>_disk_written_bytes` | bytes written during the run |
+| `<label>_disk_written_per_day_bytes` | the same, scaled to 86,400 s |
+| `<label>_footprint_bytes` | physical footprint at the last reading |
+| `<label>_footprint_max_bytes` | the largest footprint of any reading, or `ri_interval_max_phys_footprint` if larger |
+| `<label>_duration_s` | from the first reading to the last |
+| `<label>_samples` | number of readings |
+| `<label>_process_exited=true` | only when the process exited early |
+
+With a single reading (the process exited at once) the rates need two
+readings, so their lines are left out and `perf-compare` reports them as
+not measured. Progress notes go to stderr.
+
+Exit codes: 0 after a run (also when the process exited early); 1 when the
+process can't be read (no such process, another user's) or a file can't be
+written, in which case a missing process leaves no folder behind; 2 for bad
+arguments, an existing `--out` or a missing parent folder, and on any OS
+other than macOS.
+
+## Churn
+
+`churn` keeps files changing at a steady rate, so the app's CPU and energy
+can be measured while it follows the file system.
+
+```sh
+cargo run --release -p fx-bench -- churn --dir /tmp/fx-churn --duration 60 --rate 20 --seed 1
+```
+
+`--dir` and `--duration` (seconds) are required; `--rate` (operations per
+second) defaults to 20, `--seed` to 1 and `--max-files` to 5000. The
+parent of `--dir` must exist and `--dir` must not: `churn` creates it,
+makes 16 folders in it (nested up to three levels), then runs a
+deterministic stream of operations from the seed, with names from the
+generator: about half create a file (empty or up to 64 bytes), a quarter
+rename one (within its folder or into another) and a quarter delete one.
+At `--max-files` a create becomes a delete; with no files a rename or
+delete becomes a create. Every name starts with a counter (`17-report.txt`),
+so names never collide and are never hidden.
+
+Operations are paced on a fixed tick by sleeping. If the disk falls
+behind, the next operation runs as soon as the last one finishes and the
+missed ticks are dropped rather than made up in a burst. It only creates,
+renames and deletes what it made inside `--dir`, never follows symlinks,
+and leaves `--dir` in place at the end. It prints:
+
+```text
+churn_ops=1200
+churn_seconds=60.001
+churn_rate=19.999
+```
+
+Exit codes: 0 after a run; 1 for an I/O error; 2 for bad arguments, an
+existing `--dir` or a missing parent folder.
+
+From Rust, use the `churn` module: `plan(seed, n, max_files)` gives the
+first `n` operations without touching the disk (a shorter plan is a prefix
+of a longer one), `folders(seed)` the 16 folders, `Planner` the stream one
+operation at a time, and `run` applies it.
+
+## Performance comparison
+
+`perf-compare` judges the performance gate: measured metrics against a
+baseline file, one verdict per metric of a tier.
+
+```sh
+cargo run --release -p fx-bench -- perf-compare --baseline docs/gates/perf-baseline.toml \
+    --tier pr results/*.txt
+cargo run --release -p fx-bench -- perf-compare --baseline docs/gates/perf-baseline.toml \
+    --tier quick --format json --out /tmp/perf.json results/*.txt
+```
+
+`--baseline` and `--tier` (`quick`, `pr` or `rc`) and at least one metrics
+file are required. `--format` is `md` (the default) or `json`; `--out FILE`
+also writes the report to a new file (it refuses to overwrite);
+`--print-values` adds a line `<ID> <key> = <value>` for each measured
+metric after the markdown report, for writing a new baseline at a release;
+`--partial` shows a metric whose key is absent from every metrics file as
+`SKIPPED` instead of `NOT MEASURED`, for running one benchmark alone.
+
+The baseline file is a strict subset of TOML, parsed by hand: `#`
+comments, blank lines, `[ID]` table headers (ASCII letters, digits, `_` and
+`-`, such as `S1` or `F6u`) and `key = value` lines whose value is a number
+(`-?digits[.digits]`), `true`, `false` or a double-quoted string (only
+`\"` and `\\` escapes). `[meta]` holds the `machine`, `cache`, `build` and
+`date` strings shown in the report header. Every other table is a metric:
+
+```toml
+[S1]
+name = "Engine search p95 at 2M entries"
+key = "engine_2m_ms"            # metric key in the metrics files
+unit = "ms"                     # shown after values; bool shows true/false
+better = "lower"                # lower | higher | equal
+target = 16                     # ceiling, floor or exact value
+allow_pct = 10                  # allowed worsening against the baseline, %
+allow_floor = 1                 # the allowance is at least this
+aggregate = "median"            # median | p95 | max | min | mean | last
+scale_key = "engine_2m_entries" # metric key holding the scale it ran at
+scale_min = 2000000             # below this, NOT MEASURED at pr and rc
+tiers = "quick pr rc"
+baseline = 9.3                  # pr and rc tiers
+quick_baseline = 1.1            # quick tier
+gated = true                    # false: TRACKED, never fails
+baseline_build = "0.3.1"
+baseline_date = "2026-11-09"
+exception = "Raised in #57 after the store rewrite"
+```
+
+`name`, `key`, `unit`, `better`, `aggregate` and `tiers` are required;
+`gated` defaults to true; `scale_min` needs `scale_key`; an `exception`
+must name the PR that accepted it as `#<number>`. Unknown or repeated keys,
+repeated tables and values of the wrong type are errors naming the file and
+line.
+
+Metrics files hold `key=value` lines as the gate scripts write them; a key
+may repeat, one line per sample, and `true`/`false` read as 1/0. Blank and
+`#` lines are ignored; any other line is an error naming the file and line.
+`median` and `p95` are nearest-rank, as in the harness (with an even count,
+`median` is the lower middle sample); `last` is the last sample read, files
+in argument order.
+
+For each metric whose `tiers` include `--tier`:
+
+1. No sample of its key: `NOT MEASURED` (`SKIPPED` with `--partial`).
+2. At the pr and rc tiers, a `scale_key` value below `scale_min` (the
+   smallest one counts), or none while `scale_min` is set: `NOT MEASURED`.
+3. The value is the `aggregate` of every sample of the key.
+4. The target is checked at the pr and rc tiers: `lower` passes at or
+   below it, `higher` at or above it, `equal` only at it. The quick tier
+   runs at a small scale, so it skips `lower` and `higher` targets (shown
+   in parentheses) but still checks `equal` targets, which state
+   correctness rather than speed. While the baseline itself misses a
+   `lower` or `higher` target (memory far above its goal, say), the target
+   is pending: only the allowance holds the metric, so it can't get worse
+   while its fix is under way, and a pass that still misses the target
+   reads `PASS (target not yet met)`.
+5. The regression check compares with `quick_baseline` at the quick tier
+   and `baseline` otherwise, allowing max(baseline × `allow_pct` / 100,
+   `allow_floor`), or nothing when neither is set: `lower` fails above
+   baseline + allowance, `higher` below baseline − allowance; `equal` has
+   no regression check. Without a baseline for the tier the verdict is
+   `NO BASELINE`, which is not a failure: the first run sets the baseline.
+
+Verdicts: `PASS` or `PASS (target not yet met)`; `FAIL (target)`, `FAIL (regression)` or
+`FAIL (target, regression)`; `NOT MEASURED (<reason>)`; `NO BASELINE`;
+`TRACKED (would be <verdict>)` for an ungated metric; `SKIPPED`.
+
+The markdown report has a header (tier and `[meta]`), the table
+`| ID | Metric | Baseline | Now | Change | Target | Verdict |` (values with
+units, Change as a signed % against the tier's baseline), any exceptions,
+and the line `perf-compare: <p> pass, <f> fail, <n> not measured, <b> no
+baseline, <t> tracked, <s> skipped`. The JSON report is
+`{"tier","meta":{"machine","cache","build","date"},"metrics":[{"id","name",
+"key","unit","better","gated","baseline","now","change_pct","target",
+"target_checked","verdict","failed","reason","would_be","exception"}...],
+"counts":{"pass","fail","not_measured","no_baseline","tracked","skipped"},
+"result":"PASS"|"FAIL"}`.
+
+Exit codes: 0 when no gated metric is `FAIL` or `NOT MEASURED`; 1
+otherwise; 2 for bad arguments (usage on stderr), an unreadable or
+malformed baseline or metrics file, an existing `--out` file or a failed
+write. It only reads its inputs.
+
+From Rust, use the `perf` module: `parse_baseline`, `parse_metrics`,
+`compare`, `gate_passes`, `Counts`, `render_markdown`, `render_json` and
+`value_lines`.

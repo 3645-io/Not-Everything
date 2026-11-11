@@ -11,17 +11,30 @@
 //!   ones set a bit in a deletion bitset. [`Index::compact`] rebuilds a
 //!   dense base and returns the ID remap; it also runs automatically when
 //!   the delta passes [`Index::compact_fraction`] of the live entries.
+//! - The single writer navigates the index itself: [`Index::children`],
+//!   [`Index::child`] (a child by name), [`Index::subtree`] and
+//!   [`Index::get`] (an entry read back by key), and
+//!   [`Index::upsert_reporting`] says what an upsert changed.
+//! - [`IndexBuilder`] builds an index from a first scan straight into the
+//!   base columns, without a delta or a compaction.
 //! - [`Snapshot`] is an immutable `Send + Sync` view behind an `Arc`.
 //! - [`Snapshot::to_parts`] exports the index as dense [`IndexParts`]
 //!   columns with entry IDs preserved, and [`Index::from_parts`] validates
 //!   and restores them, so a store can persist an index in bulk.
+//! - [`Index::from_shared`] restores the same columns without copying them
+//!   from a [`Backing`], such as a saved index's memory map, so the base is
+//!   served from the file's pages instead of the heap, and
+//!   [`Index::adopt_base`] swaps a heap base for such a one after its save.
 //!
 //! Clean-room: written from docs/PLAN.md only.
 
 #![forbid(unsafe_code)]
 
+mod builder;
+mod column;
 mod extensions;
 mod index;
+mod kids;
 pub mod meta;
 mod names;
 mod parts;
@@ -30,9 +43,11 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+pub use builder::IndexBuilder;
+pub use column::Backing;
 pub use extensions::{ExtId, ExtensionTable, extension_of};
-pub use index::{Applied, DEFAULT_COMPACT_FRACTION, Index, IndexError};
+pub use index::{Applied, DEFAULT_COMPACT_FRACTION, Index, IndexError, Upserted};
 pub use meta::PackedMeta;
 pub use names::{NameBuffer, NameError};
-pub use parts::{IndexParts, PartsError};
+pub use parts::{IndexParts, PartsError, SharedParts};
 pub use snapshot::Snapshot;

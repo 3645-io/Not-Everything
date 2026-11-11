@@ -1245,6 +1245,8 @@ impl WinController {
                 };
                 if shown {
                     iv.search_time.set(Some(took));
+                    // Spaces the re-runs new generations cause.
+                    results.note_search_time(took);
                 }
                 changed |= shown;
             }
@@ -2045,12 +2047,7 @@ impl WinController {
     fn on_gate_tick(&self) {
         let iv = self.ivars();
         let Some(ui) = self.ui() else { return };
-        let seen = Observed {
-            first_results: iv.first_results.get(),
-            last_applied: iv.last_applied.get(),
-            last_draw: ui.table.ivars().last_draw.get(),
-            rows: iv.results.borrow().row_count(),
-        };
+        let seen = self.observed();
         let action = match iv.gate.borrow_mut().as_mut() {
             Some(gate) => gate.run.tick(Instant::now(), seen),
             None => return,
@@ -2068,6 +2065,19 @@ impl WinController {
                 }
             }
             ProbeAction::Finish => self.finish_gate_probe(),
+        }
+    }
+
+    /// What the probes see of the results: when the first results and the
+    /// last page were applied, when the table last drew, and the rows.
+    #[cfg(feature = "measure")]
+    pub(super) fn observed(&self) -> Observed {
+        let iv = self.ivars();
+        Observed {
+            first_results: iv.first_results.get(),
+            last_applied: iv.last_applied.get(),
+            last_draw: self.ui().and_then(|ui| ui.table.ivars().last_draw.get()),
+            rows: iv.results.borrow().row_count(),
         }
     }
 

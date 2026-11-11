@@ -132,9 +132,17 @@ impl Snapshot {
     /// `names` (name bytes, base and delta), `name_offsets`, `parents`,
     /// `size_kind_flags`, `times`, `ext_ids`, `ext_table`, `file_keys`,
     /// `key_table`, `deleted_bitset` and `delta_overlay` (delta rows and
-    /// maps, without their names).
+    /// maps, without their names). A column served from a saved index's
+    /// memory map counts its mapped bytes, so the figures keep their meaning;
+    /// [`mapped_bytes`](Snapshot::mapped_bytes) says how much of it that is.
     pub fn heap_columns(&self) -> Vec<(&'static str, usize)> {
         self.state.heap_columns()
+    }
+
+    /// Bytes of the base columns served from a saved index's memory map
+    /// instead of the heap; see [`Index::mapped_bytes`](crate::Index::mapped_bytes).
+    pub fn mapped_bytes(&self) -> usize {
+        self.state.base.mapped_bytes()
     }
 
     /// Exports this snapshot as dense columns: base and delta materialized,

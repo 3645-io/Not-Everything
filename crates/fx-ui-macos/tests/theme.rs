@@ -361,6 +361,10 @@ fn the_canvas_component_type_styles() {
         (styles::SEGMENT, style(14.0, 20.0, 700)),
         (styles::ICON_NAME, style(13.0, 18.0, 650)),
         (styles::TAG, caps(style(11.0, 14.0, 700), 0.04)),
+        // The shortcut recorder's hint and reset link (`.rec-hint`,
+        // `.linkbtn.rec-reset`).
+        (styles::RECORDER_HINT, style(13.0, 18.0, 400)),
+        (styles::LINK_BUTTON, style(13.0, 18.0, 700)),
     ];
     for (i, (got, want)) in cases.into_iter().enumerate() {
         assert_eq!(got, want, "component style {i}");

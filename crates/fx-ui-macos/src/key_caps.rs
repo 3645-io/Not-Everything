@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use crate::actions::Action;
-use crate::hotkey::{HotkeySpec, Key};
+use crate::hotkey::{HotkeySpec, Key, Modifiers};
 
 /// Control.
 pub const CONTROL: &str = "\u{2303}";
@@ -40,7 +40,14 @@ pub fn key_label(key: Key) -> &'static str {
 
 /// The caps of `spec`: its modifiers in Apple's order, then its key.
 pub fn key_caps(spec: HotkeySpec) -> Vec<&'static str> {
-    let m = spec.modifiers;
+    let mut caps = modifier_caps(spec.modifiers);
+    caps.push(key_label(spec.key));
+    caps
+}
+
+/// The caps of the modifiers `m`, in Apple's order: what the Settings
+/// recorder shows while they are held.
+pub fn modifier_caps(m: Modifiers) -> Vec<&'static str> {
     [
         (m.control, CONTROL),
         (m.option, OPTION),
@@ -49,7 +56,6 @@ pub fn key_caps(spec: HotkeySpec) -> Vec<&'static str> {
     ]
     .into_iter()
     .filter_map(|(on, cap)| on.then_some(cap))
-    .chain([key_label(spec.key)])
     .collect()
 }
 

@@ -632,3 +632,25 @@ fn positions_of_no_paths_is_empty() {
     assert_eq!(found.generation.get(), engine.snapshot().generation());
     engine.shutdown();
 }
+
+#[test]
+fn hiding_the_window_drops_the_cached_result_sets() {
+    // Run 2.17: nobody searches while no window shows the results, so the
+    // result sets kept for refining a query (up to 8, each as large as its
+    // matches) are dropped instead of held for hours.
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = started(&tree, &source);
+    let _ = search(&engine, "notes", SortKey::Name, Direction::Ascending, 0, 10);
+    let _ = search(&engine, "photo", SortKey::Name, Direction::Ascending, 0, 10);
+    assert!(
+        engine.cached_searches() > 0,
+        "searches are cached while shown"
+    );
+    engine.set_foreground(false);
+    assert_eq!(engine.cached_searches(), 0, "dropped once hidden");
+    engine.set_foreground(true);
+    let _ = search(&engine, "notes", SortKey::Name, Direction::Ascending, 0, 10);
+    assert!(engine.cached_searches() > 0, "cached again once shown");
+    engine.shutdown();
+}
