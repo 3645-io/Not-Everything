@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, reconcile_path};
 use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
-use fx_model::{Change, Entry, EntryId, FileKey, ResumeCursor, StartOutcome};
+use fx_model::{Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome};
 use fx_sort::{Batch, MatchSet, Order};
 
 use crate::Shared;
@@ -438,31 +438,63 @@ where
         }
     }
 
-    /// Re-enumerates the folder at `path`: every listed entry is upserted
-    /// (and recorded in the batch only when it changed), then whatever the
-    /// folder holds that the walk didn't list is removed. A failed walk
-    /// removes nothing.
+    /// Re-enumerates the folder at `path`: the folder the disk has there now
+    /// is upserted with every entry the walk lists (each recorded in the
+    /// batch only when it changed), then whatever that folder holds in the
+    /// index and the walk didn't list is removed. A failed walk removes
+    /// nothing.
+    ///
+    /// The folder walked is the one the disk has at `path`, by key, not the
+    /// entry the index has there: after a swap of names (`a` to `t`, `b` to
+    /// `a`, `t` to `b`) the index still has the other entry at `path` until
+    /// that entry's own new path is checked. Comparing the walk with that
+    /// entry's subtree kept what the folder had lost meanwhile and removed
+    /// the other entry instead (found by the soak with restarts, whose
+    /// history replay reports `a` before `b`). The entry the index had at
+    /// `path`, when it is another one, is removed at the end of the batch
+    /// unless it is found at a new path by then, as `check_path` does.
     fn rescan_subtree(&mut self, path: &Path, deferred: &mut Vec<Deferred>, depth: u32) {
-        let top = paths::resolve(&self.index, &self.root, path, None).map(|id| self.index.key(id));
-        let Some(top) = top else {
-            // Not indexed: checking the path upserts it and, for a folder,
-            // rescans it from there.
-            if depth < MAX_DEPTH {
-                self.check_path(path, deferred, depth + 1);
-            }
-            return;
-        };
         // The folder's own entry: enumerators that list only what is below
         // it (the macOS scanner) don't emit it.
         let top_entry = match self.stat_at(path) {
-            Ok(Some(entry)) => Some(entry),
-            Ok(None) => None,
+            Ok(Some(entry)) if entry.kind == EntryKind::Dir => entry,
+            Ok(_) => {
+                // Gone, or not a folder (replaced by a file, or a swap put a
+                // file here): there is nothing to walk, and checking the
+                // path reconciles what it holds now.
+                if depth < MAX_DEPTH {
+                    self.check_path(path, deferred, depth + 1);
+                }
+                return;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
-                // Gone: checking the path removes it.
                 self.check_path(path, deferred, depth + 1);
                 return;
             }
             Err(_) => return,
+        };
+        let top = top_entry.key;
+        if self.index.lookup(top).is_none() {
+            // A folder new to the index: checking the path upserts it (and
+            // its parents if need be) and rescans it from there.
+            if depth < MAX_DEPTH {
+                self.check_path(path, deferred, depth + 1);
+            }
+            return;
+        }
+        // Another entry indexed at this path (replaced, or swapped away):
+        // removed at the end of the batch unless it is found elsewhere.
+        if let Some(old) = paths::resolve(&self.index, &self.root, path, Some(top))
+            .map(|id| self.index.key(id))
+            .filter(|&old| old != top)
+        {
+            deferred.push(Deferred { key: old });
+        }
+        // The folder itself, where the disk has it: a folder that moved here
+        // may need its new parent checked first.
+        self.upsert_at(top_entry, path, deferred, depth);
+        let Some(top_id) = self.index.lookup(top) else {
+            return;
         };
         // The entries stream into the index, as in a full rescan (run 2.17):
         // no list of every entry and no map of the old ones, which took more
@@ -474,6 +506,9 @@ where
             ..
         } = self;
         let mut seen = vec![false; index.id_bound()];
+        if let Some(s) = seen.get_mut(top_id.index()) {
+            *s = true;
+        }
         let mut take = |e: Entry| {
             // Several hard links: keep the first listing, as a full rescan does.
             if let Some(id) = index.lookup(e.key) {
@@ -483,12 +518,15 @@ where
             }
             take_one(index, batch, &mut seen, e);
         };
-        if let Some(entry) = top_entry {
-            take(entry);
-        }
         match enumerator.enumerate(path, &mut take) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) && depth < MAX_DEPTH =>
+            {
+                // Gone or replaced since the stat: reconcile the path.
                 self.check_path(path, deferred, depth + 1);
                 return;
             }

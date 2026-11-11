@@ -92,6 +92,16 @@ impl EventFlags {
     pub const fn intersects(self, other: EventFlags) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// True if the event asks for a rescan, of its subtree
+    /// (`MustScanSubDirs`, `UserDropped`, `KernelDropped`) or of the
+    /// volume (`EventIdsWrapped`, `RootChanged`): what [`classify`] turns
+    /// into [`EventAction::RescanSubtree`] or [`EventAction::RescanVolume`]
+    /// whatever the path.
+    #[must_use]
+    pub const fn asks_rescan(self) -> bool {
+        self.0 & (Self::SUBTREE_RESCAN | Self::VOLUME_RESCAN) != 0
+    }
 }
 
 impl std::ops::BitOr for EventFlags {
