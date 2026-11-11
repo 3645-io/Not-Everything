@@ -350,7 +350,7 @@ usage:
                     None => None,
                 },
                 hidden,
-                timeout:Duration::from_secs(f.number("--timeout", 600, 1, 86_400)?),
+                timeout: Duration::from_secs(f.number("--timeout", 600, 1, 86_400)?),
             };
             Ok((a, f.cache()?))
         });
@@ -452,7 +452,10 @@ usage:
             let above = |peak: &AtomicUsize| peak.load(Ordering::Relaxed).saturating_sub(heap0);
             let (whole, walk, after) = (above(&PEAK), above(&WALK_PEAK), above(&AFTER_PEAK));
             metric(&format!("rescan_run{run}_walk_heap_peak_mb"), mb(walk));
-            metric(&format!("rescan_run{run}_after_walk_heap_peak_mb"), mb(after));
+            metric(
+                &format!("rescan_run{run}_after_walk_heap_peak_mb"),
+                mb(after),
+            );
             metric(&format!("rescan_run{run}_heap_peak_mb"), mb(whole));
             heap_peak = heap_peak.max(whole);
             walk_peak = walk_peak.max(walk);

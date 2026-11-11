@@ -473,13 +473,12 @@ where
             enumerator,
             ..
         } = self;
-        let mut seen = vec![false; index.id_bound()];
+        // A bit per entry: a byte per entry was 3.3 MB at 3.2M entries.
+        let mut seen = MatchSet::with_bound(index.id_bound());
         let mut take = |e: Entry| {
             // Several hard links: keep the first listing, as a full rescan does.
-            if let Some(id) = index.lookup(e.key) {
-                if seen.get(id.index()).copied().unwrap_or(false) {
-                    return;
-                }
+            if index.lookup(e.key).is_some_and(|id| seen.contains(id)) {
+                return;
             }
             take_one(index, batch, &mut seen, e);
         };
@@ -499,19 +498,33 @@ where
         // Whatever the folder holds now (folders that moved in included,
         // with what they held) and the walk didn't list is gone, or is found
         // again at its new path.
-        let unseen: Vec<FileKey> = match self.index.lookup(top) {
-            Some(id) => self
-                .index
-                .subtree(id)
-                .into_iter()
-                .filter(|d| !seen.get(d.index()).copied().unwrap_or(false))
-                .map(|d| self.index.key(d))
-                .collect(),
+        let unseen = match self.index.lookup(top) {
+            Some(id) => self.unseen_below(id, &seen),
             None => Vec::new(),
         };
         for key in unseen {
             self.remove(key);
         }
+    }
+
+    /// The keys of `top` and every live entry below it that are not in
+    /// `seen`, each after its parent. The subtree is walked depth first,
+    /// holding only the folders still to visit: a list of the whole subtree
+    /// (`Index::subtree`) took 4 B per entry, 13 MB for a rescan of a
+    /// 3.2M-entry disk, just before the commit.
+    fn unseen_below(&self, top: EntryId, seen: &MatchSet) -> Vec<FileKey> {
+        let mut unseen = Vec::new();
+        if !self.index.is_live(top) {
+            return unseen;
+        }
+        let mut stack = vec![top];
+        while let Some(id) = stack.pop() {
+            if !seen.contains(id) {
+                unseen.push(self.index.key(id));
+            }
+            stack.extend(self.index.children(id));
+        }
+        unseen
     }
 
     /// Re-enumerates the whole volume and applies the difference. Readers
@@ -573,15 +586,13 @@ where
             enumerator,
             ..
         } = self;
-        let mut seen = vec![false; index.id_bound()];
+        let mut seen = MatchSet::with_bound(index.id_bound());
         let mut take = |e: Entry| {
             // A file with several hard links is listed once per link: keep
             // the first listing, as a first scan does, so rescans don't move
             // it back and forth.
-            if let Some(id) = index.lookup(e.key) {
-                if seen.get(id.index()).copied().unwrap_or(false) {
-                    return;
-                }
+            if index.lookup(e.key).is_some_and(|id| seen.contains(id)) {
+                return;
             }
             take_one(index, batch, &mut seen, e);
         };
@@ -594,7 +605,7 @@ where
         }
         let unseen: Vec<FileKey> = (0..self.index.id_bound())
             .map(|i| EntryId(i as u32))
-            .filter(|&id| self.index.is_live(id) && !seen.get(id.index()).copied().unwrap_or(false))
+            .filter(|&id| self.index.is_live(id) && !seen.contains(id))
             .map(|id| self.index.key(id))
             .collect();
         for key in unseen {
@@ -701,17 +712,27 @@ where
         let snap = self.index.snapshot();
         let rebuild = self.orders_stale || self.batch.len() > self.index.live_count() / 2;
         self.orders_stale = false;
-        let mut orders: Vec<Order> = if rebuild {
+        // `_pending` is held until the new snapshot is published.
+        let (mut orders, _pending): (Vec<Order>, Option<Pending>) = if rebuild {
             // One Name sort shared by every order (a first scan lands here).
             let keys: Vec<_> = self.orders.iter().map(|o| o.key).collect();
-            Order::build_keys(&*snap, &keys)
+            (Order::build_keys(&*snap, &keys), None)
+        } else if let Some((mut orders, pending)) = self.take_orders() {
+            // Nothing else holds the orders: the batch goes into them in
+            // place, and none is copied.
+            for order in &mut orders {
+                order.apply(&*snap, &self.batch);
+            }
+            (orders, Some(pending))
         } else {
             // The published snapshot shares `self.orders`, so each order is
             // read, not changed: `applied` copies it once into the new one.
-            self.orders
+            let orders = self
+                .orders
                 .iter()
                 .map(|o| o.applied(&*snap, &self.batch))
-                .collect()
+                .collect();
+            (orders, None)
         };
         self.batch.clear();
         if self.compaction_due() {
@@ -759,6 +780,7 @@ where
             cursor: current.cursor,
             generation: self.generation,
             priority: self.group.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
     }
@@ -779,6 +801,7 @@ where
             cursor,
             generation: current.generation,
             priority: current.priority.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
     }
@@ -803,9 +826,89 @@ where
             cursor,
             generation: self.generation,
             priority: self.group.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
         self.shared.notify(self.generation);
+    }
+
+    /// Takes the published orders over, so the batch can be merged into
+    /// them in place: only while no window shows, and only when nothing
+    /// but the writer and the published snapshot holds them.
+    ///
+    /// The writer always merged into a copy of each order, since the
+    /// published snapshot still held the old one: 16 B per entry at every
+    /// commit, about 51 MB at 3.2M entries after a rescan that changed
+    /// anything. Instead it publishes the current snapshot without its
+    /// orders, marked `orders_pending` (readers wait for the next one, see
+    /// `snapshot::settled`), and takes the orders when that leaves them to
+    /// it alone. A reader may hold the old snapshot (a window keeps the one
+    /// it shows; a save may be writing it): then it is put back as it was
+    /// and `None` returned, and the batch is merged into copies as before.
+    /// While a window shows, searches never wait for a merge: the orders
+    /// are copied, as before.
+    fn take_orders(&mut self) -> Option<(Vec<Order>, Pending)> {
+        if self.foreground() {
+            return None;
+        }
+        let current = self.shared.current.load_full();
+        // Between commits the published orders are the writer's own.
+        if !Arc::ptr_eq(&current.orders, &self.orders) {
+            return None;
+        }
+        let interim = Arc::new(EngineSnapshot {
+            orders: Arc::new(Vec::new()),
+            orders_pending: true,
+            ..(*current).clone()
+        });
+        drop(current);
+        // The swap settles the loans of readers that are still reading the
+        // old snapshot (arc-swap's `load`), so the counts below are exact.
+        let old = self.shared.current.swap(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&self.shared),
+            interim,
+        };
+        let mut old = match Arc::try_unwrap(old) {
+            Ok(old) => old,
+            Err(held) => {
+                self.shared.current.store(held);
+                return None;
+            }
+        };
+        let orders = std::mem::replace(&mut old.orders, Arc::new(Vec::new()));
+        drop(std::mem::replace(&mut self.orders, Arc::new(Vec::new())));
+        match Arc::try_unwrap(orders) {
+            Ok(orders) => Some((orders, pending)),
+            Err(held) => {
+                // A reader kept a copy of the snapshot's fields.
+                self.orders = Arc::clone(&held);
+                old.orders = held;
+                self.shared.current.store(Arc::new(old));
+                None
+            }
+        }
+    }
+}
+
+/// The snapshot the writer publishes while it merges the orders in place
+/// ([`Writer::take_orders`]), held until the merge's result is published.
+/// If the merge unwinds before that, dropping it publishes the same
+/// snapshot without the pending mark, so readers don't wait for a snapshot
+/// that won't come: an order they need is then built on the spot.
+struct Pending {
+    shared: Arc<Shared>,
+    interim: Arc<EngineSnapshot>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let still_published = Arc::ptr_eq(&*self.shared.current.load(), &self.interim);
+        if still_published {
+            let mut snap = (*self.interim).clone();
+            snap.orders_pending = false;
+            self.shared.current.store(Arc::new(snap));
+        }
     }
 }
 
@@ -813,7 +916,7 @@ where
 /// order batch when it changed, and marked seen. A rejected entry is
 /// dropped, as during any full rescan: the rescan is already the fallback
 /// for an inconsistent batch.
-fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut Vec<bool>, e: Entry) {
+fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut MatchSet, e: Entry) {
     let Ok((id, what)) = index.upsert_reporting(e) else {
         return;
     };
@@ -822,8 +925,73 @@ fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut Vec<bool>, e: Entry
         Upserted::Moved => batch.moved(id),
         Upserted::Updated | Upserted::Inserted => batch.upsert(id),
     }
-    if id.index() >= seen.len() {
-        seen.resize(id.index() + 1, false);
+    // A new entry's ID may be past the bound the set was made for: it grows.
+    seen.insert(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use arc_swap::ArcSwap;
+
+    use super::*;
+    use crate::checkpoint::Checkpoints;
+    use crate::health::HealthState;
+
+    fn snapshot(generation: u64, orders_pending: bool) -> EngineSnapshot {
+        EngineSnapshot {
+            index: Index::new().snapshot(),
+            orders: Arc::new(Vec::new()),
+            cursor: None,
+            generation,
+            priority: None,
+            orders_pending,
+        }
     }
-    seen[id.index()] = true;
+
+    fn shared(current: Arc<EngineSnapshot>) -> Arc<Shared> {
+        Arc::new(Shared {
+            current: ArcSwap::new(current),
+            subscribers: Mutex::new(Vec::new()),
+            health: HealthState::new(EngineHealth::Live),
+            paused: AtomicBool::new(false),
+            foreground: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            checkpoints: Checkpoints::new(None, None, Duration::from_secs(60), None),
+        })
+    }
+
+    #[test]
+    fn a_merge_that_unwinds_leaves_no_snapshot_pending() {
+        let interim = Arc::new(snapshot(3, true));
+        let shared = shared(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&shared),
+            interim,
+        };
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _pending = pending;
+            panic!("the merge failed");
+        }));
+        assert!(unwound.is_err());
+        let now = shared.current.load_full();
+        assert!(!now.orders_pending, "readers would wait for nothing");
+        assert_eq!(now.generation, 3, "the same snapshot, without its mark");
+    }
+
+    #[test]
+    fn a_published_merge_is_left_alone() {
+        let interim = Arc::new(snapshot(3, true));
+        let shared = shared(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&shared),
+            interim,
+        };
+        let published = Arc::new(snapshot(4, false));
+        shared.current.store(Arc::clone(&published));
+        drop(pending);
+        assert!(Arc::ptr_eq(&shared.current.load_full(), &published));
+    }
 }

@@ -163,7 +163,9 @@ fn random_op(rng: &mut Rng, tree: &FakeTree, paths: &mut Paths) -> Vec<Change> {
     }
 }
 
-fn run(seed: u64) {
+/// One seed's rounds; `hidden` runs the engine as with no window on screen,
+/// where the writer merges the batches into the sort orders in place.
+fn run(seed: u64, hidden: bool) {
     let mut rng = Rng(seed);
     let tree = FakeTree::new();
     let mut paths = Paths {
@@ -182,7 +184,9 @@ fn run(seed: u64) {
         }
     }
     let source = FakeSource::new(StartOutcome::Resumed);
-    let engine: Engine = start(&tree, &source, tree.build_index(), config());
+    let config = config().with_background_batch_window(std::time::Duration::from_millis(20));
+    let engine: Engine = start(&tree, &source, tree.build_index(), config);
+    engine.set_foreground(!hidden);
     for round in 0..30 {
         let mut batch = Vec::new();
         for _ in 0..1 + rng.below(6) {
@@ -208,6 +212,13 @@ fn run(seed: u64) {
 #[test]
 fn the_index_equals_a_fresh_scan_after_every_batch() {
     for seed in 0..6 {
-        run(0xD1FF_0000 + seed);
+        run(0xD1FF_0000 + seed, false);
+    }
+}
+
+#[test]
+fn the_index_equals_a_fresh_scan_after_every_hidden_batch() {
+    for seed in 0..6 {
+        run(0xD1FF_0000 + seed, true);
     }
 }

@@ -111,7 +111,11 @@ fn the_engine_keeps_no_second_copy_of_the_entries() {
 /// lists. It streams the entries into the index, as a full rescan does
 /// (run 2.17): a list of every entry and a map of the old ones took more
 /// than 300 B per entry, and macOS asks for such rescans of busy folders.
-const MAX_RESCAN_PEAK_PER_ENTRY: usize = 40;
+/// What is left is a bit per entry to mark the entries it listed, which
+/// took a byte per entry before. (The test's enumerator holds the whole
+/// tree while it walks, so what the rescan allocates after the walk, less
+/// than that list, doesn't show here; `rescan_bench` measures it.)
+const MAX_RESCAN_PEAK_PER_ENTRY: f64 = 0.5;
 
 #[test]
 fn a_subtree_rescan_streams_its_entries() {
@@ -125,6 +129,15 @@ fn a_subtree_rescan_streams_its_entries() {
     let source = FakeSource::new(StartOutcome::Resumed);
     let engine = start(&tree, &source, Index::new(), config());
     drop(wait_for_tree(&engine, &tree, "first scan published"));
+    // A first change builds what the writer keeps for good (its children
+    // index, 4 B per entry), so the rescan below shows its own peak.
+    let old_cursor = source.current_cursor();
+    tree.set_size(&format!("{ROOT}/d0000/file-0.dat"), 1);
+    source.push(vec![check(&format!("{ROOT}/d0000/file-0.dat"))]);
+    drop(wait_for(&engine, "the first change's cursor", |s| {
+        let now = source.current_cursor();
+        now != old_cursor && s.cursor() == Some(now)
+    }));
     thread::sleep(Duration::from_millis(300));
 
     // The test's enumerator builds its own list of the tree before it hands
@@ -150,14 +163,14 @@ fn a_subtree_rescan_streams_its_entries() {
         .load(Ordering::Relaxed)
         .saturating_sub(before)
         .saturating_sub(enumerator);
-    let per_entry = peak / entries;
+    let per_entry = peak as f64 / entries as f64;
     eprintln!(
         "subtree rescan peak beyond the enumerator's {enumerator} B: {peak} B, \
-         {per_entry} B per entry ({entries} entries)"
+         {per_entry:.2} B per entry ({entries} entries)"
     );
     assert!(
         per_entry <= MAX_RESCAN_PEAK_PER_ENTRY,
-        "a subtree rescan took {per_entry} B per entry at its peak, more than {MAX_RESCAN_PEAK_PER_ENTRY} B"
+        "a subtree rescan took {per_entry:.2} B per entry at its peak, more than {MAX_RESCAN_PEAK_PER_ENTRY} B"
     );
     let snap = wait_for_tree(&engine, &tree, "the index after the rescan");
     assert_orders_match(&snap);

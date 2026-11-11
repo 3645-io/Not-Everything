@@ -1048,7 +1048,8 @@ fn apply_grows_a_full_order_by_a_small_spare_only() {
     // New entries: every order must grow past its full buffer.
     let mut batch = Batch::new();
     for i in 0..10u32 {
-        batch.upsert(EntryId(m.push(&format!("new{i}"), EntryId(root), EntryKind::File)));
+        let id = m.push(&format!("new{i}"), EntryId(root), EntryKind::File);
+        batch.upsert(EntryId(id));
     }
     apply_and_check(&mut orders, &m, &batch, "ten new entries");
     for order in &orders {
@@ -1068,7 +1069,8 @@ fn apply_grows_a_full_order_by_a_small_spare_only() {
         .collect();
     let mut batch = Batch::new();
     for i in 0..5u32 {
-        batch.upsert(EntryId(m.push(&format!("more{i}"), EntryId(root), EntryKind::File)));
+        let id = m.push(&format!("more{i}"), EntryId(root), EntryKind::File);
+        batch.upsert(EntryId(id));
     }
     apply_and_check(&mut orders, &m, &batch, "five more entries");
     for (order, &(capacity, ptr)) in orders.iter().zip(&buffers) {

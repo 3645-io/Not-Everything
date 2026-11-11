@@ -641,7 +641,14 @@ fn readers_never_see_a_snapshot_without_its_orders() {
         let reader = s.spawn(|| {
             let mut reads = 0u64;
             while !stop.load(Ordering::Relaxed) {
+                let t = Instant::now();
                 let snap = engine.snapshot();
+                // At most the time of one merge in place, which is short.
+                assert!(
+                    t.elapsed() < Duration::from_millis(100),
+                    "snapshot() waited {:?}",
+                    t.elapsed()
+                );
                 for key in ENGINE_KEYS {
                     assert!(
                         snap.order(key).is_some(),
