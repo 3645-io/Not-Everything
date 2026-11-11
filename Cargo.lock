@@ -150,6 +150,7 @@ dependencies = [
  "fx-bench",
  "fx-fs",
  "fx-model",
+ "fx-testkit",
  "libc",
 ]
 

@@ -8,6 +8,10 @@
 //!
 //! The library holds helpers other crates' tests use as a dev-dependency:
 //! [`crash`] runs a test binary's own test as a child process and kills it
-//! with SIGKILL, for the crash-safety tests. Std only.
+//! with SIGKILL, for the crash-safety tests; `disk_image` (macOS only)
+//! makes and attaches small disk images with `hdiutil` for the
+//! external-volume tests. Std only.
 
 pub mod crash;
+#[cfg(target_os = "macos")]
+pub mod disk_image;

@@ -31,6 +31,10 @@ with `-export-*`:
   from the saved index only, so they are as fresh as the app's last save.
   The app saves its index once a day, when it quits and after a full
   rescan, so while it runs the results can be up to a day old.
+- With Full Disk Access the app also indexes the external drives in
+  `/Volumes` (APFS, Mac OS Extended, FAT and exFAT). A drive that was
+  ejected stays in the index as offline, so its files are still found, at
+  paths that exist again once it is connected.
 - There is no option to delete, rename, move or trash a file.
 
 ## Which store is read

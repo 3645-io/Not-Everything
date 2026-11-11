@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fx_model::ResumeCursor;
+use fx_model::{EntryId, ResumeCursor};
 use fx_sort::{MatchSet, Order, SortKey};
 
 /// The sort keys the engine keeps merged, in the order they are stored.
@@ -88,6 +88,18 @@ impl EngineSnapshot {
     /// The index as of this snapshot.
     pub fn index(&self) -> &fx_index::Snapshot {
         &self.index
+    }
+
+    /// Whether entry `id` is on an offline volume: one that was unmounted
+    /// and is kept in the index (run 2.4,
+    /// [`EngineConfig::with_volumes_folder`](crate::EngineConfig::with_volumes_folder)).
+    /// Its path no longer exists until the volume is mounted again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of range, as [`fx_index::Snapshot::key`] does.
+    pub fn is_offline(&self, id: EntryId) -> bool {
+        self.index.key(id).volume.is_offline()
     }
 
     /// The merged order for `key`, or `None` if the engine does not keep it

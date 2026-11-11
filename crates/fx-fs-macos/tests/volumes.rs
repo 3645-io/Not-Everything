@@ -9,28 +9,37 @@
 //!   `Debug + Clone + PartialEq + Eq`. `device` is `f_mntfromname` (e.g.
 //!   `/dev/disk3s1s1`), `fs_type` is `f_fstypename` (e.g. `apfs`).
 //! - `pub struct MountFlags { pub local: bool, pub readonly: bool,
-//!   pub network: bool }` derives `Debug + Clone + Copy + PartialEq + Eq`.
+//!   pub network: bool, pub browsable: bool }` derives `Debug + Clone +
+//!   Copy + PartialEq + Eq`.
 //! - `MountFlags::from_raw(raw: u32, fs_type: &str) -> MountFlags` classifies
 //!   a `statfs.f_flags` word with the `sys/mount.h` values `MNT_RDONLY =
 //!   0x1` and `MNT_LOCAL = 0x1000`: `local` is `MNT_LOCAL` set, `readonly`
 //!   is `MNT_RDONLY` set, and `network` is `MNT_LOCAL` clear or the type is
-//!   one of `smbfs`, `nfs`, `afpfs`, `webdav`.
+//!   one of `smbfs`, `nfs`, `afpfs`, `webdav`; `browsable` is
+//!   `MNT_DONTBROWSE = 0x100000` clear.
 //! - `mount_policy(&MountInfo) -> MountPolicy` (`Index | ListOnly`, derives
-//!   `Debug + Clone + Copy + PartialEq + Eq`) is pure. In the MVP only the
-//!   local root `/` is indexed; every other mount point is `ListOnly`, and a
-//!   network mount is never indexed.
+//!   `Debug + Clone + Copy + PartialEq + Eq`) is pure. Only the local root
+//!   `/` is indexed; every other mount point is `ListOnly`, and a network
+//!   mount is never indexed.
+//! - `mount_policy_with(&MountInfo, Option<&ExternalVolumes>)` (run 2.4)
+//!   also indexes the external volumes `ExternalVolumes::indexes` accepts:
+//!   local, non-network APFS, HFS+, FAT (`msdos`) or exFAT mounted directly
+//!   in the external volumes folder, browsable unless `include_hidden`.
 //! - `list_mounts() -> std::io::Result<Vec<MountInfo>>` (macOS) reads
 //!   `getfsstat(MNT_NOWAIT)`.
 
 use std::path::{Path, PathBuf};
 
-use fx_fs_macos::volumes::{MountFlags, MountInfo, MountPolicy, mount_policy};
+use fx_fs_macos::volumes::{
+    ExternalVolumes, MountFlags, MountInfo, MountPolicy, mount_policy, mount_policy_with,
+};
 
 const MNT_RDONLY: u32 = 0x0000_0001;
 const MNT_LOCAL: u32 = 0x0000_1000;
+const MNT_DONTBROWSE: u32 = 0x0010_0000;
 /// Unrelated bits that must not change the classification
-/// (`MNT_NOSUID`, `MNT_JOURNALED`, `MNT_DONTBROWSE`).
-const NOISE: u32 = 0x0000_0008 | 0x0080_0000 | 0x0010_0000;
+/// (`MNT_NOSUID`, `MNT_JOURNALED`).
+const NOISE: u32 = 0x0000_0008 | 0x0080_0000;
 
 fn mount(point: &str, fs_type: &str, device: &str, raw: u32) -> MountInfo {
     MountInfo {
@@ -52,9 +61,18 @@ fn local_apfs_volume_is_local_and_not_network() {
         MountFlags {
             local: true,
             readonly: false,
-            network: false
+            network: false,
+            browsable: true,
         }
     );
+}
+
+#[test]
+fn dont_browse_clears_browsable() {
+    let f = MountFlags::from_raw(MNT_LOCAL | MNT_DONTBROWSE, "apfs");
+    assert!(!f.browsable);
+    assert!(f.local);
+    assert!(!f.network);
 }
 
 #[test]
@@ -128,11 +146,107 @@ fn devfs_and_autofs_are_list_only() {
 }
 
 #[test]
-fn external_volumes_wait_for_run_2_4() {
+fn external_volumes_are_list_only_without_the_external_policy() {
     let usb = mount("/Volumes/USB", "msdos", "/dev/disk5s1", MNT_LOCAL);
     assert_eq!(mount_policy(&usb), MountPolicy::ListOnly);
+    assert_eq!(mount_policy_with(&usb, None), MountPolicy::ListOnly);
     let ext = mount("/Volumes/Backup", "apfs", "/dev/disk7s1", MNT_LOCAL);
     assert_eq!(mount_policy(&ext), MountPolicy::ListOnly);
+}
+
+#[test]
+fn external_apfs_hfs_fat_and_exfat_volumes_are_indexed() {
+    let ext = ExternalVolumes::system();
+    for ty in ["apfs", "hfs", "msdos", "exfat"] {
+        for raw in [MNT_LOCAL, MNT_LOCAL | MNT_RDONLY, MNT_LOCAL | NOISE] {
+            let m = mount("/Volumes/Drive", ty, "/dev/disk5s1", raw);
+            assert_eq!(
+                mount_policy_with(&m, Some(&ext)),
+                MountPolicy::Index,
+                "{ty} {raw:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_root_stays_indexed_with_the_external_policy() {
+    let ext = ExternalVolumes::system();
+    let root = mount("/", "apfs", "/dev/disk3s1s1", MNT_LOCAL | MNT_RDONLY);
+    assert_eq!(mount_policy_with(&root, Some(&ext)), MountPolicy::Index);
+    assert!(!ext.indexes(&root), "the root is not an external volume");
+}
+
+#[test]
+fn hidden_external_mounts_are_left_out_unless_asked_for() {
+    // Time Machine snapshots, the Recovery volume and `-nobrowse` disk
+    // images carry MNT_DONTBROWSE.
+    let hidden = mount(
+        "/Volumes/Recovery",
+        "apfs",
+        "/dev/disk3s3",
+        MNT_LOCAL | MNT_DONTBROWSE,
+    );
+    let ext = ExternalVolumes::system();
+    assert_eq!(
+        mount_policy_with(&hidden, Some(&ext)),
+        MountPolicy::ListOnly
+    );
+    let all = ExternalVolumes {
+        include_hidden: true,
+        ..ExternalVolumes::system()
+    };
+    assert_eq!(mount_policy_with(&hidden, Some(&all)), MountPolicy::Index);
+}
+
+#[test]
+fn only_mounts_directly_in_the_folder_are_external_volumes() {
+    let ext = ExternalVolumes::system();
+    for point in [
+        "/Volumes",
+        "/Volumes/Drive/Nested",
+        "/System/Volumes/Data",
+        "/private/var/folders/x/disk",
+        "/Volumesque/Drive",
+    ] {
+        let m = mount(point, "apfs", "/dev/disk5s1", MNT_LOCAL);
+        assert_eq!(
+            mount_policy_with(&m, Some(&ext)),
+            MountPolicy::ListOnly,
+            "{point}"
+        );
+    }
+    let elsewhere = ExternalVolumes {
+        folder: PathBuf::from("/tmp/mnt"),
+        include_hidden: false,
+    };
+    let m = mount("/tmp/mnt/img", "hfs", "/dev/disk9s1", MNT_LOCAL);
+    assert_eq!(mount_policy_with(&m, Some(&elsewhere)), MountPolicy::Index);
+    assert_eq!(mount_policy_with(&m, Some(&ext)), MountPolicy::ListOnly);
+}
+
+#[test]
+fn other_file_systems_and_network_volumes_are_not_external_volumes() {
+    let ext = ExternalVolumes::system();
+    for ty in ["ntfs", "devfs", "autofs", "nullfs", "udf", "cd9660"] {
+        let m = mount("/Volumes/Disc", ty, "/dev/disk5", MNT_LOCAL);
+        assert_eq!(
+            mount_policy_with(&m, Some(&ext)),
+            MountPolicy::ListOnly,
+            "{ty}"
+        );
+    }
+    for ty in ["smbfs", "nfs", "afpfs", "webdav"] {
+        let m = mount("/Volumes/share", ty, "//server/share", 0);
+        assert_eq!(
+            mount_policy_with(&m, Some(&ext)),
+            MountPolicy::ListOnly,
+            "{ty}"
+        );
+    }
+    // A local mark does not make a network type local.
+    let smb = mount("/Volumes/share", "smbfs", "//server/share", MNT_LOCAL);
+    assert_eq!(mount_policy_with(&smb, Some(&ext)), MountPolicy::ListOnly);
 }
 
 #[test]
@@ -155,6 +269,7 @@ fn a_network_root_is_not_indexed() {
             local: false,
             readonly: false,
             network: true,
+            browsable: true,
         },
         is_root: true,
     };

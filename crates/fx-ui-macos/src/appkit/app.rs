@@ -25,8 +25,10 @@ use fx_fs_macos::enumerator::MacScanner;
 use fx_fs_macos::fda::{FdaProbe, consent_prompt_paths, user_home};
 use fx_fs_macos::fsevents::source::FsEventsSource;
 use fx_fs_macos::fsevents::stream::StreamConfig;
+use fx_fs_macos::fsevents::volumes_source::VolumesSource;
 use fx_fs_macos::path_stat::MacPathStat;
 use fx_fs_macos::scan::ScanOptions;
+use fx_fs_macos::volumes::ExternalVolumes;
 
 use super::window::{self, FullIndexSwitch, ResidentConfig, WindowConfig};
 use crate::APP_NAME;
@@ -283,14 +285,24 @@ fn scan_options(excluded: &[PathBuf], root: &Path) -> Result<ScanOptions, AppErr
 /// saved cursor) at or below a consent-prompt folder reaches the engine's
 /// writer, which would stat it. With access granted `excluded` is empty and
 /// the wrapper passes everything.
+///
+/// External volumes (run 2.4, [`external_volumes_for`]): with access
+/// granted and `/Volumes` below the root, the scanner enters the external
+/// volumes, a [`VolumesSource`] watches each one and reports mounts and
+/// unmounts, and the engine keeps an unmounted volume's entries offline.
 fn open_engine(
     root: &Path,
-    scan: ScanOptions,
+    mut scan: ScanOptions,
     excluded: Vec<PathBuf>,
     scope: StoreScope,
     data: Option<&Path>,
 ) -> std::io::Result<Engine> {
+    let external = external_volumes_for(root, &excluded);
+    scan.external_volumes.clone_from(&external);
     let mut config = EngineConfig::new(root);
+    if let Some(external) = &external {
+        config = config.with_volumes_folder(&external.folder);
+    }
     if let Some(home) = user_home() {
         // The index holds resolved paths, as the root is canonical.
         let resolved = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
@@ -309,12 +321,33 @@ fn open_engine(
     }
     let mut stream = StreamConfig::new(root.to_path_buf());
     stream.path_filter = Some(root.to_path_buf());
-    Engine::open(
-        config,
-        ExcludingChangeSource::new(FsEventsSource::new(stream), excluded),
-        MacPathStat::new(),
-        MacScanner::new(scan),
-    )
+    let fsevents = FsEventsSource::new(stream);
+    match external {
+        Some(external) => Engine::open(
+            config,
+            ExcludingChangeSource::new(VolumesSource::new(fsevents, root, external), excluded),
+            MacPathStat::new(),
+            MacScanner::new(scan),
+        ),
+        None => Engine::open(
+            config,
+            ExcludingChangeSource::new(fsevents, excluded),
+            MacPathStat::new(),
+            MacScanner::new(scan),
+        ),
+    }
+}
+
+/// The external volumes an engine over `root` indexes (run 2.4): the
+/// browsable APFS, HFS+, FAT and exFAT volumes in `/Volumes`
+/// ([`ExternalVolumes::system`]), when `/Volumes` lies strictly below the
+/// root and nothing is `excluded`. In limited mode `/Volumes` is one of the
+/// consent-prompt folders (reading a removable volume asks for consent),
+/// so there are none.
+fn external_volumes_for(root: &Path, excluded: &[PathBuf]) -> Option<ExternalVolumes> {
+    let external = ExternalVolumes::system();
+    (excluded.is_empty() && external.folder != root && external.folder.starts_with(root))
+        .then_some(external)
 }
 
 /// Arms the watchdog of the measurement `args` asks for, if any. A
@@ -381,5 +414,16 @@ mod tests {
     #[test]
     fn granted_access_has_no_exclusions() {
         assert!(limited_exclusions(false).is_empty());
+    }
+
+    #[test]
+    fn external_volumes_are_indexed_from_the_whole_disk_with_access_only() {
+        let whole = external_volumes_for(Path::new("/"), &[]);
+        assert_eq!(whole, Some(ExternalVolumes::system()));
+        let limited = consent_prompt_paths(Path::new("/Users/tester"));
+        assert_eq!(external_volumes_for(Path::new("/"), &limited), None);
+        for root in ["/Users/tester", "/Volumes", "/Volumes/Drive", "/tmp"] {
+            assert_eq!(external_volumes_for(Path::new(root), &[]), None, "{root}");
+        }
     }
 }

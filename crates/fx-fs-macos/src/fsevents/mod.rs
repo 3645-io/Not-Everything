@@ -18,6 +18,10 @@
 //!   dropped before the cursor.
 //! * `source` (macOS only): `FsEventsSource`, the per-volume
 //!   `fx_fs::ChangeSource`.
+//! * `volumes_source` (macOS only): `VolumesSource`, the root volume's
+//!   source plus a live stream per mounted external volume, which asks
+//!   the engine to index a volume when it is mounted and to check its
+//!   mount point when it is unmounted (run 2.4).
 //! * `sys` (macOS only): raw `extern "C"` declarations.
 //! * `volume` (macOS only): safe wrappers for the per-volume queries
 //!   (current event ID, database UUID, device of a path, last event ID
@@ -35,6 +39,8 @@ pub mod source;
 pub mod stream;
 #[cfg(target_os = "macos")]
 pub mod sys;
+#[cfg(target_os = "macos")]
+pub mod volumes_source;
 
 #[cfg(target_os = "macos")]
 pub mod volume;

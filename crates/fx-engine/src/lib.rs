@@ -73,6 +73,12 @@
 //! saved cursor, falling back to a full rescan when the store is missing or
 //! rejected, or the source reports a gap.
 //!
+//! External volumes (run 2.4, [`EngineConfig::with_volumes_folder`]): a
+//! volume mounted in the volumes folder is indexed like any folder the
+//! change source reports. When it is unmounted, its entries stay, re-keyed
+//! onto a reserved offline volume ID ([`EngineSnapshot::is_offline`]), and
+//! rescans keep them until a volume mounted with its name replaces them.
+//!
 //! Read-only access (for the command line): [`StoreReader::open`] loads a
 //! checkpoint without a change source, threads or any write to the store,
 //! and [`StoreReader::search`] answers queries over it with the same query
@@ -329,6 +335,8 @@ impl Engine {
             group,
             group_stale: false,
             fresh_base: false,
+            volumes_folder: config.volumes_folder().map(std::path::Path::to_path_buf),
+            next_offline: None,
         };
         let handle = thread::Builder::new()
             .name("fx-engine-writer".into())

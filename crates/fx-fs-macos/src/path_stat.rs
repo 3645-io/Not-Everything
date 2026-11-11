@@ -20,6 +20,11 @@
 //! scanner does (see
 //! [Keys of firmlinked directories](crate::enumerator#keys-of-firmlinked-directories)).
 //!
+//! A mount point (a path whose device differs from its parent's and that
+//! is not a firmlink) is keyed by the mounted volume's root, its own
+//! `(st_dev, st_ino)`, as the scanner keys it (run 2.4), and so is the
+//! parent of an entry directly on a volume's root.
+//!
 //! # Cloud files
 //!
 //! Only `lstat` is called: nothing is opened, read or listed, so a dataless
@@ -94,6 +99,26 @@ fn key(dev: libc::dev_t, ino: u64) -> FileKey {
     FileKey::new(VolumeId(dev as u32), ino)
 }
 
+/// The key of `path` (lstat `st`) listed in a folder on device
+/// `parent_dev`: `(parent_dev, st_ino)`, except for a mount point, which is
+/// keyed by its own `(st_dev, st_ino)`. A firmlinked folder (such as
+/// `/Users`) is not a mount point even where its device differs.
+fn listed_key(path: &Path, st: &libc::stat, parent_dev: libc::dev_t) -> FileKey {
+    if st.st_dev != parent_dev && !is_firmlink(path) {
+        key(st.st_dev, st.st_ino)
+    } else {
+        key(parent_dev, st.st_ino)
+    }
+}
+
+/// Whether `path` is a firmlink of the system table (such as `/Users`).
+fn is_firmlink(path: &Path) -> bool {
+    crate::firmlinks::FirmlinkMap::system()
+        .entries()
+        .iter()
+        .any(|(on_root, _)| on_root == path)
+}
+
 /// The path with `.` components and trailing slashes removed, so that
 /// `parent()` and `file_name()` see the real last component.
 fn clean(path: &Path) -> std::path::PathBuf {
@@ -121,17 +146,14 @@ impl PathStat for MacPathStat {
                 let Some(pst) = lstat(parent)? else {
                     return Ok(None);
                 };
-                let parent_dev = match parent.parent() {
-                    None => pst.st_dev,
+                let parent_key = match parent.parent() {
+                    None => key(pst.st_dev, pst.st_ino),
                     Some(grand) => match lstat(grand)? {
-                        Some(gst) => gst.st_dev,
+                        Some(gst) => listed_key(parent, &pst, gst.st_dev),
                         None => return Ok(None),
                     },
                 };
-                (
-                    key(pst.st_dev, st.st_ino),
-                    Some(key(parent_dev, pst.st_ino)),
-                )
+                (listed_key(&path, &st, pst.st_dev), Some(parent_key))
             }
         };
 

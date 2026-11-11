@@ -20,3 +20,5 @@ libc = "0.2.191"
 
 [dev-dependencies]
 fx-bench = { path = "../fx-bench" }
+# Workspace crate (std only); the disk images of the external-volume tests.
+fx-testkit = { path = "../fx-testkit" }

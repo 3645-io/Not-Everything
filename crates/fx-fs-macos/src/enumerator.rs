@@ -52,6 +52,13 @@
 //! by this same rule or remap these keys; looking a firmlinked directory up
 //! by its `lstat` identity will not find the scanned entry.
 //!
+//! A mount point is keyed the other way round (run 2.4): its listing
+//! reports the folder the volume is mounted on, so it is keyed by the
+//! mounted volume's root, `lstat`'s own `(st_dev, st_ino)`, and the
+//! volume's entries hang off that key. Two volumes' roots often share an
+//! inode number (2 on APFS and HFS+), never a device, so mount points never
+//! share a key. `MacPathStat` keys them the same way.
+//!
 //! The scanner is read-only.
 
 use std::path::Path;
