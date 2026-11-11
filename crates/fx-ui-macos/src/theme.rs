@@ -816,6 +816,24 @@ pub mod metrics {
     pub const DATE_COLUMN: f64 = 156.0;
     /// The table's smallest width; narrower, it scrolls sideways.
     pub const GRID_MIN_WIDTH: f64 = 760.0;
+    /// The narrowest a divider makes Name, Path and Size (`NE_COL_MIN`).
+    pub const RESIZE_MIN_WIDTHS: [f64; 3] = [140.0, 120.0, 64.0];
+    /// Date Modified's narrowest once the columns are resized: it takes
+    /// the rest (`minmax(140px, 1fr)`).
+    pub const REST_MIN_WIDTH: f64 = 140.0;
+    /// The widest a divider makes a column (`NE_COL_MAX`).
+    pub const RESIZE_MAX_WIDTH: f64 = 800.0;
+    /// How far Left or Right moves a focused divider, and with Shift.
+    pub const RESIZE_STEP: (f64, f64) = (8.0, 32.0);
+    /// A column divider's width, centred in the gap (`.ne-col-handle`).
+    pub const DIVIDER_WIDTH: f64 = 12.0;
+    /// Its line's inset from the header cell's top and bottom: at rest,
+    /// and hovered, focused or dragged.
+    pub const DIVIDER_INSET: (f64, f64) = (13.0, 9.0);
+    /// Its line's width: at rest, and hovered, focused or dragged.
+    pub const DIVIDER_LINE: (f64, f64) = (1.0, 2.0);
+    /// The hovered, focused or dragged line's corner radius.
+    pub const DIVIDER_RADIUS: f64 = 1.0;
     /// A file glyph's side...
     pub const GLYPH_SIZE: f64 = 18.0;
     /// ...and the gap before the name.

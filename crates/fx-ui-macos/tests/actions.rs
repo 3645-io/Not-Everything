@@ -11,6 +11,9 @@
 //! it hides the window (`escape_action`). Hiding the window, by Escape or
 //! the summon hotkey, hands the focus back to the app the user was using
 //! before (`hide_mode`).
+//!
+//! Space in the results is Quick Look (`Action::QuickLook`), as in Finder;
+//! in the search field it stays a space.
 
 use fx_ui_macos::actions::{
     Action, DRAG_OPERATION_MASK, EscapeAction, Focus, HideMode, Key, Modifiers, SearchFieldKey,
@@ -117,9 +120,15 @@ fn delete_keys_map_to_no_action() {
 #[test]
 fn action_set_has_the_read_only_actions() {
     let all: Vec<Action> = Action::ALL.iter().copied().collect();
-    for wanted in [Action::Open, Action::RevealInFinder, Action::CopyPath] {
+    for wanted in [
+        Action::Open,
+        Action::RevealInFinder,
+        Action::CopyPath,
+        Action::QuickLook,
+    ] {
         assert!(all.contains(&wanted), "Action::ALL lacks {wanted:?}");
     }
+    assert_eq!(all.len(), 4, "{all:?}");
 }
 
 #[test]
@@ -396,6 +405,7 @@ const KVK_ESCAPE: u16 = 53;
 const KVK_ANSI_KEYPAD_ENTER: u16 = 76;
 const KVK_FORWARD_DELETE: u16 = 117;
 const KVK_ANSI_C: u16 = 8;
+const KVK_SPACE: u16 = 49;
 
 #[test]
 fn escape_is_recognised_by_its_key_code() {
@@ -415,6 +425,15 @@ fn named_keys_are_recognised_by_their_key_codes() {
         key_from_code(KVK_FORWARD_DELETE, Some("\u{f728}")),
         Key::Delete
     );
+}
+
+#[test]
+fn space_is_recognised_by_its_key_code() {
+    // kVK_Space, whatever the characters say (a no-break space with Option
+    // held, none at all from some input methods).
+    assert_eq!(key_from_code(KVK_SPACE, Some(" ")), Key::Space);
+    assert_eq!(key_from_code(KVK_SPACE, Some("\u{a0}")), Key::Space);
+    assert_eq!(key_from_code(KVK_SPACE, None), Key::Space);
 }
 
 #[test]
@@ -470,4 +489,50 @@ fn hiding_never_leaves_the_app_active_without_a_window() {
     // the active app with no window. With nothing else of the app on
     // screen, the app hides and the previous app comes back.
     assert_eq!(hide_mode(FROM_THIS_APP, NO_OTHER_WINDOW), HideMode::HideApp);
+}
+
+// ------------------------------------------------------------- Quick Look
+
+#[test]
+fn space_in_the_results_is_quick_look() {
+    // Finder's key: Space shows the selection in the Quick Look panel.
+    assert_eq!(action_for_key(Key::Space, none()), Some(Action::QuickLook));
+}
+
+#[test]
+fn space_with_a_modifier_is_not_quick_look() {
+    // Cmd+Space is Spotlight's and Option+Space the summon hotkey's (both
+    // taken before the app sees them); no other combination gains a
+    // meaning.
+    for mods in all_modifiers().into_iter().filter(|m| *m != none()) {
+        assert_eq!(action_for_key(Key::Space, mods), None, "{mods:?}");
+    }
+}
+
+#[test]
+fn space_in_the_search_field_stays_a_space() {
+    for mods in all_modifiers() {
+        assert_eq!(search_field_key(Key::Space, mods), None, "{mods:?}");
+    }
+}
+
+#[test]
+fn only_space_is_quick_look() {
+    for key in [
+        Key::Return,
+        Key::Enter,
+        Key::Backspace,
+        Key::Delete,
+        Key::Escape,
+        Key::Char('y'),
+        Key::Other,
+    ] {
+        for mods in all_modifiers() {
+            assert_ne!(
+                action_for_key(key, mods),
+                Some(Action::QuickLook),
+                "{key:?} {mods:?}"
+            );
+        }
+    }
 }

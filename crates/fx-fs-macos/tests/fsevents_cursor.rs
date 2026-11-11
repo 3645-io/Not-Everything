@@ -357,3 +357,135 @@ fn tracker_cursor_id_resumes_through_decide_start() {
         (StartOutcome::Resumed, 77_777)
     );
 }
+
+// --------------------------------------------------------- run 2.1: flag-aware recording
+//
+// `CursorTracker::on_raw_event(&mut self, id: u64, flags: EventFlags) -> bool`
+// records any event, the HistoryDone marker included, and returns whether
+// it is to be delivered:
+// - the HistoryDone marker is `on_history_done` (always delivered);
+// - EventIdsWrapped is `on_ids_wrapped` (always delivered);
+// - the other special events (MustScanSubDirs, UserDropped, KernelDropped,
+//   RootChanged, Mount, Unmount) are always delivered, even at or before
+//   the replay start: FSEvents.h gives RootChanged an event ID of zero, and
+//   a special event asks for a rescan that no earlier event covered;
+// - any other event is `on_event`.
+//
+// `CursorTracker::on_ids_wrapped(&mut self, id: u64)`: the 64-bit counter
+// wrapped, so every earlier ID is meaningless. The replay start no longer
+// drops anything, the replay is over (the wrap event rescans the volume,
+// which covers every historical event), and the cursor moves to the wrap
+// event's ID, from where later events advance it.
+
+use fx_fs_macos::fsevents::flags::EventFlags as F;
+
+#[test]
+fn special_events_with_id_zero_are_delivered_during_replay() {
+    for flags in [
+        F::ROOT_CHANGED,
+        F::MOUNT | F::ITEM_IS_DIR,
+        F::UNMOUNT | F::ITEM_IS_DIR,
+        F::MUST_SCAN_SUB_DIRS,
+        F::MUST_SCAN_SUB_DIRS | F::USER_DROPPED,
+        F::MUST_SCAN_SUB_DIRS | F::KERNEL_DROPPED,
+    ] {
+        let mut t = CursorTracker::replay(1_000);
+        assert!(
+            t.on_raw_event(0, flags),
+            "special event {:#x} with ID 0 was dropped during replay",
+            flags.bits()
+        );
+        assert!(
+            t.on_raw_event(900, flags),
+            "special event {:#x} before the replay start was dropped",
+            flags.bits()
+        );
+        assert_eq!(t.cursor_id(), 1_000, "a special event moved the cursor");
+        assert_eq!(
+            t.dropped_before_cursor(),
+            0,
+            "special events are not counted as dropped"
+        );
+        t.on_raw_event(1_200, F::ITEM_CREATED | F::ITEM_IS_FILE);
+        t.on_raw_event(1_300, F::HISTORY_DONE);
+        assert_eq!(t.cursor_id(), 1_300);
+    }
+}
+
+#[test]
+fn special_events_with_id_zero_never_move_a_live_cursor() {
+    let mut t = CursorTracker::since_now(5_000);
+    assert!(t.on_raw_event(0, F::ROOT_CHANGED));
+    assert!(t.on_raw_event(0, F::UNMOUNT));
+    assert_eq!(t.cursor_id(), 5_000);
+    assert!(t.on_raw_event(5_100, F::MUST_SCAN_SUB_DIRS));
+    assert_eq!(t.cursor_id(), 5_100);
+}
+
+#[test]
+fn item_events_at_or_before_the_replay_start_are_still_dropped() {
+    let mut t = CursorTracker::replay(1_000);
+    assert!(!t.on_raw_event(999, F::ITEM_CREATED | F::ITEM_IS_FILE));
+    assert!(!t.on_raw_event(1_000, F::ITEM_REMOVED | F::ITEM_IS_FILE));
+    assert!(t.on_raw_event(1_001, F::ITEM_MODIFIED | F::ITEM_IS_FILE));
+    assert_eq!(t.dropped_before_cursor(), 2);
+}
+
+#[test]
+fn raw_history_done_marker_ends_the_replay() {
+    let mut t = CursorTracker::replay(1_000);
+    t.on_raw_event(1_500, F::ITEM_CREATED | F::ITEM_IS_FILE);
+    assert!(t.on_raw_event(1_400, F::HISTORY_DONE));
+    assert!(t.history_done());
+    assert_eq!(t.cursor_id(), 1_500);
+}
+
+#[test]
+fn ids_wrapped_during_live_moves_the_cursor_to_the_new_ids() {
+    let mut t = CursorTracker::since_now(u64::MAX - 10);
+    t.on_raw_event(u64::MAX - 5, F::ITEM_CREATED | F::ITEM_IS_FILE);
+    assert_eq!(t.cursor_id(), u64::MAX - 5);
+    assert!(t.on_raw_event(3, F::EVENT_IDS_WRAPPED));
+    assert_eq!(
+        t.cursor_id(),
+        3,
+        "after a wrap the cursor holds a post-wrap ID, or a restart sees a gap"
+    );
+    assert!(t.on_raw_event(7, F::ITEM_MODIFIED | F::ITEM_IS_FILE));
+    assert_eq!(t.cursor_id(), 7, "post-wrap events advance the cursor");
+}
+
+#[test]
+fn ids_wrapped_during_replay_stops_dropping_later_events() {
+    let mut t = CursorTracker::replay(u64::MAX - 100);
+    assert!(t.on_raw_event(2, F::EVENT_IDS_WRAPPED));
+    assert!(t.history_done(), "a wrap ends the replay");
+    for id in [5, 9, 12] {
+        assert!(
+            t.on_raw_event(id, F::ITEM_CREATED | F::ITEM_IS_FILE),
+            "post-wrap event {id} dropped as if before the replay start"
+        );
+    }
+    assert_eq!(t.dropped_before_cursor(), 0);
+    assert_eq!(t.cursor_id(), 12);
+}
+
+#[test]
+fn ids_wrapped_cursor_resumes_through_decide_start() {
+    let mut t = CursorTracker::since_now(u64::MAX - 1);
+    t.on_ids_wrapped(40);
+    t.on_raw_event(55, F::ITEM_CREATED | F::ITEM_IS_FILE);
+    let saved = cursor(t.cursor_id(), UUID_A);
+    assert_eq!(
+        decide_start(Some(&saved), Some(UUID_A), 60),
+        (StartOutcome::Resumed, 55)
+    );
+}
+
+#[test]
+fn ids_wrapped_with_the_since_now_sentinel_is_never_recorded() {
+    let mut t = CursorTracker::since_now(1_000);
+    t.on_ids_wrapped(SINCE_NOW);
+    assert_ne!(t.cursor_id(), SINCE_NOW);
+    assert!(t.cursor_id() <= 1_000);
+}

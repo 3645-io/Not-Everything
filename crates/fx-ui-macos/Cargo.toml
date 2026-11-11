@@ -47,11 +47,15 @@ fx-channel = { path = "../fx-channel" }
 # 2.13.2 MIT OR Apache-2.0. All used under MIT. Default features stay off:
 # only the framework classes the windows use are turned on, and a new class
 # needs only a new feature of these crates, not a new crate.
-# (`NSFontDescriptor` declares `NSFontWeight`, which the windows' fonts use.)
+# (`NSFontDescriptor` declares `NSFontWeight`, which the windows' fonts use;
+# `NSAccessibility` declares `NSWorkspace`'s `isVoiceOverEnabled`.) The
+# Quick Look panel comes from the system's QuickLookUI framework, loaded at
+# first use by `src/appkit/window/quick_look.rs` and called by class name,
+# so it needs no crate.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSNotification", "NSTimer", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSURL", "NSArray", "NSIndexSet", "NSError", "NSData", "NSKeyValueObserving", "NSDictionary", "NSValue", "NSAffineTransform", "NSTimeZone", "NSAttributedString", "NSRange"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSView", "NSControl", "NSTextField", "NSSearchField", "NSTableView", "NSTableColumn", "NSTableCellView", "NSScrollView", "NSClipView", "NSText", "NSUserInterfaceItemIdentification", "NSGraphics", "NSFont", "NSCell", "NSMenu", "NSMenuItem", "NSScreen", "NSWorkspace", "NSPasteboard", "NSDragging", "NSEvent", "objc2-core-foundation", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSImage", "NSButtonCell", "NSActionCell", "NSAppearance", "NSBox", "NSColor", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext", "NSColorSpace", "NSBezierPath", "NSAffineTransform", "NSStringDrawing", "NSAttributedString", "NSFontDescriptor", "NSAccessibilityProtocols", "NSAccessibilityConstants", "NSTrackingArea", "NSParagraphStyle", "NSTableRowView", "NSImageView", "NSGradient", "NSSearchFieldCell", "NSTextFieldCell", "NSCursor", "NSScroller"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSView", "NSControl", "NSTextField", "NSSearchField", "NSTableView", "NSTableColumn", "NSTableCellView", "NSScrollView", "NSClipView", "NSText", "NSUserInterfaceItemIdentification", "NSGraphics", "NSFont", "NSCell", "NSMenu", "NSMenuItem", "NSScreen", "NSWorkspace", "NSPasteboard", "NSDragging", "NSEvent", "objc2-core-foundation", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSImage", "NSButtonCell", "NSActionCell", "NSAppearance", "NSBox", "NSColor", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext", "NSColorSpace", "NSBezierPath", "NSAffineTransform", "NSStringDrawing", "NSAttributedString", "NSFontDescriptor", "NSAccessibility", "NSAccessibilityProtocols", "NSAccessibilityConstants", "NSTrackingArea", "NSParagraphStyle", "NSTableRowView", "NSImageView", "NSGradient", "NSSearchFieldCell", "NSTextFieldCell", "NSCursor", "NSScroller"] }
 # The app binary's engine runs on the macOS scanner, FSEvents source and
 # lstat-based PathStat (workspace crate, MIT).
 fx-fs-macos = { path = "../fx-fs-macos" }

@@ -263,12 +263,22 @@ impl Plan {
     }
 }
 
+/// When [`merge_in_place`] must grow an order's buffer, it adds this
+/// fraction of the new length as spare (1/256: 50 KB for an order of 3.2M
+/// IDs), so the small batches that follow fit without growing it again.
+const SPARE_DIVISOR: usize = 256;
+
 /// Merges the sorted `fresh` IDs into `kept`, itself sorted by `key` in
 /// `src`, in place: `kept` grows by `fresh.len()` and is filled from the
 /// back, so no second buffer of the order's size is needed. Each fresh ID
 /// goes before the kept IDs that do not sort before it, as a forward merge
 /// would place it; its position is found by halving, and every kept ID
 /// moves at most once.
+///
+/// A buffer too small for the result grows to the new length plus a small
+/// spare ([`SPARE_DIVISOR`]), not to twice its size as `Vec` would grow it
+/// on its own: an order merged in place lives on, and a doubled buffer
+/// would hold 4 bytes per entry for nothing.
 fn merge_in_place<S: SortSource + ?Sized>(
     key: SortKey,
     src: &S,
@@ -279,7 +289,11 @@ fn merge_in_place<S: SortSource + ?Sized>(
         return;
     }
     let mut hi = kept.len();
-    kept.resize(hi + fresh.len(), 0);
+    let len = hi + fresh.len();
+    if len > kept.capacity() {
+        kept.reserve_exact(len - hi + len / SPARE_DIVISOR);
+    }
+    kept.resize(len, 0);
     for (j, &id) in fresh.iter().enumerate().rev() {
         let pos = kept[..hi]
             .partition_point(|&k| key.compare(src, EntryId(k), EntryId(id)) == Ordering::Less);
