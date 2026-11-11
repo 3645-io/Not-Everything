@@ -1,7 +1,7 @@
 //! [`VolumesSource`]: the root volume's change source plus one FSEvents
 //! stream per mounted external volume (run 2.4, macOS only).
 //!
-//! The root source (the boot volume's [`FsEventsSource`](super::source::FsEventsSource))
+//! The root source (the boot volume's [`FsEventsSource`])
 //! keeps the resume cursor; the external volumes have none, so each is
 //! rescanned when it is mounted and when the source starts:
 //!
@@ -120,7 +120,7 @@ impl<R: ChangeSource> VolumesSource<R> {
     }
 
     /// Reads the mount table (at most once a [`MOUNT_CHECK_INTERVAL`]
-    /// unless `now` is set), starting streams for new volumes (queueing a
+    /// unless `force` is set), starting streams for new volumes (queueing a
     /// rescan of each when `rescan`) and stopping those of volumes that
     /// are gone (queueing a check of their mount point).
     fn check_mounts(&mut self, force: bool, rescan: bool) {
@@ -234,7 +234,15 @@ impl<R: ChangeSource> ChangeSource for VolumesSource<R> {
         } else {
             Instant::now()
         };
-        let root = self.root.next_batch(wait_until)?;
+        let root = match self.root.next_batch(wait_until) {
+            Ok(root) => root,
+            Err(e) => {
+                // Kept for the next batch: a failed call must not lose a
+                // volume's rescan or check.
+                self.pending = out;
+                return Err(e);
+            }
+        };
         let mounts_moved = root.iter().any(|c| self.in_folder(c));
         out.extend(root);
         self.drain_external(&mut out);

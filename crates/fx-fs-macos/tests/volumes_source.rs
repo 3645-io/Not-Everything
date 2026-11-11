@@ -11,6 +11,9 @@
 //!   mounted; any other start outcome asks for nothing (the engine rescans
 //!   everything).
 //! - The cursor is the root source's.
+//! - A root source error is passed on, and a volume's rescan or check that
+//!   was waiting is kept for the next batch (no disk image needed: a fake
+//!   mount table names a plain folder).
 //!
 //! The root source here is a quiet fake; the images are attached with
 //! `-nobrowse` in a scratch folder and always detached. Where `hdiutil`
@@ -20,13 +23,94 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fx_fs::ChangeSource;
-use fx_fs_macos::fsevents::volumes_source::VolumesSource;
-use fx_fs_macos::volumes::ExternalVolumes;
+use fx_fs_macos::fsevents::volumes_source::{MOUNT_CHECK_INTERVAL, VolumesSource};
+use fx_fs_macos::volumes::{ExternalVolumes, MountFlags, MountInfo};
 use fx_model::{Change, ResumeCursor, StartOutcome};
 use fx_testkit::disk_image::{DiskImage, ImageFs, Scratch, skip};
+
+/// A root source whose `next_batch` fails while `failing` is set.
+struct FlakyRoot {
+    failing: Arc<AtomicBool>,
+}
+
+impl ChangeSource for FlakyRoot {
+    fn start(&mut self, _from: Option<&ResumeCursor>) -> io::Result<StartOutcome> {
+        Ok(StartOutcome::NoCursorSupport)
+    }
+
+    fn next_batch(&mut self, deadline: Instant) -> io::Result<Vec<Change>> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(io::Error::other("stream stopped"));
+        }
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        Ok(Vec::new())
+    }
+
+    fn cursor(&self) -> ResumeCursor {
+        CURSOR
+    }
+}
+
+#[test]
+fn a_root_error_keeps_a_waiting_volume_rescan() {
+    let scratch = Scratch::new("source-error").expect("scratch");
+    let mount_point = scratch.path().join("mnt/fake");
+    std::fs::create_dir_all(&mount_point).expect("folder");
+    let mounted = Arc::new(AtomicBool::new(false));
+    let failing = Arc::new(AtomicBool::new(false));
+    let lister = {
+        let mounted = Arc::clone(&mounted);
+        let mount_point = mount_point.clone();
+        Box::new(move || {
+            let mut mounts = Vec::new();
+            if mounted.load(Ordering::SeqCst) {
+                mounts.push(MountInfo {
+                    mount_point: mount_point.clone(),
+                    fs_type: "apfs".to_string(),
+                    device: "/dev/disk99s1".to_string(),
+                    flags: MountFlags::from_raw(0x1000, "apfs"),
+                    is_root: false,
+                });
+            }
+            Ok(mounts)
+        })
+    };
+    let mut src = VolumesSource::with_lister(
+        FlakyRoot {
+            failing: Arc::clone(&failing),
+        },
+        scratch.path(),
+        ExternalVolumes {
+            folder: scratch.path().join("mnt"),
+            include_hidden: false,
+        },
+        lister,
+    );
+    src.start(None).expect("start");
+    assert!(src.watched().is_empty());
+
+    // The volume appears; the next mount check queues its rescan, and the
+    // root fails in that same call.
+    mounted.store(true, Ordering::SeqCst);
+    failing.store(true, Ordering::SeqCst);
+    std::thread::sleep(MOUNT_CHECK_INTERVAL + Duration::from_millis(50));
+    assert!(src.next_batch(Instant::now()).is_err());
+    assert_eq!(src.watched(), vec![mount_point.clone()]);
+
+    failing.store(false, Ordering::SeqCst);
+    let batch = src
+        .next_batch(Instant::now() + Duration::from_millis(50))
+        .expect("next_batch");
+    assert!(
+        batch.contains(&Change::RescanSubtree(mount_point.clone())),
+        "the rescan survived the error: {batch:?}"
+    );
+}
 
 const CURSOR: ResumeCursor = ResumeCursor::FsEvents {
     event_id: 42,
