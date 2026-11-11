@@ -4,7 +4,7 @@ Every change that ships is measured before its pull request against the metrics 
 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
 - `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
-- The baseline was set from 0.3.2, the latest release, on the M4 Pro (24 GB, macOS 27) with a warm cache. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The baseline is 0.4.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
 
 ## Tiers
 
@@ -19,7 +19,7 @@ GitHub's shared macOS runners vary more between runs than the allowances, and ha
 
 ## Allowances
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.3.2's CPU, energy, wakeups and memory, and its first scan), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
+A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.4.0's CPU showing a search, B2, and its first results during the first scan, F5), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
 
 | Class | Metrics | Allowance |
 | --- | --- | --- |
@@ -90,7 +90,7 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 | --- | --- | --- | --- | --- |
 | C1 | Operations missed in the freshness test | `freshness_missed` | 0 | Q P R |
 | C2 | Catch-up equals a fresh scan | `catchup_equal` | true | Q P R |
-| C3 | Differences after a 24 h soak with 100,000 random file operations (tracked until the soak test is built) | `soak_differences` | 0 | R |
+| C3 | Differences after a 24 h soak with 100,000 random file operations (tracked: it runs only with `--step soak`; see [The soak](#the-soak)) | `soak_differences` | 0 | R |
 
 ### Optional
 
@@ -98,6 +98,23 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 | --- | --- | --- | --- | --- | --- |
 | O1 | DMG size | `dmg_bytes` | none | 5% | R |
 | O2 | `not-everything` query time over a 2M-entry saved index (tracked) | `cli_query_ms` | ≤100 ms | tracked | Q P |
+
+## The soak
+
+C3 comes from `crates/fx-engine/examples/soak.rs`. It runs the engine, with the real FSEvents source, path stat and scanner set up as the app sets them up, over a fresh folder in `$TMPDIR`, under a seeded stream of random file operations (`fx_testkit::soak`) at 10 a second: creates, rewrites, saves that replace a file with a new one, renames and case-only renames, moves of files and folders, deletes of files and whole folders, folders moved in from outside and out of it (as to the Trash), name swaps, deep trees and bursts.
+
+- Every 30 s it stops and waits for the index to equal a fresh scan (the same paths, each with the same file key, kind and file size, as C2 compares) and every merged sort order to equal a fresh build, for 250 ms in a row.
+- Every 10th check it first closes the engine, which saves the index, makes changes while it is down, and opens it again from the saved cursor, so the FSEvents history replay is soaked too.
+- `soak_differences` counts the paths and sort orders that still differ after 30 s. Each one is printed with the operations before it, and the engine restarts from a fresh scan, so the next check counts only new differences.
+- It also reports the settle times, modification times that differ on otherwise equal entries (`soak_metadata_differences`, not counted: FSEvents reports no event for a folder whose contents change), and the memory growth from the first check with the tree near its 10,000-entry cap to the end (`soak_memory_growth_pct`; the plan allows 5%).
+
+Run it for 24 h on each release candidate, on a quiet Mac, plugged in. It holds the measurement lock for the whole run:
+
+```text
+scripts/perf-check.sh --tier rc --step soak --out <new dir>
+```
+
+`--soak-minutes N` runs it for N minutes instead of 1440. Outside the gate, `cargo run --release -p fx-engine --example soak -- --duration 24h` runs it alone (`--help` lists its settings). C3 stays tracked, so it never fails the gate, because the soak is not part of every rc run. The fuzz test `crates/fx-engine/tests/fuzz.rs` runs the same operation stream against the fake file system in every `cargo test`, with events delivered late, out of order, twice or folded into subtree rescans.
 
 ## In release notes
 
