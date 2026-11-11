@@ -2,12 +2,13 @@
 //!
 //! Clean-room: written from docs/PLAN.md ("Sorting") only.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use fx_model::EntryId;
 use rayon::prelude::*;
 
-use crate::key::{SortKey, compare_names};
+use crate::key::{SortKey, compare_names, compare_paths};
 use crate::source::{SortSource, parent_of};
 
 /// A permutation of every live entry ID in one key's total order.
@@ -227,37 +228,228 @@ impl Order {
     }
 
     /// Checks that the order is a permutation of `src`'s live IDs, strictly
-    /// ascending by its key.
-    pub fn validate<S: SortSource + ?Sized>(&self, src: &S) -> Result<(), OrderError> {
-        let bound = src.id_bound();
-        let mut seen = vec![false; bound];
-        for (position, &id) in self.ids.iter().enumerate() {
-            let i = id as usize;
-            if i >= bound || !src.is_live(EntryId(id)) {
-                return Err(OrderError::NotLive { position, id });
-            }
-            if seen[i] {
-                return Err(OrderError::Duplicate { position, id });
-            }
-            seen[i] = true;
-        }
-        let expected = (0..bound)
-            .filter(|&i| src.is_live(EntryId(i as u32)))
-            .count();
-        if expected != self.ids.len() {
-            return Err(OrderError::WrongLength {
-                expected,
-                found: self.ids.len(),
-            });
-        }
-        for (position, pair) in self.ids.windows(2).enumerate() {
-            let ord = self.key.compare(src, EntryId(pair[0]), EntryId(pair[1]));
-            if ord != std::cmp::Ordering::Less {
-                return Err(OrderError::OutOfOrder { position });
-            }
-        }
-        Ok(())
+    /// ascending by its key: every pair of neighbours in the order that
+    /// [`SortKey::compare`] gives them.
+    ///
+    /// The comparisons run in parallel on the rayon pool. A Path order is
+    /// checked in one walk of the folder tree instead of a comparison of
+    /// full paths per pair (see `path_walk_fits`); only when the walk
+    /// doesn't fit (a wrong order, or live entries the walk can't reach)
+    /// are the paths compared pair by pair, which then decides.
+    pub fn validate<S: SortSource + Sync + ?Sized>(&self, src: &S) -> Result<(), OrderError> {
+        check_orders(&[self], src)
     }
+
+    /// Checks every order in `orders` as [`validate`](Order::validate)
+    /// does, and returns an error of a failing one: the first in `orders`
+    /// whose IDs are not a permutation of the live IDs, else the Name
+    /// order's, else the first other order's that is out of key order.
+    ///
+    /// When a Name order is among them, it is checked first, and the other
+    /// orders then answer the Name rule (their tie-break) by the position
+    /// of each entry in it, without reading a name: the same answer, since
+    /// the checked Name order is exactly the Name rule's order. The engine
+    /// checks its four saved orders this way when it loads a store.
+    pub fn validate_all<S: SortSource + Sync + ?Sized>(
+        orders: &[Order],
+        src: &S,
+    ) -> Result<(), OrderError> {
+        let orders: Vec<&Order> = orders.iter().collect();
+        check_orders(&orders, src)
+    }
+}
+
+/// Below this many neighbour pairs, a parallel check stops splitting.
+const PAR_CHECK_MIN: usize = 4096;
+
+/// How a check answers the Name rule for two live entries.
+#[derive(Clone, Copy)]
+enum Names<'a> {
+    /// By comparing their names ([`compare_names`]).
+    Compare,
+    /// By their positions in a Name order that has passed its check
+    /// ([`name_ranks`]): the same answer, without reading a name.
+    Ranks(&'a [u32]),
+}
+
+impl Names<'_> {
+    fn cmp<S: SortSource + ?Sized>(self, src: &S, a: EntryId, b: EntryId) -> Ordering {
+        match self {
+            Names::Compare => compare_names(src, a, b),
+            Names::Ranks(rank) => rank[a.index()].cmp(&rank[b.index()]),
+        }
+    }
+}
+
+/// [`SortKey::compare`], with the Name rule answered by `names`. Path
+/// compares full paths ([`compare_paths`]) whatever `names` is.
+fn compare_with<S: SortSource + ?Sized>(
+    key: SortKey,
+    src: &S,
+    names: Names<'_>,
+    a: EntryId,
+    b: EntryId,
+) -> Ordering {
+    match key {
+        SortKey::Name => names.cmp(src, a, b),
+        SortKey::Path => compare_paths(src, a, b),
+        SortKey::Size => src
+            .size(a)
+            .cmp(&src.size(b))
+            .then_with(|| names.cmp(src, a, b)),
+        SortKey::Modified => src
+            .modified(a)
+            .cmp(&src.modified(b))
+            .then_with(|| names.cmp(src, a, b)),
+        SortKey::Created => src
+            .created(a)
+            .cmp(&src.created(b))
+            .then_with(|| names.cmp(src, a, b)),
+    }
+}
+
+/// [`Order::validate`] for each of `orders`, sharing the live count and,
+/// when a Name order is among them, its ranks; see
+/// [`Order::validate_all`] for which error is returned.
+fn check_orders<S: SortSource + Sync + ?Sized>(
+    orders: &[&Order],
+    src: &S,
+) -> Result<(), OrderError> {
+    if orders.is_empty() {
+        return Ok(());
+    }
+    let bound = u32::try_from(src.id_bound()).unwrap_or(u32::MAX);
+    let live = (0..bound)
+        .into_par_iter()
+        .filter(|&i| src.is_live(EntryId(i)))
+        .count();
+    let permutations: Vec<Result<(), OrderError>> = orders
+        .par_iter()
+        .map(|order| check_permutation(&order.ids, src, live))
+        .collect();
+    permutations.into_iter().collect::<Result<(), _>>()?;
+    // Ranks are only as good as the order they come from: the Name order
+    // passes its own check, comparing names, before any other order uses
+    // them.
+    let by_name = orders.iter().position(|order| order.key == SortKey::Name);
+    let ranks = match by_name {
+        Some(i) => {
+            check_key_order(orders[i], src, Names::Compare)?;
+            Some(name_ranks(src.id_bound(), &orders[i].ids))
+        }
+        None => None,
+    };
+    let names = ranks.as_deref().map_or(Names::Compare, Names::Ranks);
+    let sorted: Vec<Result<(), OrderError>> = orders
+        .par_iter()
+        .enumerate()
+        .map(|(i, order)| {
+            if Some(i) == by_name {
+                Ok(())
+            } else {
+                check_key_order(order, src, names)
+            }
+        })
+        .collect();
+    sorted.into_iter().collect()
+}
+
+/// Checks that `ids` holds every live ID of `src` exactly once; `live` is
+/// the number of live IDs.
+fn check_permutation<S: SortSource + ?Sized>(
+    ids: &[u32],
+    src: &S,
+    live: usize,
+) -> Result<(), OrderError> {
+    let bound = src.id_bound();
+    let mut seen = vec![0u64; bound.div_ceil(64)];
+    for (position, &id) in ids.iter().enumerate() {
+        let i = id as usize;
+        if i >= bound || !src.is_live(EntryId(id)) {
+            return Err(OrderError::NotLive { position, id });
+        }
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        if seen[word] & bit != 0 {
+            return Err(OrderError::Duplicate { position, id });
+        }
+        seen[word] |= bit;
+    }
+    if ids.len() != live {
+        return Err(OrderError::WrongLength {
+            expected: live,
+            found: ids.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks that `order`, a permutation of the live IDs, is strictly
+/// ascending by its key, with the Name rule answered by `names`.
+fn check_key_order<S: SortSource + Sync + ?Sized>(
+    order: &Order,
+    src: &S,
+    names: Names<'_>,
+) -> Result<(), OrderError> {
+    let ids = &order.ids;
+    if order.key == SortKey::Path && path_walk_fits(ids, src, names) {
+        return Ok(());
+    }
+    let key = order.key;
+    let first = ids
+        .par_windows(2)
+        .with_min_len(PAR_CHECK_MIN)
+        .position_first(|pair| {
+            compare_with(key, src, names, EntryId(pair[0]), EntryId(pair[1])) != Ordering::Less
+        });
+    match first {
+        Some(position) => Err(OrderError::OutOfOrder { position }),
+        None => Ok(()),
+    }
+}
+
+/// Checks a Path order, a permutation of the live IDs, in one walk instead
+/// of comparing full paths: a correct Path order is a depth-first walk of
+/// the folder tree that lists the roots, and each folder's children, in
+/// name order (the Name rule, answered by `names`).
+///
+/// The walk keeps the open folders, from a root down to the previous
+/// entry. Each entry's parent must be one of them (or the entry a root):
+/// the folders below the parent are closed, and the last one closed, the
+/// previous entry's ancestor (or itself) that shares the entry's parent,
+/// must come before the entry by name. That is the one comparison
+/// [`compare_paths`] makes for the pair, so `true` means every pair of
+/// neighbours is in Path order. Each entry is opened and closed once, so
+/// the walk reads each parent once and makes at most one name comparison
+/// per entry.
+///
+/// `false` when the walk doesn't fit: the order is wrong, or some live
+/// entry hangs off a removed entry or a parent cycle and is never reached
+/// from a root. The caller then compares paths pair by pair, which decides.
+fn path_walk_fits<S: SortSource + ?Sized>(ids: &[u32], src: &S, names: Names<'_>) -> bool {
+    let mut open: Vec<u32> = Vec::new();
+    for &id in ids {
+        let entry = EntryId(id);
+        let parent = parent_of(src, entry);
+        let mut sibling = None;
+        while let Some(&top) = open.last() {
+            if parent == Some(EntryId(top)) {
+                break;
+            }
+            sibling = open.pop();
+        }
+        if parent.is_some() && open.is_empty() {
+            // The parent is not an open folder: it is later in the order,
+            // not live, or not reachable from a root.
+            return false;
+        }
+        let after_sibling =
+            sibling.is_none_or(|s| names.cmp(src, EntryId(s), entry) == Ordering::Less);
+        if !after_sibling {
+            return false;
+        }
+        open.push(id);
+    }
+    true
 }
 
 /// A set of entry IDs, stored as a bitset over `EntryId`.
