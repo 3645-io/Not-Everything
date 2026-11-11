@@ -459,7 +459,8 @@ tiers = "quick pr rc"
 baseline = 1
 quick_baseline = 1
 
-# Tracked until the 24 h soak test is built.
+# Tracked: the soak runs only with `--step soak` (docs/gates/performance.md,
+# "The soak").
 [C3]
 name = "Differences after a 24 h soak"
 key = "soak_differences"
