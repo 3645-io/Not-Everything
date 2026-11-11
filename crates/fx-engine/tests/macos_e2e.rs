@@ -1266,9 +1266,11 @@ fn subtree_rescan_of_a_file_path_updates_the_file() {
             f.write_all(b"grown").unwrap();
         },
         // A flag word with no item bit names a folder in FSEvents.h; on a
-        // file path the subtree rescan it maps to must still update it.
+        // file path the subtree rescan it maps to must still update it. The
+        // writer checks a path that holds a file instead of walking it (the
+        // soak's name-swap fix), so nothing is enumerated.
         |root| at(root, "d1/f5.txt", EventFlags::NONE),
-        Expect::Subtree,
+        Expect::Check,
     );
 }
 
