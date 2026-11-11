@@ -277,6 +277,11 @@ impl VolumeEnumerator for FakeTree {
             let start = st
                 .resolve(root)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such folder"))?;
+            // As the macOS scanner, which opens the folder with
+            // `O_DIRECTORY`: a file (or symlink) is not walked.
+            if st.entries[&start].kind != EntryKind::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+            }
             let mut children: HashMap<FileKey, Vec<&Entry>> = HashMap::new();
             for e in st.entries.values() {
                 match e.parent {

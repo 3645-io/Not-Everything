@@ -55,6 +55,13 @@ cargo test -p fx-engine
   entry after the path it was given. It now reads the name stored on disk,
   and the tests check both event orders, the old spelling alone and a
   folder rescanned under its old spelling, with the real stat and scanner.
+- `tests/catch_up.rs` covers another bug the soak found with restarts: a
+  file and a folder swapped names while the engine was down, then a
+  folder inside the swapped folder was deleted, and the deleted folder
+  stayed indexed. A subtree rescan compared its walk with the subtree of
+  the entry the index had at the path (the file, about to be found at its
+  new name) instead of the folder the disk has there. The tests deliver
+  name swaps and kind changes in every order, in one batch and in two.
 
 fx-fs-macos is a dev-dependency under
 `[target.'cfg(target_os = "macos")'.dev-dependencies]` only; the library

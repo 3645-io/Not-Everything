@@ -410,10 +410,16 @@ These were observed on macOS on Apple silicon (M4 Pro):
   streams from now.
 - The cursor saved with a checkpoint stays at the replay start until the
   HistoryDone marker, because replay arrives in path order, not ID order.
-- A `path_filter` hides rescan events reported on an ancestor of the
-  filter. The app filters its stream to the indexed root, `/` by default,
-  which has no ancestor; with a root below `/`, a rescan of an ancestor is
-  not seen.
+- With a `path_filter`, a rescan event (`MustScanSubDirs`, `UserDropped`,
+  `KernelDropped`, `EventIdsWrapped`, `RootChanged`) reported on the
+  volume's mount point or on an ancestor of the filter is delivered as a
+  rescan of the filter's folder. FSEvents reports the events it dropped
+  that way: the soak, on a busy Mac, saw bursts of `MustScanSubDirs |
+  UserDropped` on `/System/Volumes/Data`, live and at the start of a
+  replay, and the filter used to hide them, so the changes they stood for
+  were lost. Any other event outside the filter is dropped. The app
+  filters its stream to the indexed root, `/` by default, so the volume
+  root's rescan reaches it unchanged.
 
 ## Benchmark: `fsevents_bench`
 
