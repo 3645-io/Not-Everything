@@ -558,10 +558,13 @@ Gates: live p95 <= 50 ms; replay exact.";
         for p in &touched {
             allowed.extend(p.ancestors().take_while(|a| a.starts_with(dir)));
         }
+        // Events above the bench directory that the stream's filter lets
+        // through (`flags::admit`) rescan the whole directory; they are not
+        // scripted paths.
         let extra: Vec<&Path> = reported
             .iter()
             .copied()
-            .filter(|p| !allowed.contains(p))
+            .filter(|p| p.starts_with(dir) && !allowed.contains(p))
             .collect();
         let before_cursor = history.iter().filter(|e| e.id <= restored.event_id).count();
 
