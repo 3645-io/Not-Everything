@@ -585,9 +585,49 @@ stop_app() {
     fi
 }
 
+# project_saves LABEL: B7's index saves (docs/gates/performance.md). A phase
+# is too short to reach a compaction, after which the app rewrites its whole
+# store (about 150 MB for a whole-disk index, every 200,000 or so files
+# created or deleted), so `fx-bench saves` projects a day of them at the
+# phase's pace: from the store this run's app saved, its entry count and
+# the files churn created and deleted. Its total, the measured writes plus
+# the projected saves, is what B7 reads; without it B7 is not measured.
+project_saves() {
+    label=$1
+    # The app's one store in its data folder: stores/ with Full Disk Access,
+    # stores-limited/ without; the larger, should there be both.
+    store=""
+    for f in "$OUT"/bg-data/stores/*.fxstore "$OUT"/bg-data/stores-limited/*.fxstore; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        if [ -z "$store" ] || [ "$(stat -f %z "$f")" -gt "$(stat -f %z "$store")" ]; then
+            store=$f
+        fi
+    done
+    if [ -z "$store" ]; then
+        note "saves $label: the app saved no store in its data folder; B7 not measured"
+        return 0
+    fi
+    # Every entry of the saved index: an empty search matches them all.
+    entries=$("$BIN/not-everything" -store "$store" -get-result-count 2>>"$OUT/saves_$label.log" || true)
+    if [ "$CHURN_RATE" -gt 0 ]; then
+        creates=$(value_of churn_creates "$OUT/churn-$label.log" | tail -1)
+        deletes=$(value_of churn_deletes "$OUT/churn-$label.log" | tail -1)
+        seconds=$(value_of churn_seconds "$OUT/churn-$label.log" | tail -1)
+    else
+        # No scripted file activity, so nothing to project.
+        creates=0
+        deletes=0
+        seconds=$BG_SECONDS
+    fi
+    measured=$(value_of "${label}_disk_written_per_day_bytes" "$OUT/sample-$label/metrics.txt")
+    run_step "saves_$label" "$BIN/fx-bench" saves --label "$label" --entries "$entries" \
+        --save-bytes "$(stat -f %z "$store")" --creates "$creates" --deletes "$deletes" \
+        --duration "$seconds" --measured-per-day "$measured"
+}
+
 # background_phase LABEL WINDOW-ARGS...: launches the app on the run's data
 # folder, runs churn (when the rate is above 0) and samples the app for the
-# phase's length.
+# phase's length, then projects the phase's index saves.
 background_phase() {
     label=$1
     shift
@@ -607,6 +647,7 @@ background_phase() {
         CHURN_PID=""
     fi
     stop_app
+    project_saves "$label"
 }
 
 step_background() {
@@ -633,8 +674,36 @@ step_background() {
         emit "${label}_wakeups_per_s" $(value_of "${label}_wakeups_per_s" "$m")
         emit "${label}_footprint_mb" $(mb $(value_of "${label}_footprint_bytes" "$m"))
         emit cpu_max_interval_pct $(value_of "${label}_cpu_max_interval_pct" "$m")
-        emit disk_written_per_day_mb $(mb $(value_of "${label}_disk_written_per_day_bytes" "$m"))
+        # B7: the measured writes plus the projected index saves; their parts
+        # are kept beside it for the summary.
+        s="$OUT/saves_$label.log"
+        emit disk_written_per_day_mb $(mb $(value_of "${label}_disk_written_with_saves_per_day_bytes" "$s"))
+        emit "${label}_disk_written_measured_per_day_mb" $(mb $(value_of "${label}_disk_written_per_day_bytes" "$m"))
+        emit "${label}_compaction_saves_per_day_mb" $(mb $(value_of "${label}_compaction_saves_per_day_bytes" "$s"))
+        emit "${label}_compactions_per_day" $(value_of "${label}_compactions_per_day" "$s")
+        emit "${label}_save_mb" $(mb $(value_of "${label}_save_bytes" "$s"))
+        emit "${label}_index_entries" $(value_of "${label}_entries" "$s")
         emit "${label}_minutes" "$BG_MINUTES"
+    done
+}
+
+# B7's parts by phase, after the summary, so it shows what the projection
+# added.
+b7_breakdown() {
+    echo
+    echo "B7, disk writes a day, by phase: the writes measured, plus the index saves projected at the phase's rate of files created or deleted (each compaction rewrites the whole store)."
+    echo
+    echo "| Phase | Measured | Compactions a day | One save | Projected saves | B7 |"
+    echo "| --- | --- | --- | --- | --- | --- |"
+    for label in hidden search; do
+        total=$(mb $(value_of "${label}_disk_written_with_saves_per_day_bytes" "$OUT/saves_$label.log"))
+        total=${total:+$total MB}
+        printf '| %s | %s MB | %s | %s MB | %s MB | %s |\n' "$label" \
+            "$(value_of "${label}_disk_written_measured_per_day_mb" "$METRICS")" \
+            "$(value_of "${label}_compactions_per_day" "$METRICS")" \
+            "$(value_of "${label}_save_mb" "$METRICS")" \
+            "$(value_of "${label}_compaction_saves_per_day_mb" "$METRICS")" \
+            "${total:-not measured}"
     done
 }
 
@@ -670,5 +739,8 @@ set -- --baseline "$BASELINE" --tier "$TIER" --out "$OUT/summary.md"
 [ "$PARTIAL" -eq 0 ] || set -- "$@" --partial
 status=0
 "$BIN/fx-bench" perf-compare "$@" "$METRICS" || status=$?
+if wants background && [ -f "$OUT/summary.md" ]; then
+    b7_breakdown >>"$OUT/summary.md"
+fi
 note "perf-compare exit code: $status (summary in $OUT/summary.md)"
 exit "$status"

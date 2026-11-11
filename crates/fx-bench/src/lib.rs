@@ -46,7 +46,9 @@
 //! it: [`sample`] reads a running process's CPU, energy, wakeups, disk
 //! writes and memory from the kernel (`sample`, macOS only), and [`churn`]
 //! creates, renames and deletes files in a new folder at a steady seeded
-//! rate (`churn`) so the app can be measured while files change.
+//! rate (`churn`) so the app can be measured while files change. [`saves`]
+//! projects the index saves a background phase is too short to see (`saves`),
+//! which the disk-writes metric adds to the writes it measured.
 //!
 //! The crate uses only the standard library (on macOS, `sample` also calls
 //! libSystem through its own `extern "C"` declarations).
@@ -61,6 +63,7 @@ pub mod perf;
 pub mod release;
 mod rng;
 pub mod sample;
+pub mod saves;
 mod tree;
 
 pub use gate::{GateLine, GateRow, Verdict, parse_gate_lines};

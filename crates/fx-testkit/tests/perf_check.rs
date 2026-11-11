@@ -193,6 +193,44 @@ fn perf_check_runs_file_activity_where_the_app_indexes_it() {
     }
 }
 
+/// B7 ("Disk writes a day") adds the index saves the background phases are
+/// too short to see (`docs/gates/performance.md`): `fx-bench saves` projects
+/// them from the store this run's app saved, its entry count and the
+/// phase's scripted file activity, and B7 is the measured writes plus that
+/// projection, never the measured writes alone.
+#[test]
+fn perf_check_adds_the_projected_index_saves_to_b7() {
+    let code = code();
+    let text = code.join("\n");
+    for needle in [
+        "\"$BIN/fx-bench\" saves",
+        "-get-result-count",
+        "churn_creates",
+        "churn_deletes",
+        "churn_seconds",
+        "--measured-per-day",
+    ] {
+        assert!(
+            text.contains(needle),
+            "{SCRIPT}: B7's projection needs {needle}"
+        );
+    }
+    assert!(
+        text.contains("\"$OUT\"/bg-data/stores"),
+        "{SCRIPT}: the saved store must be the run's own, in its data folder"
+    );
+    let b7: Vec<&String> = code
+        .iter()
+        .filter(|l| l.contains("emit disk_written_per_day_mb"))
+        .collect();
+    assert_eq!(b7.len(), 1, "{SCRIPT}: B7 is emitted in one place: {b7:?}");
+    assert!(
+        b7[0].contains("_disk_written_with_saves_per_day_bytes"),
+        "{SCRIPT}: B7 must add the projected saves: {}",
+        b7[0].trim()
+    );
+}
+
 /// The quick tier's crate-to-steps map in the script and the table in the
 /// agent rule are the same, so the rule never promises a step the script
 /// doesn't run.
