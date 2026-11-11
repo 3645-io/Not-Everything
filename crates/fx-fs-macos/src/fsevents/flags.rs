@@ -129,7 +129,7 @@ impl EventFlags {
     }
 
     /// True if the event asks for a rescan, of its subtree
-    /// (`MustScanSubDirs`) or of the volume ([`Self::VOLUME_RESCAN`]:
+    /// (`MustScanSubDirs`) or of the volume (`VOLUME_RESCAN`:
     /// `EventIdsWrapped`, `RootChanged`, `UserDropped`, `KernelDropped`).
     #[must_use]
     pub const fn asks_rescan(self) -> bool {
