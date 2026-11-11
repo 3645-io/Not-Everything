@@ -136,6 +136,9 @@ unit = "MB"
 better = "lower"
 target = 200
 allow_pct = 5
+# 30 MB floor: the owner's decision of 11 Nov 2026, since identical builds of
+# 0.4.0 read 125 to 169 MB between runs, more than 5% of 125 MB.
+allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 125
@@ -149,6 +152,9 @@ unit = "MB"
 better = "lower"
 target = 250
 allow_pct = 5
+# 30 MB floor: the owner's decision of 11 Nov 2026, since identical builds of
+# 0.4.0 read 125 to 169 MB between runs, more than 5% of 125 MB.
+allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 125.2
