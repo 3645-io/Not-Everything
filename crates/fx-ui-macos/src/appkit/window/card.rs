@@ -10,33 +10,61 @@
 //! standard ones. Cells are [`ResultCell`]s holding a label (and in the
 //! Name column a shared template glyph); their colours don't change with
 //! the selection, so AppKit's emphasized background style is kept out.
+//!
+//! The column titles sit in a [`HeaderStrip`] that follows the rows when
+//! they scroll sideways. Between the titles, a [`ColumnDivider`] after
+//! Name, Path and Size resizes the column on its left
+//! ([`crate::column_sizes`]): dragged, double-clicked for the default
+//! layout, moved with Left and Right when it has the keyboard focus (Full
+//! Keyboard Access, or VoiceOver running), and read and moved by VoiceOver
+//! as a splitter. The table's own column resizing stays off: the card sets
+//! the table columns' widths, and saves the user's in the settings.
+//!
+//! For VoiceOver ([`crate::accessibility`]) each cell names its column and
+//! its text reads in words (set with the text, see `WinController`'s
+//! `cell_view`), so a row reads its cells in order, and the table,
+//! labelled "Results", reports the result count as its row count. The
+//! glyphs, the column titles' texts and chevrons and the syntax examples'
+//! tokens are hidden: the cells and the click targets say what they show.
 
 use std::cell::{Cell, OnceCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackgroundStyle, NSBox, NSBoxType, NSColor, NSControlSize,
-    NSFocusRingType, NSImageScaling, NSImageView, NSResponder, NSScrollView, NSScroller,
-    NSScrollerStyle, NSTableCellView, NSTableColumn, NSTableRowView, NSTableView, NSTableViewStyle,
-    NSTextAlignment, NSTextField, NSTitlePosition, NSUserInterfaceItemIdentification, NSView,
+use objc2::{
+    AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    sel,
 };
-use objc2_foundation::{NSEdgeInsets, NSRect, NSSize, NSString};
+use objc2_app_kit::{
+    NSAccessibility, NSAccessibilityOrientation, NSAccessibilitySplitterRole, NSApplication,
+    NSAutoresizingMaskOptions, NSBackgroundStyle, NSBox, NSBoxType, NSClipView, NSColor,
+    NSControlSize, NSCursor, NSEvent, NSEventModifierFlags, NSFocusRingType, NSImageScaling,
+    NSImageView, NSResponder, NSScrollElasticity, NSScrollView, NSScroller, NSScrollerStyle,
+    NSTableCellView, NSTableColumn, NSTableRowView, NSTableView, NSTableViewStyle, NSTextAlignment,
+    NSTextField, NSTitlePosition, NSTrackingArea, NSTrackingAreaOptions,
+    NSUserInterfaceItemIdentification, NSView, NSWorkspace,
+};
+use objc2_foundation::{
+    NSEdgeInsets, NSNotification, NSNotificationCenter, NSNumber, NSPoint, NSRect, NSSize, NSString,
+};
 
-use super::classes::ResultsTableView;
+use super::classes::{ResultsTableView, with_controller};
 use super::drag_operation;
 use super::views::{
-    FlippedView, Flow, HitButton, SurfaceView, clip_to_radius, color, glyph, label, place,
-    place_line, place_text, set_label, set_text, text_height, text_width, wrapping_label,
+    FlippedView, Flow, HitButton, SurfaceView, clip_to_radius, color, glyph, hide_from_voiceover,
+    label, place, place_line, place_text, set_label, set_text, text_height, text_width,
+    wrapping_label,
 };
+use crate::accessibility::column_label;
+use crate::column_sizes::{self, ColumnSizes, Drag, RESIZABLE, Step, divider_token};
 use crate::columns::{Column, SortState};
 use crate::main_layout::{CardLayout, Rect, card, empty_content_width, empty_state};
+use crate::settings_view::layout::FOCUS_OUTLINE;
 use crate::surface::Surface;
-use crate::theme::{RADIUS_LG, Token, metrics, styles};
+use crate::theme::{RADIUS_LG, RADIUS_SM, Token, metrics, styles};
 use crate::ui_text::{
-    NO_MATCHES_TEXT, REGEX_ERROR_TEXT, REGEX_ERROR_TITLE, RESULTS_LABEL, SYNTAX_EXAMPLES,
-    SYNTAX_LABEL, no_matches_title, sort_label,
+    NO_MATCHES_TEXT, REGEX_ERROR_TEXT, REGEX_ERROR_TITLE, RESIZE_HINT, RESULTS_LABEL,
+    SYNTAX_EXAMPLES, SYNTAX_LABEL, no_matches_title, resize_label, sort_label,
 };
 use crate::window_view::{Body, glyph_tint, header_text, is_numeric, row_surface, sort_glyph};
 
@@ -239,6 +267,9 @@ impl ResultCell {
         // SAFETY: `initWithFrame:` is NSView's designated initializer.
         let cell: Retained<ResultCell> = unsafe { msg_send![super(this), initWithFrame: frame] };
         cell.setIdentifier(Some(&NSString::from_str(column.identifier())));
+        // Moving cell by cell inside a row, VoiceOver names the column. The
+        // label goes on the cell, not its text, which keeps its value.
+        set_label(&cell, column_label(column));
         let text = label(mtm);
         let (font, align) = match column {
             Column::Name => (&styles::ROW_NAME, NSTextAlignment::Left),
@@ -257,6 +288,9 @@ impl ResultCell {
                 objc2_foundation::NSPoint::new(0.0, ((height - g) / 2.0).round()),
                 NSSize::new(g, g),
             ));
+            // The name's text says "folder"; an unlabelled image would read
+            // "image".
+            hide_from_voiceover(&image);
             cell.addSubview(&image);
             let _ = cell.ivars().glyph.set(image);
             x = g + metrics::GLYPH_GAP;
@@ -312,6 +346,326 @@ struct HeaderColumn {
     button: Retained<HitButton>,
 }
 
+define_class!(
+    // SAFETY: NSView may be subclassed; `isFlipped` keeps its contract and
+    // the notification method only moves the view.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FxHeaderStrip"]
+    pub(crate) struct HeaderStrip;
+
+    impl HeaderStrip {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        /// The rows' clip view moved (`NSViewBoundsDidChangeNotification`):
+        /// the titles follow it sideways.
+        #[unsafe(method(rowsScrolled:))]
+        fn rows_scrolled(&self, note: &NSNotification) {
+            if let Some(clip) = note.object().and_then(|o| o.downcast::<NSClipView>().ok()) {
+                self.follow(clip.bounds().origin.x);
+            }
+        }
+    }
+);
+
+impl HeaderStrip {
+    /// The header's content: the column titles and dividers, as wide as
+    /// the rows' table, moved sideways with it.
+    fn new(mtm: MainThreadMarker) -> Retained<HeaderStrip> {
+        let this = HeaderStrip::alloc(mtm).set_ivars(());
+        // SAFETY: `initWithFrame:` is NSView's designated initializer.
+        let view: Retained<HeaderStrip> =
+            unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        view.setWantsLayer(true);
+        view
+    }
+
+    /// Shows the titles over the rows scrolled `x` points sideways.
+    fn follow(&self, x: f64) {
+        let origin = NSPoint::new(-x, 0.0);
+        if self.frame().origin != origin {
+            self.setFrameOrigin(origin);
+        }
+    }
+}
+
+/// The cursor over a divider: macOS 15's column-resize cursor, or the
+/// left-and-right one before it (deprecated since, so used only there).
+fn resize_cursor() -> Retained<NSCursor> {
+    // SAFETY: `respondsToSelector:` sent to the class object asks about
+    // its class methods; it takes a selector and returns a BOOL.
+    let new: bool =
+        unsafe { msg_send![NSCursor::class(), respondsToSelector: sel!(columnResizeCursor)] };
+    if new {
+        NSCursor::columnResizeCursor()
+    } else {
+        left_right_cursor()
+    }
+}
+
+/// The left-and-right cursor, for macOS 13 and 14, which lack the
+/// column-resize one that replaced it.
+#[allow(deprecated)]
+fn left_right_cursor() -> Retained<NSCursor> {
+    NSCursor::resizeLeftRightCursor()
+}
+
+/// Whether a divider takes the keyboard focus, as a button does: with
+/// Full Keyboard Access on, or while VoiceOver runs.
+fn keyboard_focusable(mtm: MainThreadMarker) -> bool {
+    if NSApplication::sharedApplication(mtm).isFullKeyboardAccessEnabled() {
+        return true;
+    }
+    let workspace = NSWorkspace::sharedWorkspace();
+    // SAFETY: `-[NSWorkspace isVoiceOverEnabled]` (macOS 10.13, below the
+    // app's 13.0) takes nothing and returns a BOOL.
+    unsafe { msg_send![&*workspace, isVoiceOverEnabled] }
+}
+
+/// Runs `f` on the window's results card, if the window is built.
+fn with_card(f: impl FnOnce(&ResultsCard)) {
+    with_controller(|c| {
+        if let Some(ui) = c.ui() {
+            f(&ui.card);
+        }
+    });
+}
+
+/// Instance variables of [`ColumnDivider`].
+#[derive(Default)]
+pub(crate) struct DividerIvars {
+    /// The column on its left: 0 Name, 1 Path, 2 Size.
+    index: Cell<usize>,
+    hovered: Cell<bool>,
+    focused: Cell<bool>,
+}
+
+define_class!(
+    // SAFETY: NSView may be subclassed; the responder overrides call super
+    // (or handle the event themselves) and keep their return contracts.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FxColumnDivider"]
+    #[ivars = DividerIvars]
+    pub(crate) struct ColumnDivider;
+
+    impl ColumnDivider {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            keyboard_focusable(self.mtm())
+        }
+
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            // SAFETY: `becomeFirstResponder` takes nothing and returns BOOL.
+            let ok: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            if ok {
+                self.ivars().focused.set(true);
+                with_card(|c| c.layout_dividers());
+            }
+            ok
+        }
+
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            // SAFETY: `resignFirstResponder` takes nothing and returns BOOL.
+            let ok: bool = unsafe { msg_send![super(self), resignFirstResponder] };
+            if ok {
+                self.ivars().focused.set(false);
+                with_card(|c| c.layout_dividers());
+            }
+            ok
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(true);
+            with_card(|c| c.layout_dividers());
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(false);
+            with_card(|c| c.layout_dividers());
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            self.addCursorRect_cursor(self.bounds(), &resize_cursor());
+        }
+
+        /// A press starts a drag; a double-click restores the default
+        /// layout.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let i = self.ivars().index.get();
+            if event.clickCount() >= 2 {
+                with_card(|c| c.reset_columns());
+            } else {
+                let x = event.locationInWindow().x;
+                with_card(|c| c.begin_drag(i, x));
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            // Kept while the pointer leaves the divider's cursor rect.
+            resize_cursor().set();
+            let x = event.locationInWindow().x;
+            with_card(|c| c.drag_to(x));
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            // No enter or exit events come during a drag: look where the
+            // pointer is now.
+            let at = self.convertPoint_fromView(event.locationInWindow(), None);
+            let b = self.bounds();
+            let inside = at.x >= b.origin.x
+                && at.x < b.origin.x + b.size.width
+                && at.y >= b.origin.y
+                && at.y < b.origin.y + b.size.height;
+            self.ivars().hovered.set(inside);
+            with_card(|c| c.end_drag());
+        }
+
+        /// Left and Right (with Shift, four times as far) move the divider;
+        /// every other key goes on up the responder chain.
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let flags = event.modifierFlags();
+            let others = NSEventModifierFlags::Command
+                | NSEventModifierFlags::Control
+                | NSEventModifierFlags::Option;
+            let step = match event.keyCode() {
+                123 => Some(Step::Narrower),
+                124 => Some(Step::Wider),
+                _ => None,
+            };
+            match step.filter(|_| !flags.intersects(others)) {
+                Some(step) => {
+                    let i = self.ivars().index.get();
+                    let large = flags.contains(NSEventModifierFlags::Shift);
+                    with_card(|c| c.step_divider(i, step, large));
+                }
+                // SAFETY: `keyDown:` takes one NSEvent and returns void.
+                None => unsafe { msg_send![super(self), keyDown: event] },
+            }
+        }
+
+        /// VoiceOver's increment: as Right.
+        #[unsafe(method(accessibilityPerformIncrement))]
+        fn accessibility_increment(&self) -> bool {
+            let i = self.ivars().index.get();
+            with_card(|c| c.step_divider(i, Step::Wider, false));
+            true
+        }
+
+        /// VoiceOver's decrement: as Left.
+        #[unsafe(method(accessibilityPerformDecrement))]
+        fn accessibility_decrement(&self) -> bool {
+            let i = self.ivars().index.get();
+            with_card(|c| c.step_divider(i, Step::Narrower, false));
+            true
+        }
+    }
+);
+
+impl ColumnDivider {
+    /// The divider after column `index`, titled `title`: a splitter for
+    /// VoiceOver, with the board's label and tooltip.
+    fn new(mtm: MainThreadMarker, index: usize, title: &str) -> Retained<ColumnDivider> {
+        let this = ColumnDivider::alloc(mtm).set_ivars(DividerIvars {
+            index: Cell::new(index),
+            ..DividerIvars::default()
+        });
+        // SAFETY: `initWithFrame:` is NSView's designated initializer.
+        let view: Retained<ColumnDivider> =
+            unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        let hint = NSString::from_str(RESIZE_HINT);
+        view.setToolTip(Some(&hint));
+        view.setAccessibilityElement(true);
+        // SAFETY: the role is an immutable framework constant.
+        view.setAccessibilityRole(Some(unsafe { NSAccessibilitySplitterRole }));
+        view.setAccessibilityOrientation(NSAccessibilityOrientation::Vertical);
+        set_label(&view, &resize_label(title));
+        view.setAccessibilityHelp(Some(&hint));
+        let options = NSTrackingAreaOptions::MouseEnteredAndExited
+            | NSTrackingAreaOptions::ActiveInActiveApp
+            | NSTrackingAreaOptions::InVisibleRect;
+        // SAFETY: the owner is the divider, which keeps the area; no user
+        // info is passed.
+        let area = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                options,
+                Some(&view),
+                None,
+            )
+        };
+        view.addTrackingArea(&area);
+        view
+    }
+
+    /// Whether the pointer is over it or it has the keyboard focus.
+    fn hovered_or_focused(&self) -> bool {
+        self.ivars().hovered.get() || self.ivars().focused.get()
+    }
+
+    /// Tells VoiceOver the column's width in points.
+    fn set_width(&self, width: f64) {
+        let number = NSNumber::new_f64(width.round());
+        let value: &AnyObject = &number;
+        // SAFETY: an accessibility value may be any object; an NSNumber is
+        // what a splitter's position is.
+        unsafe { self.setAccessibilityValue(Some(value)) };
+    }
+}
+
+/// A divider's views: what the pointer drags, its line and its focus
+/// outline.
+struct DividerViews {
+    view: Retained<ColumnDivider>,
+    line: Retained<NSBox>,
+    ring: Retained<NSBox>,
+}
+
+/// A plain custom box (a line or an outline) for a divider.
+fn divider_box(mtm: MainThreadMarker) -> Retained<NSBox> {
+    let b = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::ZERO);
+    b.setBoxType(NSBoxType::Custom);
+    b.setBorderWidth(0.0);
+    b.setTitlePosition(NSTitlePosition::NoTitle);
+    b
+}
+
+/// `rect` moved so its left edge falls on a pixel of a `scale` screen, so
+/// a one-point line is drawn sharp.
+fn on_pixel(rect: Rect, scale: f64) -> Rect {
+    Rect {
+        x: (rect.x * scale).round() / scale,
+        ..rect
+    }
+}
+
+/// A divider drag in progress: the drag, the pointer's x in the window
+/// where it started, and the sizes before it.
+#[derive(Clone, Copy)]
+struct Dragging {
+    drag: Drag,
+    start_x: f64,
+    before: Option<ColumnSizes>,
+}
+
 // ----------------------------------------------------------- empty state
 
 /// One syntax example: its token and what it finds.
@@ -353,6 +707,8 @@ impl EmptyState {
             .map(|(i, e)| {
                 let surface = SurfaceView::new(mtm);
                 let token = label(mtm);
+                // Its button reads "Search for ext:pdf".
+                hide_from_voiceover(&token);
                 let meaning = label(mtm);
                 let button = HitButton::new(
                     mtm,
@@ -492,8 +848,11 @@ pub(crate) struct ResultsCard {
     surface: Retained<SurfaceView>,
     clip: Retained<FlippedView>,
     header: Retained<FlippedView>,
+    /// The titles and dividers, moved sideways with the rows.
+    strip: Retained<HeaderStrip>,
     line: Retained<NSBox>,
     columns: Vec<HeaderColumn>,
+    dividers: Vec<DividerViews>,
     /// The rows' scroll view.
     pub(crate) scroll: Retained<NSScrollView>,
     /// The rows.
@@ -503,6 +862,12 @@ pub(crate) struct ResultsCard {
     body: Cell<Body>,
     /// The sort shown in the header.
     sort: Cell<SortState>,
+    /// Where the card is in the window.
+    rect: Cell<Rect>,
+    /// The widths the user set, or `None` for the default layout.
+    sizes: Cell<Option<ColumnSizes>>,
+    /// The divider being dragged.
+    dragging: Cell<Option<Dragging>>,
 }
 
 impl ResultsCard {
@@ -523,6 +888,7 @@ impl ResultsCard {
         scroll.setDrawsBackground(false);
         scroll.contentView().setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
+        // Turned on while resized columns don't fit (`lay_out_columns`).
         scroll.setHasHorizontalScroller(false);
         scroll.setAutohidesScrollers(true);
         scroll.setAutomaticallyAdjustsContentInsets(false);
@@ -575,14 +941,35 @@ impl ResultsCard {
         // Drag-out offers copy and link only, to other apps and within this one.
         table.setDraggingSourceOperationMask_forLocal(drag_operation(), false);
         table.setDraggingSourceOperationMask_forLocal(drag_operation(), true);
+        // VoiceOver: "Results, table"; AppKit reports the row count (the
+        // result count) and each row's index.
+        set_label(&table, RESULTS_LABEL);
         scroll.setDocumentView(Some(&table));
 
         let header = FlippedView::new(mtm);
-        let line = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::ZERO);
-        line.setBoxType(NSBoxType::Custom);
-        line.setBorderWidth(0.0);
-        line.setTitlePosition(NSTitlePosition::NoTitle);
+        let line = divider_box(mtm);
         header.addSubview(&line);
+        let strip = HeaderStrip::new(mtm);
+        header.addSubview(&strip);
+        // The dividers' lines and outlines go under the titles, and what the
+        // pointer drags over them (`.ne-col-handle { z-index: 1 }`).
+        let dividers: Vec<DividerViews> = Column::ALL
+            .into_iter()
+            .take(RESIZABLE)
+            .enumerate()
+            .map(|(i, column)| {
+                let line = divider_box(mtm);
+                let ring = divider_box(mtm);
+                ring.setHidden(true);
+                strip.addSubview(&line);
+                strip.addSubview(&ring);
+                DividerViews {
+                    view: ColumnDivider::new(mtm, i, column.title()),
+                    line,
+                    ring,
+                }
+            })
+            .collect();
         let columns = Column::ALL
             .into_iter()
             .enumerate()
@@ -590,6 +977,10 @@ impl ResultsCard {
                 let label = label(mtm);
                 let chevron = NSImageView::new(mtm);
                 chevron.setImageScaling(NSImageScaling::ScaleNone);
+                // The click target reads "Sort by Name, ascending": the
+                // title and the chevron say nothing more.
+                hide_from_voiceover(&label);
+                hide_from_voiceover(&chevron);
                 let button = HitButton::new(
                     mtm,
                     target,
@@ -599,9 +990,9 @@ impl ResultsCard {
                     false,
                     false,
                 );
-                header.addSubview(&label);
-                header.addSubview(&chevron);
-                header.addSubview(&button);
+                strip.addSubview(&label);
+                strip.addSubview(&chevron);
+                strip.addSubview(&button);
                 HeaderColumn {
                     column,
                     label,
@@ -611,23 +1002,52 @@ impl ResultsCard {
             })
             .collect();
 
+        for d in &dividers {
+            strip.addSubview(&d.view);
+        }
+        // The titles follow the rows sideways.
+        let rows_clip = scroll.contentView();
+        rows_clip.setPostsBoundsChangedNotifications(true);
+        // SAFETY: `rowsScrolled:` is implemented by HeaderStrip as
+        // `-(void)rowsScrolled:(NSNotification *)note`; the name is an
+        // immutable framework constant; the strip and the clip view live as
+        // long as the window, which lives until the app quits, so the
+        // observer never outlives them.
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                &strip,
+                sel!(rowsScrolled:),
+                Some(objc2_app_kit::NSViewBoundsDidChangeNotification),
+                Some(&rows_clip),
+            );
+        }
+
         let empty = EmptyState::new(mtm, target);
         clip.addSubview(&scroll);
         clip.addSubview(&empty.scroll);
         clip.addSubview(&header);
 
+        // The resident app starts with the widths it saved.
+        let sizes = controller
+            .with_resident(|r| r.settings.column_widths)
+            .flatten();
         ResultsCard {
             surface,
             clip,
             header,
+            strip,
             line,
             columns,
+            dividers,
             scroll,
             table,
             empty,
             layout: Cell::new(None),
             body: Cell::new(Body::Blank),
             sort: Cell::new(SortState::default()),
+            rect: Cell::new(Rect::default()),
+            sizes: Cell::new(sizes),
+            dragging: Cell::new(None),
         }
     }
 
@@ -641,8 +1061,8 @@ impl ResultsCard {
     pub(crate) fn layout(&self, rect: Rect, query: &str) {
         self.surface.show(Some(Surface::Panel), rect);
         place(&self.clip, rect);
-        let l = card(rect.width, rect.height, legacy_scroller_width(&self.scroll));
-        self.layout.set(Some(l));
+        self.rect.set(rect);
+        let l = self.lay_out_columns();
         place(&self.header, l.header);
         place(
             &self.line,
@@ -658,6 +1078,21 @@ impl ResultsCard {
                 l.rows.height,
             ),
         );
+        place(&self.empty.scroll, l.rows);
+        self.show_body(self.body.get(), query);
+    }
+
+    /// Lays the columns out for the card's size and the user's widths:
+    /// the table columns, the titles and the dividers.
+    fn lay_out_columns(&self) -> CardLayout {
+        let rect = self.rect.get();
+        let l = card(
+            rect.width,
+            rect.height,
+            legacy_scroller_width(&self.scroll),
+            self.sizes.get(),
+        );
+        self.layout.set(Some(l));
         let columns = self.table.tableColumns();
         for (i, column) in columns.iter().enumerate() {
             let w = l.columns.widths[i];
@@ -665,9 +1100,228 @@ impl ResultsCard {
                 column.setWidth(w);
             }
         }
-        place(&self.empty.scroll, l.rows);
+        // A horizontal scroller, and a bounce sideways, only when the
+        // columns don't fit: the default layout's fractional widths can
+        // make the table a hair wider than the rows, which must not scroll.
+        let sideways = l.width > rect.width + 0.5;
+        if self.scroll.hasHorizontalScroller() != sideways {
+            self.scroll.setHasHorizontalScroller(sideways);
+        }
+        let elasticity = if sideways {
+            NSScrollElasticity::Automatic
+        } else {
+            NSScrollElasticity::None
+        };
+        if self.scroll.horizontalScrollElasticity() != elasticity {
+            self.scroll.setHorizontalScrollElasticity(elasticity);
+        }
+        place(
+            &self.strip,
+            Rect::new(
+                -self.scroll.contentView().bounds().origin.x,
+                0.0,
+                l.width,
+                l.header.height,
+            ),
+        );
         self.layout_header();
-        self.show_body(self.body.get(), query);
+        self.layout_dividers();
+        l
+    }
+
+    /// Places the dividers between the column titles and shows each one's
+    /// state: its line green while hovered, focused or dragged, and its
+    /// focus outline while it has the keyboard focus.
+    fn layout_dividers(&self) {
+        let Some(l) = self.layout.get() else { return };
+        let scale = self.header.window().map_or(2.0, |w| w.backingScaleFactor());
+        let dragged = self.dragging.get().map(|d| d.drag.divider());
+        let (outline, offset) = FOCUS_OUTLINE;
+        let reach = outline + offset;
+        for (i, d) in self.dividers.iter().enumerate() {
+            let at = l.dividers[i];
+            let active = d.view.hovered_or_focused() || dragged == Some(i);
+            place(&d.view, at.hit);
+            let line = if active { at.active_line } else { at.line };
+            place(&d.line, on_pixel(line, scale));
+            d.line
+                .setCornerRadius(if active { metrics::DIVIDER_RADIUS } else { 0.0 });
+            d.line.setFillColor(&color(divider_token(active)));
+            // `:focus-visible { outline: 2px solid var(--green-ink);
+            // outline-offset: 2px }` round the 6-point-radius handle.
+            let h = at.hit;
+            place(
+                &d.ring,
+                Rect::new(
+                    h.x - reach,
+                    h.y - reach,
+                    h.width + 2.0 * reach,
+                    h.height + 2.0 * reach,
+                ),
+            );
+            d.ring.setBorderWidth(outline);
+            d.ring.setBorderColor(&color(Token::GreenInk));
+            d.ring.setFillColor(&NSColor::clearColor());
+            d.ring.setCornerRadius(RADIUS_SM + reach);
+            d.ring.setHidden(!d.view.ivars().focused.get());
+            d.view.set_width(l.columns.widths[i]);
+        }
+    }
+
+    /// A press on divider `divider` at `x` in the window starts a drag.
+    pub(crate) fn begin_drag(&self, divider: usize, x: f64) {
+        let Some(l) = self.layout.get() else { return };
+        self.dragging.set(Some(Dragging {
+            drag: Drag::new(divider, l.columns.widths),
+            start_x: x,
+            before: self.sizes.get(),
+        }));
+        self.layout_dividers();
+    }
+
+    /// The pointer moved to `x` in the window during a drag: the column on
+    /// the divider's left follows it, in the header and every row.
+    pub(crate) fn drag_to(&self, x: f64) {
+        let Some(mut d) = self.dragging.get() else {
+            return;
+        };
+        let sizes = d.drag.to(x - d.start_x);
+        self.dragging.set(Some(d));
+        if sizes.is_some() && sizes != self.sizes.get() {
+            self.sizes.set(sizes);
+            self.lay_out_columns();
+        }
+    }
+
+    /// The drag ended: the widths are saved if they changed.
+    pub(crate) fn end_drag(&self) {
+        let dragging = self.dragging.take();
+        // Also after a double-click's second release, which ends no drag:
+        // the divider shows whether the pointer is still over it.
+        self.layout_dividers();
+        if dragging.is_some_and(|d| self.sizes.get() != d.before) {
+            self.save_sizes();
+        }
+    }
+
+    /// Left or Right on divider `divider` (`large` with Shift).
+    pub(crate) fn step_divider(&self, divider: usize, step: Step, large: bool) {
+        let Some(l) = self.layout.get() else { return };
+        let sizes = Some(column_sizes::step(l.columns.widths, divider, step, large));
+        if sizes != self.sizes.get() {
+            self.sizes.set(sizes);
+            self.lay_out_columns();
+            self.save_sizes();
+        }
+    }
+
+    /// A double-click on a divider: the default layout again.
+    pub(crate) fn reset_columns(&self) {
+        self.dragging.set(None);
+        if self.sizes.replace(None).is_some() {
+            self.lay_out_columns();
+            self.save_sizes();
+        } else {
+            self.layout_dividers();
+        }
+    }
+
+    /// A debug script's divider step on divider `i`: mouse events sent
+    /// to `window` as the hardware sends them, or an arrow key handed to
+    /// the divider.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_divider(
+        &self,
+        window: &objc2_app_kit::NSWindow,
+        i: usize,
+        step: super::debug_script::DividerStep,
+    ) {
+        use super::debug_script::DividerStep;
+        use objc2_app_kit::NSEventType;
+        let Some(d) = self.dividers.get(i) else {
+            return;
+        };
+        let b = d.view.bounds();
+        let mid = NSPoint::new(b.size.width / 2.0, b.size.height / 2.0);
+        let at = d.view.convertPoint_toView(mid, None);
+        let mouse = |kind: NSEventType, dx: f64, clicks: isize| {
+            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                kind,
+                NSPoint::new(at.x + dx, at.y),
+                NSEventModifierFlags::empty(),
+                0.0,
+                window.windowNumber(),
+                None,
+                0,
+                clicks,
+                if kind == NSEventType::LeftMouseUp { 0.0 } else { 1.0 },
+            )
+        };
+        let events = match step {
+            DividerStep::Drag(dx) => vec![
+                mouse(NSEventType::LeftMouseDown, 0.0, 1),
+                mouse(NSEventType::LeftMouseDragged, dx / 2.0, 1),
+                mouse(NSEventType::LeftMouseDragged, dx, 1),
+                mouse(NSEventType::LeftMouseUp, dx, 1),
+            ],
+            DividerStep::DoubleClick => vec![
+                mouse(NSEventType::LeftMouseDown, 0.0, 1),
+                mouse(NSEventType::LeftMouseUp, 0.0, 1),
+                mouse(NSEventType::LeftMouseDown, 0.0, 2),
+                mouse(NSEventType::LeftMouseUp, 0.0, 2),
+            ],
+            DividerStep::Key { right, shift } => {
+                let (ch, code) = if right {
+                    ('\u{F703}', 124)
+                } else {
+                    ('\u{F702}', 123)
+                };
+                let mut flags = NSEventModifierFlags::NumericPad | NSEventModifierFlags::Function;
+                if shift {
+                    flags |= NSEventModifierFlags::Shift;
+                }
+                let text = NSString::from_str(&ch.to_string());
+                let key = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    NSEventType::KeyDown,
+                    NSPoint::new(0.0, 0.0),
+                    flags,
+                    0.0,
+                    window.windowNumber(),
+                    None,
+                    &text,
+                    &text,
+                    false,
+                    code,
+                );
+                if let Some(key) = key {
+                    d.view.keyDown(&key);
+                }
+                return;
+            }
+        };
+        for event in events.into_iter().flatten() {
+            window.sendEvent(&event);
+        }
+    }
+
+    /// A debug script's sideways scroll of the rows to `x`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_scroll_x(&self, x: f64) {
+        let clip = self.scroll.contentView();
+        let y = clip.bounds().origin.y;
+        clip.scrollToPoint(NSPoint::new(x, y));
+        self.scroll.reflectScrolledClipView(&clip);
+    }
+
+    /// Remembers the widths for the next launch (resident app only).
+    fn save_sizes(&self) {
+        let sizes = self.sizes.get();
+        with_controller(|c| {
+            c.with_resident(|r| {
+                r.settings.column_widths = sizes;
+                r.save_settings();
+            });
+        });
     }
 
     /// Shows the column titles for `sort`.
@@ -764,6 +1418,7 @@ impl ResultsCard {
         self.line.setFillColor(&color(Token::Line));
         self.empty.restyle();
         self.restyle_header();
+        self.layout_dividers();
     }
 
     /// The click target of `column`'s title, which the re-sort probe sends

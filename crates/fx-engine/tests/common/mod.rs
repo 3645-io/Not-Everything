@@ -483,6 +483,9 @@ pub fn wait_for(
         if cond(&snap) {
             return snap;
         }
+        // Not held while sleeping: a held snapshot keeps the writer from
+        // merging its orders in place.
+        drop(snap);
         assert!(Instant::now() < end, "timed out waiting for: {what}");
         thread::sleep(Duration::from_millis(5));
     }
@@ -498,6 +501,7 @@ pub fn wait_for_tree(engine: &Engine, tree: &FakeTree, what: &str) -> Arc<Engine
         if got == want {
             return snap;
         }
+        drop(snap);
         if Instant::now() >= end {
             let missing: Vec<_> = want.keys().filter(|k| !got.contains_key(*k)).collect();
             let extra: Vec<_> = got.keys().filter(|k| !want.contains_key(*k)).collect();

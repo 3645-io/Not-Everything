@@ -27,8 +27,8 @@ use objc2_foundation::{NSRect, NSSize, NSString};
 use super::classes::{WinController, with_controller};
 use super::settings_controls::TextView;
 use super::views::{
-    FlippedView, Flow, HitButton, SurfaceView, color, glyph, place, place_line, set_label,
-    set_text, styled, text_width, theme,
+    FlippedView, Flow, HitButton, SurfaceView, color, glyph, hide_from_voiceover, place,
+    place_line, set_label, set_text, styled, text_width, theme,
 };
 use crate::build_info::BuildInfo;
 use crate::chips::{Chip, QueryOptions, chip_surface, chip_text, chip_width};
@@ -126,6 +126,26 @@ define_class!(
             // SAFETY: `resignKeyWindow` takes no arguments and returns void.
             let _: () = unsafe { msg_send![super(self), resignKeyWindow] };
             with_controller(|c| c.focus_changed());
+        }
+
+        // The Quick Look panel's controller (`QLPreviewPanelController`, an
+        // informal protocol the panel looks for in the responder chain).
+        // The window answers wherever the focus is in it, so the panel keeps
+        // showing the selection while the search field has the focus.
+
+        #[unsafe(method(acceptsPreviewPanelControl:))]
+        fn accepts_preview_panel_control(&self, _panel: Option<&AnyObject>) -> bool {
+            true
+        }
+
+        #[unsafe(method(beginPreviewPanelControl:))]
+        fn begin_preview_panel_control(&self, panel: &NSWindow) {
+            with_controller(|c| c.begin_preview(panel));
+        }
+
+        #[unsafe(method(endPreviewPanelControl:))]
+        fn end_preview_panel_control(&self, panel: &NSWindow) {
+            with_controller(|c| c.end_preview(panel));
         }
     }
 );
@@ -393,6 +413,9 @@ impl TopBar {
         let glyph =
             NSImageView::imageViewWithImage(&glyph(Glyph::Search, metrics::GLYPH_SIZE), mtm);
         glyph.setImageScaling(NSImageScaling::ScaleNone);
+        // The field reads "Search file and folder names"; the magnifier
+        // would read "image".
+        hide_from_voiceover(&glyph);
         content.addSubview(&glyph);
 
         let search = SearchField::new(mtm);
@@ -437,6 +460,9 @@ impl TopBar {
                 let surface = SurfaceView::new(mtm);
                 let label = super::views::label(mtm);
                 label.setAlignment(NSTextAlignment::Center);
+                // The button reads "Match case" and its state; "Aa" would
+                // only repeat it, less clearly.
+                hide_from_voiceover(&label);
                 let button = HitButton::new(
                     mtm,
                     target,

@@ -68,12 +68,37 @@ impl EventFlags {
     /// `kFSEventStreamEventFlagItemCloned`.
     pub const ITEM_CLONED: EventFlags = EventFlags(0x0040_0000);
 
-    /// Flags that ask for a rescan of the event's directory subtree.
-    const SUBTREE_RESCAN: u32 =
-        Self::MUST_SCAN_SUB_DIRS.0 | Self::USER_DROPPED.0 | Self::KERNEL_DROPPED.0;
+    /// Flags that invalidate everything the stream watches, whatever the
+    /// path. `FSEvents.h`: after UserDropped or KernelDropped "the client
+    /// must do a full scan of any directories (and their subdirectories,
+    /// recursively) being monitored by this stream"; after EventIdsWrapped
+    /// no earlier ID is a valid start; RootChanged reports a change on the
+    /// path to a watched directory.
+    pub(crate) const VOLUME_RESCAN: u32 = Self::EVENT_IDS_WRAPPED.0
+        | Self::ROOT_CHANGED.0
+        | Self::USER_DROPPED.0
+        | Self::KERNEL_DROPPED.0;
 
-    /// Flags that invalidate the whole volume, whatever the path.
-    const VOLUME_RESCAN: u32 = Self::EVENT_IDS_WRAPPED.0 | Self::ROOT_CHANGED.0;
+    /// The special (non-item) flags: `MustScanSubDirs` through `Unmount`.
+    /// Events carrying one of these are not historical item records, so
+    /// the replay's "at or before the saved ID" rule never drops them
+    /// (`FSEvents.h` gives RootChanged an event ID of zero).
+    pub(crate) const SPECIAL: u32 = 0x0000_00FF;
+
+    /// The item action bits (`ItemCreated` through `ItemXattrMod`, and
+    /// `ItemCloned`).
+    const ITEM_ACTION: u32 = 0x0000_FF00 | Self::ITEM_CLONED.0;
+
+    /// The item type bits (`ItemIsFile`, `ItemIsDir`, `ItemIsSymlink`,
+    /// `ItemIsHardlink`, `ItemIsLastHardlink`).
+    const ITEM_TYPE: u32 = Self::ITEM_IS_FILE.0
+        | Self::ITEM_IS_DIR.0
+        | Self::ITEM_IS_SYMLINK.0
+        | Self::ITEM_IS_HARDLINK.0
+        | Self::ITEM_IS_LAST_HARDLINK.0;
+
+    /// Item actions that change which names exist at a path.
+    const NAMESPACE: u32 = Self::ITEM_CREATED.0 | Self::ITEM_REMOVED.0 | Self::ITEM_RENAMED.0;
 
     /// The raw flag word.
     #[must_use]
@@ -93,14 +118,14 @@ impl EventFlags {
         self.0 & other.0 != 0
     }
 
-    /// True if the event asks for a rescan, of its subtree
-    /// (`MustScanSubDirs`, `UserDropped`, `KernelDropped`) or of the
-    /// volume (`EventIdsWrapped`, `RootChanged`): what [`classify`] turns
-    /// into [`EventAction::RescanSubtree`] or [`EventAction::RescanVolume`]
-    /// whatever the path.
+    /// True for a directory-level event: no item bit (action or type) and
+    /// no special bit, only possibly `OwnEvent` or bits this SDK does not
+    /// define. `FSEvents.h` (`kFSEventStreamEventFlagNone`): "There was
+    /// some change in the directory at the specific path supplied in this
+    /// event", so the folder must be listed, not only checked.
     #[must_use]
-    pub const fn asks_rescan(self) -> bool {
-        self.0 & (Self::SUBTREE_RESCAN | Self::VOLUME_RESCAN) != 0
+    pub const fn is_directory_level(self) -> bool {
+        self.0 & (Self::ITEM_ACTION | Self::ITEM_TYPE | Self::SPECIAL) == 0
     }
 }
 
@@ -123,54 +148,122 @@ impl std::ops::BitOrAssign for EventFlags {
 pub enum EventAction {
     /// All historical events have been delivered; live events follow.
     HistoryDone,
-    /// The stream can no longer be trusted for this volume (event IDs
-    /// wrapped, the root changed, or the watched volume was unmounted):
-    /// rescan the whole volume.
+    /// The stream can no longer be trusted for anything it watches (event
+    /// IDs wrapped, events dropped, the root changed, or the watched volume
+    /// was unmounted): rescan the whole volume.
     RescanVolume,
-    /// Events below this directory were coalesced or dropped: rescan it and
+    /// Events below this directory were coalesced, or the directory's
+    /// contents changed in a way only a listing shows: rescan it and
     /// everything below it.
     RescanSubtree(PathBuf),
     /// Something may have changed at this path: stat it and update the
     /// index (insert, update or remove).
     CheckPath(PathBuf),
+    /// A metadata change on a folder above the scope root: nothing the
+    /// index holds changed.
+    Ignore,
 }
 
 /// Classifies one event.
 ///
+/// `scope_root` is the root of what the stream delivers, in the form the
+/// stream hands out paths: pass `VolumeStream::scope_root()` (macOS), which
+/// is the stream's path filter, or its volume's mount point (`/`,
+/// `/Volumes/X`, `/System/Volumes/Data`) when it has none.
+///
 /// Priority, highest first:
 ///
-/// 1. `HistoryDone` gives [`EventAction::HistoryDone`].
+/// 1. `HistoryDone` gives [`EventAction::HistoryDone`] (`FSEvents.h`: the
+///    path is to be ignored).
 /// 2. `EventIdsWrapped`, `RootChanged` (which only a `WatchRoot` stream
-///    reports; treated as volume-level wherever it appears), or `Unmount`
-///    of the watched volume itself give [`EventAction::RescanVolume`]. The
-///    watched volume is named by a path equal to `volume_root` (component
-///    wise, so a trailing slash does not matter) or by `""`, `"/"` or `"."`
-///    (the root of a device-relative stream).
-/// 3. `MustScanSubDirs`, `UserDropped` or `KernelDropped` give
+///    reports; treated as volume-level wherever it appears), `UserDropped`
+///    or `KernelDropped` on any path, or `Unmount` of the scope root or the
+///    volume root, give [`EventAction::RescanVolume`]. The volume root is
+///    named by `""`, `"/"` or `"."` (the root of a device-relative
+///    stream); paths are compared component-wise, so a trailing slash does
+///    not matter.
+/// 3. An event on a folder strictly above the scope root (an ancestor of
+///    it, or the volume root) gives
+///    [`EventAction::RescanSubtree`]`(scope_root)` when it asks for a
+///    subtree rescan, mounts or unmounts a volume there, creates, removes
+///    or renames the folder (the scope root moved, went away or came back:
+///    what a `WatchRoot` stream would report as RootChanged), or is a
+///    directory-level event; any other event there (a metadata change) is
+///    [`EventAction::Ignore`].
+/// 4. `Mount` on the scope root itself (a volume now hides what was
+///    indexed) gives [`EventAction::RescanSubtree`]`(scope_root)`.
+/// 5. `MustScanSubDirs`, or a directory-level event
+///    ([`EventFlags::is_directory_level`]), gives
 ///    [`EventAction::RescanSubtree`] on the path.
-/// 4. Anything else (every item-level event, any `Mount`, an `Unmount` of
-///    another volume or of a volume mounted inside the watched one, unknown
-///    bits) gives [`EventAction::CheckPath`]. The item flags are only hints,
-///    and renames are not paired: each side of a rename is checked on its
-///    own.
-///
-/// `volume_root` is the watched volume's mount path in the form the stream
-/// hands out paths: pass `VolumeStream::mount_point()` (macOS), e.g. `/`,
-/// `/Volumes/X` or `/System/Volumes/Data`.
+/// 6. Anything else (every item-level event, any other `Mount`, an
+///    `Unmount` of another volume or of a volume mounted inside the scope)
+///    gives [`EventAction::CheckPath`]. The item flags are only hints, and
+///    renames are not paired: each side of a rename is checked on its own.
 #[must_use]
-pub fn classify(path: &Path, flags: EventFlags, volume_root: &Path) -> EventAction {
+pub fn classify(path: &Path, flags: EventFlags, scope_root: &Path) -> EventAction {
     if flags.contains(EventFlags::HISTORY_DONE) {
         return EventAction::HistoryDone;
     }
     if flags.0 & EventFlags::VOLUME_RESCAN != 0
-        || (flags.contains(EventFlags::UNMOUNT) && (path == volume_root || is_volume_root(path)))
+        || (flags.contains(EventFlags::UNMOUNT) && (path == scope_root || is_volume_root(path)))
     {
         return EventAction::RescanVolume;
     }
-    if flags.0 & EventFlags::SUBTREE_RESCAN != 0 {
+    if is_above(path, scope_root) {
+        let rescans = flags.0
+            & (EventFlags::MUST_SCAN_SUB_DIRS.0
+                | EventFlags::MOUNT.0
+                | EventFlags::UNMOUNT.0
+                | EventFlags::NAMESPACE)
+            != 0;
+        return if rescans || flags.is_directory_level() {
+            EventAction::RescanSubtree(scope_root.to_path_buf())
+        } else {
+            EventAction::Ignore
+        };
+    }
+    if flags.contains(EventFlags::MOUNT) && path == scope_root {
+        return EventAction::RescanSubtree(scope_root.to_path_buf());
+    }
+    if flags.contains(EventFlags::MUST_SCAN_SUB_DIRS) || flags.is_directory_level() {
         return EventAction::RescanSubtree(path.to_path_buf());
     }
     EventAction::CheckPath(path.to_path_buf())
+}
+
+/// Whether a stream filtered to `filter` delivers this event
+/// (`StreamConfig::path_filter`, macOS).
+///
+/// Without a filter, everything. With one: events at or below it
+/// (component-wise), the HistoryDone marker, the volume-level flags
+/// (`EventIdsWrapped`, `RootChanged`, `UserDropped`, `KernelDropped`) on any
+/// path, and the events on a folder above it that [`classify`] does not
+/// ignore (they rescan the filtered root). Everything else concerns paths
+/// outside the filter. Dropping the events above the filter used to lose
+/// changes: a MustScanSubDirs coalesced onto a parent folder, dropped
+/// events reported on the volume root, and the filtered root moving away
+/// all went unseen.
+#[must_use]
+pub fn admit(path: &Path, flags: EventFlags, filter: Option<&Path>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if path.starts_with(filter)
+        || flags.0 & (EventFlags::HISTORY_DONE.0 | EventFlags::VOLUME_RESCAN) != 0
+    {
+        return true;
+    }
+    is_above(path, filter) && classify(path, flags, filter) != EventAction::Ignore
+}
+
+/// True for a folder strictly above `scope_root`: a proper ancestor of it
+/// (component-wise), or the root of a device-relative stream (`""`, `"/"`
+/// or `"."`) when the scope root is not itself the volume root.
+fn is_above(path: &Path, scope_root: &Path) -> bool {
+    if is_volume_root(path) {
+        return !is_volume_root(scope_root);
+    }
+    path != scope_root && scope_root.starts_with(path)
 }
 
 /// True for the root of a device-relative stream: `""`, `"/"` or `"."`.

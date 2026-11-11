@@ -266,10 +266,11 @@ and the SDK header `FSEvents.h`.
 | Item | OS | What it is |
 |------|----|------------|
 | `flags::EventFlags` | all | the raw `FSEventStreamEventFlags` word, with one constant per `kFSEventStreamEventFlag*` bit, plus `contains` / `intersects` / `bits` |
-| `flags::classify(path, flags, volume_root) -> EventAction` | all | pure per-event decision: `HistoryDone`, `RescanVolume`, `RescanSubtree(path)` or `CheckPath(path)`; `volume_root` is `VolumeStream::mount_point()` |
+| `flags::classify(path, flags, scope_root) -> EventAction` | all | pure per-event decision: `HistoryDone`, `RescanVolume`, `RescanSubtree(path)`, `CheckPath(path)` or `Ignore`; `scope_root` is `VolumeStream::scope_root()` |
+| `flags::admit(path, flags, filter) -> bool` | all | the stream's `path_filter` decision: what a filtered stream delivers |
 | `cursor::FsEventsCursor { event_id, db_uuid }` | all | a named-field view of `fx_model::ResumeCursor::FsEvents` (`From` / `TryFrom`); `to_bytes` / `from_bytes` with a fixed 24-byte layout |
 | `cursor::decide_start(saved, current_uuid, current_event_id)` | all | pure gap detection over a saved `ResumeCursor`; returns an `fx_model::StartOutcome` and the `sinceWhen` ID |
-| `cursor::CursorTracker` | all | pure bookkeeping behind `VolumeStream::cursor()`: `since_now` / `replay`, `on_event`, `on_history_done`, `cursor_id`, `history_done` |
+| `cursor::CursorTracker` | all | pure bookkeeping behind `VolumeStream::cursor()`: `since_now` / `replay`, `on_raw_event` (any event, by its flags), `on_event`, `on_history_done`, `on_ids_wrapped`, `cursor_id`, `history_done`, `dropped_before_cursor` |
 | `volume::current_event_id()` | macOS | `FSEventsGetCurrentEventId` |
 | `volume::volume_uuid(dev)` | macOS | `FSEventsCopyUUIDForDevice`, as 16 bytes, or `None` |
 | `volume::device_of(path)` | macOS | `st_dev` of a path |
@@ -278,7 +279,8 @@ and the SDK header `FSEvents.h`.
 | `stream::VolumeStream::start(config, from)` | macOS | starts a stream and returns it with the `StartOutcome` |
 | `VolumeStream::{recv_timeout, try_iter}` | macOS | receive `RawEvent { path, flags, id, received }` |
 | `VolumeStream::{cursor, history_done, flush_sync, stop}` | macOS | resume point, replay state, flush, and teardown (`Drop` also stops) |
-| `VolumeStream::mount_point()` | macOS | the watched volume's mount path in the stream's normalised form (`/`, `/Volumes/X`, `/System/Volumes/Data`); pass it to `classify` as `volume_root` |
+| `VolumeStream::mount_point()` | macOS | the watched volume's mount path in the stream's normalised form (`/`, `/Volumes/X`, `/System/Volumes/Data`) |
+| `VolumeStream::scope_root()` | macOS | the root of what the stream delivers: its `path_filter`, or `mount_point()` without one; pass it to `classify` as `scope_root` |
 | `stream::normalise_firmlinks(path)` | macOS | maps `/System/Volumes/Data/<firmlink>/...` back to `/<firmlink>/...` |
 
 `VolumeStream::start` creates one stream for the whole volume holding
@@ -313,8 +315,14 @@ callback has finished, then releases the stream and the queue.
   is the pure `CursorTracker`, unit-tested in `tests/fsevents_cursor.rs`.
 - On resume (`StartOutcome::Resumed`), FSEvents replays the history after
   the saved ID, then sends the HistoryDone marker (reported with the mount
-  point as its path), then live events. The stream drops any event whose
-  ID is at or below the saved one, so a replay never repeats the past.
+  point as its path), then live events. The stream drops any item event
+  whose ID is at or below the saved one, so a replay never repeats the
+  past. Special events (a rescan request, a mount or unmount, RootChanged,
+  whose ID `FSEvents.h` gives as zero) are always delivered.
+- `EventIdsWrapped`: every earlier ID is meaningless. The event rescans the
+  volume; the tracker stops dropping events at or below the replay start
+  (every later ID is below it), ends the replay, and moves the cursor to
+  the wrap event's ID.
 - Resuming from an older ID than necessary is safe: it only repeats
   events, and every action is idempotent (`CheckPath` re-stats).
 
@@ -334,33 +342,47 @@ now, and its cursor carries the volume's real UUID.
 
 ### Flag-to-action table (`classify`)
 
-`classify(path, flags, volume_root)` takes the watched volume's mount path
-as `volume_root`; pass `VolumeStream::mount_point()`, which is in the same
+`classify(path, flags, scope_root)` takes the root of what the stream
+delivers as `scope_root`; pass `VolumeStream::scope_root()` (the path
+filter, or the volume's mount point without one), which is in the same
 normalised form as the event paths. Priority is from top to bottom; the
-first matching row wins.
+first matching row wins. Paths are compared component-wise.
 
 | Flags on the event | Action |
 |--------------------|--------|
 | `HistoryDone` | `HistoryDone`: replay finished; live events follow |
-| `EventIdsWrapped`, or `RootChanged` on any path | `RescanVolume` |
-| `Unmount` on the watched volume: a path equal to `volume_root` (a trailing slash does not matter), or `""`, `"/"` or `"."` | `RescanVolume` |
-| `MustScanSubDirs`, `UserDropped` or `KernelDropped` | `RescanSubtree(path)` |
-| any `Mount` | `CheckPath(path)` |
-| any other `Unmount` (another volume, or one mounted inside the watched volume) | `CheckPath(path)` |
-| any `Item*` flag (`Created`, `Removed`, `Renamed`, `Modified`, `InodeMetaMod`, `FinderInfoMod`, `ChangeOwner`, `XattrMod`, `Cloned`, hard-link flags) | `CheckPath(path)` |
-| unknown bits, or no flags | `CheckPath(path)` |
+| `EventIdsWrapped`, `RootChanged`, `UserDropped` or `KernelDropped`, on any path | `RescanVolume` |
+| `Unmount` of the scope root (a trailing slash does not matter), or of `""`, `"/"` or `"."` | `RescanVolume` |
+| on a folder above the scope root: `MustScanSubDirs`, `Mount`, `Unmount`, `ItemCreated`, `ItemRemoved`, `ItemRenamed`, or no item bit | `RescanSubtree(scope_root)` |
+| on a folder above the scope root: anything else (metadata) | `Ignore` |
+| `Mount` on the scope root | `RescanSubtree(scope_root)` |
+| `MustScanSubDirs` | `RescanSubtree(path)` |
+| no item bit and no special bit (`kFSEventStreamEventFlagNone`, possibly with `OwnEvent` or unknown bits) | `RescanSubtree(path)` |
+| any other `Mount` or `Unmount` (below the scope root) | `CheckPath(path)` |
+| any `Item*` flag (`Created`, `Removed`, `Renamed`, `Modified`, `InodeMetaMod`, `FinderInfoMod`, `ChangeOwner`, `XattrMod`, `Cloned`, type and hard-link flags), with or without `OwnEvent` | `CheckPath(path)` |
+
+Why the rescans (`FSEvents.h`): with `UserDropped` or `KernelDropped` "the
+client must do a full scan of any directories (and their subdirectories,
+recursively) being monitored by this stream"; `MustScanSubDirs` comes from
+hierarchical coalescing, so it can name a folder above the scope root (the
+header's example coalesces events in a user's `Music` and `Pictures`
+folders into one on the user's home folder); `kFSEventStreamEventFlagNone`
+means "some change in the directory", which only a listing shows. A folder
+above the scope root that is created, removed or renamed has moved the
+indexed root, which is what a `WatchRoot` stream would report as
+`RootChanged`.
 
 Item flags are only hints. The kernel coalesces events, so one event can
 carry `Created | Renamed | Removed` for a path that no longer exists. The
 safe reaction is always to stat the path again. The two sides of a rename
 are separate, unpaired events, and each is checked on its own.
 
-During replay only, the stream adds `MustScanSubDirs` to every directory
-rename (`ItemRenamed | ItemIsDir`). The history store does not replay
-events recorded below a directory that was renamed later; only the
+During replay only, the stream sets `RawEvent::rescan_subtree` on every
+directory rename (`ItemRenamed | ItemIsDir`). The history store does not
+replay events recorded below a directory that was renamed later; only the
 directory's own rename (old and new name) comes back. So the subtree below
-both names must be rescanned. Live events pass through unchanged. So
-`RawEvent::flags` is the kernel word except for this added bit. The
+both names must be rescanned. `RawEvent::flags` is always the exact kernel
+word. The
 offline-replay test and `fsevents_bench replay` both print how many
 scripted paths were reported directly and how many were covered only by
 such an added rescan, so the strength of the replay gate is visible.
@@ -400,26 +422,28 @@ These were observed on macOS on Apple silicon (M4 Pro):
 `FsEventsSource` turns every event into an `fx_model::Change` (see
 `src/fsevents/change.rs`), and the engine applies it:
 
-- `MustScanSubDirs`, alone or with `UserDropped` or `KernelDropped`, and
-  every directory rename (including the replay-time renames above):
-  rescan the subtree.
-- `EventIdsWrapped`, `RootChanged` and `Unmount` of the watched volume:
-  rescan the volume. `Mount` of another volume is only a path check:
-  external volumes are out of scope (see the scanner policy above).
+- `MustScanSubDirs`, a flag word with no item bit, and every directory
+  rename (including the replay-time renames above): rescan the subtree.
+- `EventIdsWrapped`, `RootChanged`, `UserDropped`, `KernelDropped` and
+  `Unmount` of the scope root: rescan the volume. `Mount` of another volume
+  below the scope root is only a path check: external volumes are out of
+  scope (see the scanner policy above).
+- An event on a folder above the scope root that rescans, mounts over,
+  creates, removes or renames it: rescan the scope root. A metadata change
+  there changes nothing indexed.
 - A gap at start (see the gap rules): the engine rescans the volume and
   streams from now.
 - The cursor saved with a checkpoint stays at the replay start until the
   HistoryDone marker, because replay arrives in path order, not ID order.
-- With a `path_filter`, a rescan event (`MustScanSubDirs`, `UserDropped`,
-  `KernelDropped`, `EventIdsWrapped`, `RootChanged`) reported on the
-  volume's mount point or on an ancestor of the filter is delivered as a
-  rescan of the filter's folder. FSEvents reports the events it dropped
-  that way: the soak, on a busy Mac, saw bursts of `MustScanSubDirs |
-  UserDropped` on `/System/Volumes/Data`, live and at the start of a
-  replay, and the filter used to hide them, so the changes they stood for
-  were lost. Any other event outside the filter is dropped. The app
-  filters its stream to the indexed root, `/` by default, so the volume
-  root's rescan reaches it unchanged.
+- A `path_filter` passes the events above it that rescan it, and the
+  volume-level flags on any path (`flags::admit`), so a rescan reported on
+  a folder above the indexed root, or the root moving away and back, is
+  seen. The app filters its stream to the indexed root, `/` by default.
+- Every route is tested end to end in `fx-engine`'s `tests/macos_e2e.rs`:
+  the real stream is muted while files change, the test checks that the
+  index missed the changes, then injects the one raw event FSEvents would
+  send, routed as `FsEventsSource` routes it; the index must then equal a
+  fresh scan. FSEvents cannot be made to send these flags on demand.
 
 ## Benchmark: `fsevents_bench`
 
