@@ -7,7 +7,15 @@
 //! CI workflow.
 //!
 //! The library holds helpers other crates' tests use as a dev-dependency:
-//! [`crash`] runs a test binary's own test as a child process and kills it
-//! with SIGKILL, for the crash-safety tests. Std only.
+//!
+//! - [`crash`] runs a test binary's own test as a child process and kills
+//!   it with SIGKILL, for the crash-safety tests;
+//! - [`soak`] draws a seeded stream of random file operations with a model
+//!   of the tree it builds, applies it to a real folder and compares
+//!   listings, for the engine's soak (`crates/fx-engine/examples/soak.rs`)
+//!   and fuzz test (`crates/fx-engine/tests/fuzz.rs`).
+//!
+//! Std only.
 
 pub mod crash;
+pub mod soak;
