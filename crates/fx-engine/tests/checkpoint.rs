@@ -500,6 +500,97 @@ fn corrupt_store_triggers_a_rebuild() {
     engine2.shutdown();
 }
 
+/// Rewrites the store at `path` with its saved orders changed by `damage`
+/// (given each order's key code); the columns, the cursor and the flags
+/// stay as they are. The new file's checksums cover the changed orders,
+/// as a build that sorts by other rules would have written them.
+fn rewrite_orders(path: &Path, damage: impl Fn(u8, &mut Vec<u32>)) {
+    let mapped = MappedIndex::open(path).expect("store loads");
+    mapped.verify_checksums().expect("store checksums");
+    let parts = mapped.to_parts();
+    let volumes = mapped.cursors().to_vec();
+    let clean = mapped.clean_shutdown();
+    let orders: Vec<(u8, Vec<u32>)> = mapped
+        .orders()
+        .into_iter()
+        .map(|(code, ids)| {
+            let mut ids = ids.to_vec();
+            damage(code, &mut ids);
+            (code, ids)
+        })
+        .collect();
+    drop(mapped);
+    let orders: Vec<(u8, &[u32])> = orders.iter().map(|(c, ids)| (*c, ids.as_slice())).collect();
+    fx_store::write_checkpoint(
+        path,
+        &fx_store::SaveInput {
+            parts: &parts,
+            volumes: &volumes,
+            orders: &orders,
+            clean_shutdown: clean,
+        },
+    )
+    .expect("rewrite the store");
+}
+
+#[test]
+fn saved_orders_out_of_key_order_are_rebuilt_at_open() {
+    // Each case: what is done to the saved orders, and to which one (by
+    // key code: 1 Name, 2 Path, 3 Size, 4 Modified; `None` for all four).
+    // Every damaged order is still a checksummed permutation of the live
+    // entries, so only the check of the key order can reject it; the engine
+    // merges changes into its orders, so it must not keep a wrong one.
+    type Damage = fn(&mut Vec<u32>);
+    let reverse: Damage = |ids| ids.reverse();
+    let swap_ends: Damage = |ids| {
+        let last = ids.len() - 1;
+        ids.swap(0, last);
+    };
+    let rotate: Damage = |ids| ids.rotate_left(1);
+    let swap_middle: Damage = |ids| {
+        let mid = ids.len() / 2;
+        ids.swap(mid - 1, mid);
+    };
+    let cases: [(&str, Option<u8>, Damage); 8] = [
+        ("reversed", None, reverse),
+        ("ends swapped", None, swap_ends),
+        ("rotated", None, rotate),
+        ("neighbours swapped", None, swap_middle),
+        ("Name reversed", Some(1), reverse),
+        ("Path ends swapped", Some(2), swap_ends),
+        ("Size rotated", Some(3), rotate),
+        ("Modified neighbours swapped", Some(4), swap_middle),
+    ];
+    for (what, target, damage) in cases {
+        let dir = TempDir::new("unsorted-orders");
+        let store = dir.store();
+        let tree = sample_tree();
+        let source = FakeSource::new(StartOutcome::Resumed);
+        let (engine, _) = first_run(&tree, &source, &store);
+        engine.shutdown();
+        rewrite_orders(&store, |code, ids| {
+            if target.is_none_or(|t| t == code) {
+                damage(ids);
+            }
+        });
+
+        let source2 = FakeSource::new(StartOutcome::Resumed);
+        let engine2 = open(&tree, &source2, store_config(&store));
+        // The first snapshot already sorts right: the store's orders were
+        // rebuilt, not served.
+        let first = engine2.snapshot();
+        assert_eq!(snapshot_entries(&first), tree.entries(), "{what}");
+        assert_orders_match(&first);
+
+        // Changes merged into the orders keep them right.
+        let changes = offline_changes(&tree);
+        source2.push(changes);
+        let snap = wait_for_tree(&engine2, &tree, what);
+        assert_orders_match(&snap);
+        engine2.shutdown();
+    }
+}
+
 #[test]
 fn garbage_store_file_triggers_a_rebuild() {
     let dir = TempDir::new("garbage");
