@@ -10,7 +10,9 @@
 //! - The **delta** holds entries appended since the last compaction (IDs
 //!   `base_len..`) and overrides for base entries whose name, parent or
 //!   metadata changed. It is behind an `Arc` and copied on write, so a
-//!   snapshot keeps the delta it saw.
+//!   snapshot keeps the delta it saw. A bitmap over the base marks the
+//!   overridden entries, so reading an untouched base entry never consults
+//!   the overrides' map.
 //! - The **deletion bitset** has one bit per ID (base and delta), set when
 //!   the entry is removed. Also `Arc`, copy on write.
 //!
@@ -229,6 +231,12 @@ pub(crate) struct Delta {
     /// updated. Kept when the entry is later removed, so its dead slot
     /// reads back its last stored values.
     pub(crate) overrides: HashMap<u32, Row>,
+    /// One bit per base entry, set when `overrides` holds a row for it, so
+    /// a read of an untouched base entry (nearly all of them) is one bit
+    /// test instead of a hash and a probe of the map: a search re-run reads
+    /// every row. Empty until the first override; see
+    /// [`is_overridden`](Delta::is_overridden).
+    pub(crate) overridden: Vec<u64>,
     /// Keys of the live entries in `new`.
     pub(crate) keys: HashMap<FileKey, u32>,
     /// Bytes the delta's names will take in the name buffer (name plus
@@ -241,12 +249,32 @@ impl Delta {
         self.new.len() + self.overrides.len()
     }
 
-    /// Bytes of the delta's rows, override map and key map, without the
-    /// names the rows own (see [`name_bytes`](Delta::name_bytes)).
+    /// Whether base entry `i` has a row in `overrides`.
+    pub(crate) fn is_overridden(&self, i: usize) -> bool {
+        self.overridden
+            .get(i / 64)
+            .is_some_and(|word| word & (1 << (i % 64)) != 0)
+    }
+
+    /// Stores `row` as the override of base entry `i` of a base of
+    /// `base_len` entries, marking it in the bitmap (allocated here, at the
+    /// first override).
+    pub(crate) fn set_override(&mut self, i: usize, base_len: usize, row: Row) {
+        debug_assert!(i < base_len, "override of base entry {i} of {base_len}");
+        if self.overridden.is_empty() {
+            self.overridden = vec![0; base_len.div_ceil(64)];
+        }
+        self.overridden[i / 64] |= 1 << (i % 64);
+        self.overrides.insert(i as u32, row);
+    }
+
+    /// Bytes of the delta's rows, override map and bitmap and key map,
+    /// without the names the rows own (see [`name_bytes`](Delta::name_bytes)).
     pub(crate) fn row_bytes(&self) -> usize {
         let row = size_of::<Row>();
         self.new.capacity() * row
             + self.overrides.capacity() * (size_of::<u32>() + row + 1)
+            + self.overridden.capacity() * size_of::<u64>()
             + self.keys.capacity() * (size_of::<(FileKey, u32)>() + 1)
     }
 }
@@ -343,6 +371,11 @@ impl State {
         let i = id.index();
         let base_len = self.base.len();
         if i < base_len {
+            // The bitmap first: most base entries have no override, and a
+            // lookup in the map hashes the ID even when it isn't there.
+            if !self.delta.is_overridden(i) {
+                return Slot::Base(i);
+            }
             match self.delta.overrides.get(&id.0) {
                 Some(row) => Slot::Row(row),
                 None => Slot::Base(i),

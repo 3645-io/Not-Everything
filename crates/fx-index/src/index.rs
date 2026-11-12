@@ -507,7 +507,7 @@ impl Index {
     /// Whether base entry `m` is live and still stored in the base (not
     /// overridden by a delta row, which [`DeltaKids`] lists instead).
     fn base_current(&self, m: u32) -> bool {
-        !self.state.deleted.get(m as usize) && !self.state.delta.overrides.contains_key(&m)
+        !self.state.deleted.get(m as usize) && !self.state.delta.is_overridden(m as usize)
     }
 
     /// The live delta rows under `parent` (named `name`, if given), new
@@ -623,7 +623,7 @@ impl Index {
         };
         delta.name_bytes = delta.name_bytes - old_bytes + row.name.len() + 1;
         if i < base_len {
-            delta.overrides.insert(id.0, row);
+            delta.set_override(i, base_len, row);
         } else {
             delta.new[i - base_len] = row;
         }

@@ -79,6 +79,18 @@ impl<T: Pod> Column<T> {
         }
     }
 
+    /// Number of values. Unlike the slice's `len` through `Deref`, it
+    /// doesn't look at a shared column's backing: [`Base::len`] asks for it
+    /// on every row read.
+    ///
+    /// [`Base::len`]: crate::store::Base::len
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Column::Owned(values) => values.len(),
+            Column::Shared { len, .. } => *len,
+        }
+    }
+
     pub(crate) fn push(&mut self, value: T) {
         self.to_mut().push(value);
     }
