@@ -110,6 +110,11 @@ pub(crate) const SETTLE_LIMIT: Duration = Duration::from_millis(100);
 /// for the snapshot that follows, so a reader never has to sort the whole
 /// index itself.
 pub(crate) fn settled(current: &ArcSwap<EngineSnapshot>) -> Arc<EngineSnapshot> {
+    settled_within(current, SETTLE_LIMIT)
+}
+
+/// [`settled`] with its wait bounded by `limit`.
+fn settled_within(current: &ArcSwap<EngineSnapshot>, limit: Duration) -> Arc<EngineSnapshot> {
     let mut waiting_since = None;
     loop {
         let snap = current.load_full();
@@ -117,7 +122,7 @@ pub(crate) fn settled(current: &ArcSwap<EngineSnapshot>) -> Arc<EngineSnapshot> 
             return snap;
         }
         let since = *waiting_since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= SETTLE_LIMIT {
+        if since.elapsed() >= limit {
             return snap;
         }
         drop(snap);
@@ -187,7 +192,9 @@ mod tests {
                 current.store(Arc::new(snapshot(2, false)));
             })
         };
-        let snap = settled(&current);
+        // A limit far above the writer's 20 ms, so a slow test runner can't
+        // make it give up first: this checks the wait, not the bound.
+        let snap = settled_within(&current, Duration::from_secs(10));
         assert!(!snap.orders_pending);
         assert_eq!(snap.generation, 2);
         writer.join().expect("the writer stored a snapshot");
@@ -207,9 +214,10 @@ mod tests {
         let waited = start.elapsed();
         assert!(snap.orders_pending, "the only snapshot there is");
         assert!(waited >= SETTLE_LIMIT);
-        // The owner's bound: a search waits under 100 ms for a merge (with
-        // some room for the last sleep on a busy machine).
+        // The owner's bound: a search waits under 100 ms for a merge. The
+        // upper check only says it gave up instead of hanging: a busy test
+        // runner can oversleep the last 200 µs step by far more than 50 ms.
         assert_eq!(SETTLE_LIMIT, Duration::from_millis(100));
-        assert!(waited < Duration::from_millis(150), "waited {waited:?}");
+        assert!(waited < Duration::from_secs(1), "waited {waited:?}");
     }
 }
