@@ -1,7 +1,10 @@
 //! Immutable snapshots published by the writer thread.
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use fx_model::{EntryId, ResumeCursor};
 use fx_sort::{MatchSet, Order, SortKey};
 
@@ -86,6 +89,44 @@ pub struct EngineSnapshot {
     pub(crate) hide_offline: bool,
     /// The priority group of this index; `None` without priority folders.
     pub(crate) priority: Option<Arc<MatchSet>>,
+    /// Published only while the writer merges a batch into the orders in
+    /// place: the previous snapshot without its orders, which the writer
+    /// took over. [`settled`] waits for the snapshot that follows.
+    pub(crate) orders_pending: bool,
+}
+
+/// The longest [`settled`] waits for the writer to finish merging the
+/// orders in place: the owner's bound (11 Nov) for a search waiting on a
+/// hidden merge. The writer merges in place only when it expects to finish
+/// well inside it (`writer::IN_PLACE_BUDGET`). Past it, `settled` returns
+/// the snapshot without orders, which is still correct: a search builds the
+/// order it needs on the spot (`order_or_build`), and a save writes the
+/// store without orders, which are then built at the next launch.
+pub(crate) const SETTLE_LIMIT: Duration = Duration::from_millis(100);
+
+/// The latest published snapshot whose orders are in place.
+///
+/// While no window shows, the writer merges a batch into the sort orders in
+/// place when no reader holds them, instead of copying all four (16 B per
+/// entry, about 51 MB at 3.2M entries) while the published snapshot still
+/// holds the old ones. For the few milliseconds of the merge it publishes
+/// the previous snapshot without its orders (`orders_pending`); this waits
+/// for the snapshot that follows, so a reader never has to sort the whole
+/// index itself.
+pub(crate) fn settled(current: &ArcSwap<EngineSnapshot>) -> Arc<EngineSnapshot> {
+    let mut waiting_since = None;
+    loop {
+        let snap = current.load_full();
+        if !snap.orders_pending {
+            return snap;
+        }
+        let since = *waiting_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= SETTLE_LIMIT {
+            return snap;
+        }
+        drop(snap);
+        thread::sleep(Duration::from_micros(200));
+    }
 }
 
 impl EngineSnapshot {
@@ -111,7 +152,9 @@ impl EngineSnapshot {
     }
 
     /// The merged order for `key`, or `None` if the engine does not keep it
-    /// (see [`ENGINE_SORT_KEYS`]).
+    /// (see [`ENGINE_SORT_KEYS`]). Also `None` for every key in the one
+    /// case where the engine publishes a snapshot without its orders: its
+    /// writer failed while merging a batch into them in place.
     pub fn order(&self, key: SortKey) -> Option<&Order> {
         self.orders.iter().find(|o| o.key == key)
     }
@@ -136,5 +179,57 @@ impl EngineSnapshot {
     /// priority folders.
     pub fn priority_group(&self) -> Option<&MatchSet> {
         self.priority.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(generation: u64, orders_pending: bool) -> EngineSnapshot {
+        EngineSnapshot {
+            index: fx_index::Index::new().snapshot(),
+            orders: Arc::new(Vec::new()),
+            cursor: None,
+            generation,
+            priority: None,
+            orders_pending,
+        }
+    }
+
+    #[test]
+    fn settled_waits_for_the_snapshot_after_a_merge_in_place() {
+        let current = Arc::new(ArcSwap::from_pointee(snapshot(1, true)));
+        let writer = {
+            let current = Arc::clone(&current);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                current.store(Arc::new(snapshot(2, false)));
+            })
+        };
+        let snap = settled(&current);
+        assert!(!snap.orders_pending);
+        assert_eq!(snap.generation, 2);
+        writer.join().expect("the writer stored a snapshot");
+    }
+
+    #[test]
+    fn settled_returns_a_settled_snapshot_at_once() {
+        let current = ArcSwap::from_pointee(snapshot(4, false));
+        assert_eq!(settled(&current).generation, 4);
+    }
+
+    #[test]
+    fn settled_gives_up_on_a_merge_that_never_ends() {
+        let current = ArcSwap::from_pointee(snapshot(1, true));
+        let start = Instant::now();
+        let snap = settled(&current);
+        let waited = start.elapsed();
+        assert!(snap.orders_pending, "the only snapshot there is");
+        assert!(waited >= SETTLE_LIMIT);
+        // The owner's bound: a search waits under 100 ms for a merge (with
+        // some room for the last sleep on a busy machine).
+        assert_eq!(SETTLE_LIMIT, Duration::from_millis(100));
+        assert!(waited < Duration::from_millis(150), "waited {waited:?}");
     }
 }

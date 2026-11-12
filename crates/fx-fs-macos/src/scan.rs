@@ -67,7 +67,6 @@ use std::ffi::{OsStr, c_int, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -77,6 +76,7 @@ use crate::attrbuf::{
     ATTR_BIT_MAP_COUNT, Descend, Entries, EntryKind, REQUESTED_DIR_ATTRS, REQUESTED_FILE_ATTRS,
     REQUESTED_OPTIONS, RawEntry, SkipReason, WALKER_COMMON_ATTRS, descend_decision,
 };
+use crate::budget;
 use crate::cloud::{OpenSkip, classify_open_error};
 use crate::firmlinks::{DATA_VOLUME, FirmlinkMap};
 use crate::volumes::{ExternalVolumes, MountPolicy, list_mounts, mount_policy_with};
@@ -232,7 +232,25 @@ pub struct ScanOptions {
     /// [`ExternalVolumes::indexes`] accepts is walked like any folder.
     /// `None` (the default) enters no mount below the root.
     pub external_volumes: Option<ExternalVolumes>,
+    /// Heap, in bytes, that the entries a streaming scan has listed and its
+    /// receiver hasn't taken yet may hold ([`crate::budget`]). Used by
+    /// [`MacScanner`](crate::enumerator::MacScanner).
+    pub stream_budget: usize,
 }
+
+/// Default [`ScanOptions::stream_budget`]: 1 MiB, about nine chunks of
+/// entries. Measured on an M4 Pro over a 3.2M-entry disk (`rescan_bench`,
+/// `first_run_bench`): a rescan's walk peaked at 37 MB of heap with any
+/// budget from 256 KiB to 4 MiB, against 76 to 84 MB with the 256-message
+/// channel before it, and neither the rescan nor the first scan got
+/// slower. A larger budget only holds more: on a tree of small folders,
+/// 8 MiB held more than the 256 messages did.
+pub const DEFAULT_STREAM_BUDGET: usize = 1 << 20;
+
+/// The most entries a streaming scan sends in one message: a big folder's
+/// entries go in several, so no message (and no walker's pending list)
+/// outgrows the budget.
+pub const STREAM_CHUNK: usize = 1024;
 
 /// An exclusion engine that excludes nothing.
 fn no_exclusions() -> Exclusions {
@@ -248,6 +266,7 @@ impl Default for ScanOptions {
             buf_size: DEFAULT_BUF_SIZE,
             exclusions: no_exclusions(),
             external_volumes: None,
+            stream_budget: DEFAULT_STREAM_BUDGET,
         }
     }
 }
@@ -464,7 +483,7 @@ struct Ctx<'a> {
     exclusions: &'a Exclusions,
     /// Where a streaming scan ([`scan_streaming`]) sends each directory's
     /// entries; `None` for a collecting scan.
-    emit: Option<&'a SyncSender<Vec<ScannedEntry>>>,
+    emit: Option<&'a budget::Sender<Vec<ScannedEntry>>>,
 }
 
 /// Per-thread walker state.
@@ -758,6 +777,11 @@ impl<'a> Worker<'a> {
                 parent_key: self.cur_key,
             });
             self.parent_workers.push(dir.worker);
+            if self.ctx.emit.is_some() && self.entries.len() >= STREAM_CHUNK {
+                // A big folder goes in chunks. Its subfolders are queued
+                // only after its last chunk, so the order holds.
+                self.flush();
+            }
             (self.id, index)
         } else {
             (NONE, NONE)
@@ -797,10 +821,12 @@ impl<'a> Worker<'a> {
     }
 
     /// In a streaming scan, sends the entries recorded since the last call
-    /// (one directory's). Called after a directory is scanned and before
-    /// its subdirectories are queued, so every directory's own entry is
-    /// sent before any of its children can be listed: the receiver gets
-    /// each entry after its parent, whichever worker lists what.
+    /// (one directory's, or a chunk of a big one's), first waiting while
+    /// the receiver is a budget's worth behind. Called after a directory is
+    /// scanned and before its subdirectories are queued, so every
+    /// directory's own entry is sent before any of its children can be
+    /// listed: the receiver gets each entry after its parent, whichever
+    /// worker lists what.
     fn flush(&mut self) {
         let Some(tx) = self.ctx.emit else {
             return;
@@ -810,9 +836,10 @@ impl<'a> Worker<'a> {
         }
         let batch = std::mem::take(&mut self.entries);
         self.parent_workers.clear();
+        let bytes = batch_bytes(&batch);
         // A receiver that hung up gets nothing more; the walk still ends
         // normally with its counters.
-        let _ = tx.send(batch);
+        let _ = tx.send(batch, bytes);
     }
 
     /// Single-threaded walk of everything queued in `self.children`.
@@ -892,28 +919,40 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
 }
 
 /// Scans like [`scan`], but sends the entries to `out` as the walk lists
-/// them, one directory's entries per message, instead of collecting them
-/// all: a caller that consumes them as they come never holds every entry
-/// at once (run 2.17). Every entry arrives after its parent directory's
-/// own entry; entries directly in the root, and below a traverse-only
-/// directory, arrive with a parent that is never sent. `parent` indices
-/// are not meaningful; `parent_key` is. Returns the counters (`entries` of
-/// the result is `None`). `out` should be bounded, so a slow receiver
+/// them, one directory's entries per message (at most [`STREAM_CHUNK`]),
+/// instead of collecting them all: a caller that consumes them as they
+/// come never holds every entry at once (run 2.17). Every entry arrives
+/// after its parent directory's own entry; entries directly in the root,
+/// and below a traverse-only directory, arrive with a parent that is never
+/// sent. `parent` indices are not meaningful; `parent_key` is. Returns the
+/// counters (`entries` of the result is `None`). `out`'s budget bounds the
+/// heap held by entries the receiver hasn't taken yet, so a slow receiver
 /// slows the walk instead of letting entries pile up.
 pub fn scan_streaming(
     root: &Path,
     opts: &ScanOptions,
-    out: &SyncSender<Vec<ScannedEntry>>,
+    out: &budget::Sender<Vec<ScannedEntry>>,
 ) -> io::Result<ScanStats> {
     let mut opts = opts.clone();
     opts.collect = true;
     scan_inner(root, &opts, Some(out)).map(|r| r.stats)
 }
 
+/// The heap a batch of listed entries holds, as the streaming scan counts
+/// it against its budget: the batch's buffer and every name, rounded up to
+/// the allocator's 16-byte quantum.
+fn batch_bytes(batch: &Vec<ScannedEntry>) -> usize {
+    let names: usize = batch
+        .iter()
+        .map(|e| e.name.len().next_multiple_of(16))
+        .sum();
+    batch.capacity() * std::mem::size_of::<ScannedEntry>() + names
+}
+
 fn scan_inner(
     root: &Path,
     opts: &ScanOptions,
-    emit: Option<&SyncSender<Vec<ScannedEntry>>>,
+    emit: Option<&budget::Sender<Vec<ScannedEntry>>>,
 ) -> io::Result<ScanResult> {
     let start = Instant::now();
     let root_bytes = root.as_os_str().as_bytes();

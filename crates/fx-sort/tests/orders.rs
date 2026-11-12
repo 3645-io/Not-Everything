@@ -16,7 +16,13 @@
 //!   - Path: component-wise from the root, each component by the Name rule
 //!     (including its EntryId), a shorter prefix first.
 //!   - Size / Modified / Created: the numeric key, then the Name rule.
-//! - `order.validate(&src)` accepts a correct order and rejects broken ones.
+//! - `order.validate(&src)` accepts a correct order and rejects broken ones,
+//!   exactly as checking every pair of neighbours with `SortKey::compare`
+//!   would, even over a source with broken parent links; checking a Path
+//!   order reads each entry's parent about once, not once per ancestor.
+//! - `Order::validate_all(&orders, &src)` accepts exactly when every order
+//!   passes `validate`; with a Name order among them, it compares names
+//!   for that order only.
 //! - `MatchSet` collects from an iterator of `EntryId` and answers `contains`.
 //! - `emit(&order, &matches, Direction, offset: usize, limit: usize)` returns
 //!   `Page { total: usize, ids: Vec<u32> }`: the full match count and only the
@@ -498,6 +504,265 @@ fn validate_rejects_broken_orders() {
             key_name(key)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Validation: the same verdicts as the plain rule, for less work.
+// ---------------------------------------------------------------------------
+
+/// The validation rule written out plainly: a permutation of the live IDs
+/// whose every pair of neighbours is in strictly ascending key order.
+fn plainly_valid<S: SortSource>(order: &Order, src: &S) -> bool {
+    let mut ids = order.ids.clone();
+    ids.sort_unstable();
+    ids == live_ids(src)
+        && order.ids.windows(2).all(|pair| {
+            order.key.compare(src, EntryId(pair[0]), EntryId(pair[1])) == std::cmp::Ordering::Less
+        })
+}
+
+/// A random forest with broken parent links, as a damaged index could hold:
+/// live entries under removed folders, entries that name themselves as
+/// their parent, and a folder and its child that are each other's parent.
+fn tangled_mock(seed: u64, n: usize) -> Mock {
+    let mut m = random_mock(seed, n);
+    let mut rng = Rng::new(seed ^ 0x7A7A);
+    let dead: Vec<u32> = (0..n as u32).filter(|&i| !m.live[i as usize]).collect();
+    let live: Vec<u32> = (0..n as u32).filter(|&i| m.live[i as usize]).collect();
+    for _ in 0..n / 50 {
+        let id = *rng.pick(&live) as usize;
+        m.parents[id] = if rng.chance(50) && !dead.is_empty() {
+            EntryId(*rng.pick(&dead))
+        } else {
+            EntryId(id as u32)
+        };
+    }
+    let child = live.iter().copied().rev().find(|&c| {
+        let p = m.parents[c as usize];
+        !p.is_none() && p.0 != c && m.live[p.index()]
+    });
+    if let Some(child) = child {
+        let p = m.parents[child as usize];
+        m.parents[p.index()] = EntryId(child);
+    }
+    m
+}
+
+/// Damages `ids` in the way `case` picks: none, a swap of neighbours or of
+/// any two, a block moved, the whole order reversed, a removed or repeated
+/// ID, or one ID missing.
+fn damage(ids: &mut Vec<u32>, rng: &mut Rng, case: usize, dead: Option<u32>) {
+    let n = ids.len();
+    if n < 2 {
+        return;
+    }
+    match case % 8 {
+        0 => {}
+        1 => {
+            let i = rng.below(n - 1);
+            ids.swap(i, i + 1);
+        }
+        2 => {
+            let (i, j) = (rng.below(n), rng.below(n));
+            ids.swap(i, j);
+        }
+        3 => {
+            let (a, b) = (rng.below(n), rng.below(n));
+            let (lo, hi) = (a.min(b), a.max(b) + 1);
+            let by = rng.below(hi - lo);
+            ids[lo..hi].rotate_left(by);
+        }
+        4 => ids.reverse(),
+        5 => {
+            if let Some(dead) = dead {
+                let i = rng.below(n);
+                ids[i] = dead;
+            }
+        }
+        6 => {
+            let i = rng.below(n);
+            let j = rng.below(n);
+            ids[j] = ids[i];
+        }
+        _ => {
+            ids.remove(rng.below(n));
+        }
+    }
+}
+
+fn first_dead<S: SortSource>(src: &S) -> Option<u32> {
+    (0..src.id_bound() as u32).find(|&i| !src.is_live(EntryId(i)))
+}
+
+#[test]
+fn validate_agrees_with_the_plain_rule_on_damaged_orders_and_sources() {
+    for seed in SEEDS {
+        for src in [random_mock(seed, 1500), tangled_mock(seed, 1500)] {
+            let mut rng = Rng::new(seed ^ 0x3C3C);
+            let dead = first_dead(&src);
+            for key in ALL_KEYS {
+                let built = Order::build(&src, key);
+                for case in 0..48 {
+                    let mut order = built.clone();
+                    damage(&mut order.ids, &mut rng, case, dead);
+                    assert_eq!(
+                        order.validate(&src).is_ok(),
+                        plainly_valid(&order, &src),
+                        "seed {seed}, key {}, case {case}",
+                        key_name(key)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn validate_all_agrees_with_checking_each_order() {
+    for seed in SEEDS {
+        for src in [random_mock(seed, 1500), tangled_mock(seed, 1500)] {
+            let mut rng = Rng::new(seed ^ 0x4D4D);
+            let dead = first_dead(&src);
+            let built: Vec<Order> = ALL_KEYS.iter().map(|&k| Order::build(&src, k)).collect();
+            for case in 0..96 {
+                let mut orders = built.clone();
+                let victim = rng.below(orders.len());
+                damage(&mut orders[victim].ids, &mut rng, case, dead);
+                // Without the Name order, or with it last.
+                match case % 3 {
+                    1 => {
+                        orders.remove(0);
+                    }
+                    2 => orders.rotate_left(1),
+                    _ => {}
+                }
+                let want = orders.iter().all(|o| plainly_valid(o, &src));
+                assert_eq!(
+                    Order::validate_all(&orders, &src).is_ok(),
+                    want,
+                    "seed {seed}, damaged {}, case {case}",
+                    key_name(built[victim].key)
+                );
+            }
+        }
+    }
+    let empty = random_mock(3, 0);
+    assert!(Order::validate_all(&[], &empty).is_ok());
+    let orders: Vec<Order> = ALL_KEYS.iter().map(|&k| Order::build(&empty, k)).collect();
+    assert!(Order::validate_all(&orders, &empty).is_ok());
+}
+
+/// Counts the names and parents a check reads.
+struct Counting<'a> {
+    src: &'a Mock,
+    names: std::sync::atomic::AtomicUsize,
+    parents: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> Counting<'a> {
+    fn new(src: &'a Mock) -> Self {
+        Counting {
+            src,
+            names: Default::default(),
+            parents: Default::default(),
+        }
+    }
+
+    fn names(&self) -> usize {
+        self.names.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn parents(&self) -> usize {
+        self.parents.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl SortSource for Counting<'_> {
+    fn id_bound(&self) -> usize {
+        self.src.id_bound()
+    }
+    fn is_live(&self, id: EntryId) -> bool {
+        self.src.is_live(id)
+    }
+    fn name(&self, id: EntryId) -> &str {
+        self.names
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.src.name(id)
+    }
+    fn parent(&self, id: EntryId) -> EntryId {
+        self.parents
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.src.parent(id)
+    }
+    fn size(&self, id: EntryId) -> u64 {
+        self.src.size(id)
+    }
+    fn modified(&self, id: EntryId) -> i64 {
+        self.src.modified(id)
+    }
+    fn created(&self, id: EntryId) -> i64 {
+        self.src.created(id)
+    }
+    fn kind(&self, id: EntryId) -> EntryKind {
+        self.src.kind(id)
+    }
+}
+
+/// `n` folders, each inside the one before.
+fn chain_mock(n: usize) -> Mock {
+    Mock {
+        names: (0..n).map(|i| format!("d{}", i % 7)).collect(),
+        parents: (0..n as u32)
+            .map(|i| {
+                if i == 0 {
+                    EntryId::NONE
+                } else {
+                    EntryId(i - 1)
+                }
+            })
+            .collect(),
+        live: vec![true; n],
+        sizes: vec![0; n],
+        modified: vec![0; n],
+        created: vec![0; n],
+        kinds: vec![EntryKind::Dir; n],
+    }
+}
+
+#[test]
+fn checking_a_path_order_reads_each_parent_about_once() {
+    // Comparing every pair of neighbours by path climbs to the root for
+    // each: on a deep chain, that is quadratic.
+    for src in [chain_mock(3000), random_mock(5, 3000)] {
+        let order = Order::build(&src, SortKey::Path);
+        let counting = Counting::new(&src);
+        order.validate(&counting).expect("a built order is valid");
+        let n = src.id_bound();
+        assert!(
+            counting.parents() <= 2 * n,
+            "{} parent reads for {n} entries",
+            counting.parents()
+        );
+    }
+}
+
+#[test]
+fn checking_orders_together_compares_names_only_for_the_name_order() {
+    let src = random_mock(9, 3000);
+    let orders: Vec<Order> = ALL_KEYS.iter().map(|&k| Order::build(&src, k)).collect();
+    let counting = Counting::new(&src);
+    Order::validate_all(&orders, &counting).expect("built orders are valid");
+    let n = src.id_bound();
+    assert!(
+        counting.names() <= 2 * n,
+        "{} name reads for {n} entries",
+        counting.names()
+    );
+    assert!(
+        counting.parents() <= 2 * n,
+        "{} parent reads for {n} entries",
+        counting.parents()
+    );
 }
 
 // ---------------------------------------------------------------------------

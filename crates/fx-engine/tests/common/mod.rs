@@ -297,6 +297,11 @@ impl VolumeEnumerator for FakeTree {
             let start = st
                 .resolve(root)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such folder"))?;
+            // As the macOS scanner, which opens the folder with
+            // `O_DIRECTORY`: a file (or symlink) is not walked.
+            if st.entries[&start].kind != EntryKind::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+            }
             let mut children: HashMap<FileKey, Vec<&Entry>> = HashMap::new();
             for e in st.entries.values() {
                 match e.parent {
@@ -498,6 +503,9 @@ pub fn wait_for(
         if cond(&snap) {
             return snap;
         }
+        // Not held while sleeping: a held snapshot keeps the writer from
+        // merging its orders in place.
+        drop(snap);
         assert!(Instant::now() < end, "timed out waiting for: {what}");
         thread::sleep(Duration::from_millis(5));
     }
@@ -513,6 +521,7 @@ pub fn wait_for_tree(engine: &Engine, tree: &FakeTree, what: &str) -> Arc<Engine
         if got == want {
             return snap;
         }
+        drop(snap);
         if Instant::now() >= end {
             let missing: Vec<_> = want.keys().filter(|k| !got.contains_key(*k)).collect();
             let extra: Vec<_> = got.keys().filter(|k| !want.contains_key(*k)).collect();

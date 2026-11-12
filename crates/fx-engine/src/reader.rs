@@ -278,6 +278,7 @@ impl StoreReader {
                 hide_offline: true,
                 // The command line keeps the plain sort.
                 priority: None,
+                orders_pending: false,
             },
             utc_offset: None,
         })

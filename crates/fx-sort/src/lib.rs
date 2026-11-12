@@ -28,6 +28,13 @@
 //! batch and one linear merge. For the Path order a folder recorded with
 //! [`Batch::moved`] (renamed or reparented) carries its whole subtree; a
 //! plain [`Batch::upsert`] (attribute change) re-sorts only the entry.
+//!
+//! An order read back from elsewhere (a saved store) is checked before it
+//! is used: [`Order::validate`] checks one, and [`Order::validate_all`]
+//! several over one source, comparing names only for the Name order and
+//! answering the Name rule for the others by its ranks. A Path order is
+//! checked in one walk of the folder tree; the comparisons run in
+//! parallel.
 
 mod group;
 mod key;

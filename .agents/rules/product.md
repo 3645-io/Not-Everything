@@ -2,7 +2,7 @@
 
 - Read-only. No delete, rename, move or trash action in the app or the CLI.
 - Dragging a result out offers copy and link only, never move or delete, so dropping it on the Trash or a Finder folder can't remove the file.
-- Allowed actions: in the results, Enter opens and Cmd+Enter reveals in Finder; copy full path; Space for Quick Look, which is planned (Phase 2) and not available yet. Return in the search field only moves to the results, never opens a file.
+- Allowed actions: in the results, Enter opens and Cmd+Enter reveals in Finder; copy full path; Space shows the selection in macOS's Quick Look panel (run 2.5). Return in the search field only moves to the results, never opens a file, and Space there types a space.
 - Never trigger cloud downloads: switch off materialization of dataless files and never recurse into cloud-only folders.
 - Network drives are out of the MVP (Phase 6).
 
