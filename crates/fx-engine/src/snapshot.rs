@@ -192,6 +192,7 @@ mod tests {
             orders: Arc::new(Vec::new()),
             cursor: None,
             generation,
+            hide_offline: false,
             priority: None,
             orders_pending,
         }
