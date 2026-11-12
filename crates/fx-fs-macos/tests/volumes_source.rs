@@ -201,9 +201,19 @@ fn volumes_of_every_type_are_reported_on_mount_on_change_and_on_unmount() {
         std::thread::sleep(Duration::from_millis(300));
         let file = mp.join(format!("live-{}.txt", fs.short()));
         std::fs::write(&file, b"x").expect("write on the image");
-        wait_for_change(&mut src, &format!("a file on {}", fs.short()), |c| {
-            *c == Change::CheckPath(file.clone())
-        });
+        // A check of the file, or a rescan that covers it: a rescan of a
+        // folder above it in the same batch takes the file's check in, and
+        // some Macs (GitHub's runners) report a fresh image's activity on
+        // its root.
+        wait_for_change(
+            &mut src,
+            &format!("a file on {}", fs.short()),
+            |c| match c {
+                Change::CheckPath(p) => *p == file,
+                Change::RescanSubtree(p) => file.starts_with(p),
+                _ => false,
+            },
+        );
 
         img.detach().expect("detach");
         wait_for_change(&mut src, &format!("{} unmounted", fs.short()), |c| {
@@ -236,10 +246,21 @@ fn a_resumed_start_rescans_the_folder_and_watches_mounted_volumes() {
     let batch = resumed
         .next_batch(Instant::now() + Duration::from_millis(50))
         .expect("next_batch");
-    assert_eq!(
-        batch,
-        vec![Change::RescanSubtree(scratch.path().join("mnt"))],
-        "one rescan of the folder, no per-volume rescan"
+    // One rescan of the folder from the start. The only other change
+    // allowed is the volume's own stream asking for a rescan of the volume
+    // itself: some Macs (GitHub's runners) report the fresh mount on its root
+    // just after the stream starts, which `classify` turns into that rescan.
+    let folder = scratch.path().join("mnt");
+    assert!(
+        batch.contains(&Change::RescanSubtree(folder.clone())),
+        "one rescan of the folder: {batch:?}"
+    );
+    assert!(
+        batch
+            .iter()
+            .all(|c| *c == Change::RescanSubtree(folder.clone())
+                || *c == Change::RescanSubtree(mp.clone())),
+        "no other rescan or check: {batch:?}"
     );
 
     let mut gap = source(scratch.path(), StartOutcome::GapDetected);
@@ -251,12 +272,16 @@ fn a_resumed_start_rescans_the_folder_and_watches_mounted_volumes() {
     let batch = gap
         .next_batch(Instant::now() + Duration::from_millis(50))
         .expect("next_batch");
-    // The volume's own stream may report activity on it; no rescan is
-    // asked for.
+    // The volume's own stream may report activity on it, and may ask for a
+    // rescan of the volume itself (its notice of the fresh mount, above);
+    // the start asks for no rescan of the folder and no full rescan, since
+    // the full rescan that follows covers both.
     assert!(
-        !batch
-            .iter()
-            .any(|c| matches!(c, Change::RescanSubtree(_) | Change::RescanVolume)),
+        !batch.iter().any(|c| match c {
+            Change::RescanVolume => true,
+            Change::RescanSubtree(p) => *p != mp,
+            _ => false,
+        }),
         "the full rescan covers it: {batch:?}"
     );
 
