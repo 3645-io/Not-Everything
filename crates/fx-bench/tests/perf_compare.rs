@@ -752,15 +752,12 @@ fn a_pr_baseline_needs_the_pr_tier_and_a_number() {
     assert_exit(&out, 2);
     let err = stderr(&out);
     assert!(err.contains("baseline.toml:"), "{err}");
-    assert!(err.contains("pr_baseline") && err.contains("tiers"), "{err}");
-
-    let text = table(
-        "B1",
-        "a_ms",
-        "lower",
-        "pr",
-        "pr_baseline = \"2\"\n",
+    assert!(
+        err.contains("pr_baseline") && err.contains("tiers"),
+        "{err}"
     );
+
+    let text = table("B1", "a_ms", "lower", "pr", "pr_baseline = \"2\"\n");
     let out = compare("pr", &[text], &["a_ms=1\n"], &[]);
     assert_exit(&out, 2);
     assert!(stderr(&out).contains("pr_baseline"), "{}", stderr(&out));
