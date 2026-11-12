@@ -13,9 +13,13 @@
 //! - [`soak`] draws a seeded stream of random file operations with a model
 //!   of the tree it builds, applies it to a real folder and compares
 //!   listings, for the engine's soak (`crates/fx-engine/examples/soak.rs`)
-//!   and fuzz test (`crates/fx-engine/tests/fuzz.rs`).
+//!   and fuzz test (`crates/fx-engine/tests/fuzz.rs`);
+//! - `disk_image` (macOS only) makes and attaches small disk images with
+//!   `hdiutil`, for the external-volume tests.
 //!
 //! Std only.
 
 pub mod crash;
+#[cfg(target_os = "macos")]
+pub mod disk_image;
 pub mod soak;

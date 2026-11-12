@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, reconcile_path};
 use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
-use fx_model::{Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome};
+use fx_model::{Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome, VolumeId};
 use fx_sort::{Batch, MatchSet, Order};
 
 use crate::Shared;
@@ -106,6 +106,12 @@ pub(crate) struct Writer<C, P, V> {
     /// the next publish asks for that exact snapshot to be saved, so the
     /// base can then be served from the saved file (run 2.17 step 2).
     pub(crate) fresh_base: bool,
+    /// The folder volumes are mounted in
+    /// ([`EngineConfig::with_volumes_folder`](crate::EngineConfig::with_volumes_folder)).
+    pub(crate) volumes_folder: Option<PathBuf>,
+    /// The next offline volume number to hand out; found from the index
+    /// on first use.
+    pub(crate) next_offline: Option<u32>,
     /// What the last merge in place took per unit of `merge_units`, in
     /// nanoseconds, from publishing the snapshot without orders to
     /// publishing the result: what readers could wait. `None` before the
@@ -408,6 +414,7 @@ where
                 }
             }
             self.finish_deferred(deferred);
+            self.drop_replaced_offline();
         }
         if self.full_rescan_pending && !self.full_rescan() {
             self.schedule_rescan_retry();
@@ -567,9 +574,7 @@ where
             Some(id) => self.unseen_below(id, &seen),
             None => Vec::new(),
         };
-        for key in unseen {
-            self.remove(key);
-        }
+        self.remove_unseen(unseen);
     }
 
     /// The keys of `top` and every live entry below it that are not in
@@ -610,6 +615,7 @@ where
         } else {
             self.rescan_loaded(&root)
         };
+        self.drop_replaced_offline();
         self.in_full_rescan = false;
         ok
     }
@@ -673,9 +679,7 @@ where
             .filter(|&id| self.index.is_live(id) && !seen.contains(id))
             .map(|id| self.index.key(id))
             .collect();
-        for key in unseen {
-            self.remove(key);
-        }
+        self.remove_unseen(unseen);
         true
     }
 
@@ -696,6 +700,19 @@ where
     /// Applies the postponed removals of entries that are not on disk where
     /// the index has them now.
     fn finish_deferred(&mut self, deferred: Vec<Deferred>) {
+        if deferred.is_empty() {
+            return;
+        }
+        let roots = self.volume_roots();
+        // Volume roots first: an unmounted volume goes offline whole,
+        // before a change reported inside it removes any of its entries.
+        let (mut deferred, rest): (Vec<Deferred>, Vec<Deferred>) =
+            deferred.into_iter().partition(|d| {
+                self.index
+                    .lookup(d.key)
+                    .is_some_and(|id| roots.contains(&id))
+            });
+        deferred.extend(rest);
         for d in deferred {
             // Where the index has the entry now: an entry that moved in this
             // batch, itself or with a folder above it, has a new path by
@@ -707,7 +724,7 @@ where
             };
             match self.stat_at(&path) {
                 Ok(Some(now)) if now.key == d.key => {}
-                Ok(_) => self.remove(d.key),
+                Ok(_) => self.remove_in(d.key, &roots),
                 Err(_) => {}
             }
         }
@@ -753,14 +770,183 @@ where
     }
 
     /// Removes an entry and its descendants, recording every removed ID.
+    ///
+    /// External volumes (run 2.4): a volume root goes offline instead
+    /// ([`take_offline`](Self::take_offline)), and an offline entry stays:
+    /// its path is gone while its volume is unmounted. Offline entries
+    /// leave only when a volume mounted in their place replaces them
+    /// ([`drop_replaced_offline`](Self::drop_replaced_offline)).
     fn remove(&mut self, key: FileKey) {
+        let roots = self.volume_roots();
+        self.remove_in(key, &roots);
+    }
+
+    /// [`remove`](Self::remove), with the volume roots found beforehand.
+    /// A root taken offline since stays in `roots`; its ID is no longer
+    /// live, so no key finds it.
+    fn remove_in(&mut self, key: FileKey, roots: &[EntryId]) {
         let Some(id) = self.index.lookup(key) else {
             return;
         };
+        if key.volume.is_offline() {
+            return;
+        }
+        if roots.contains(&id) {
+            self.take_offline(id);
+            return;
+        }
+        self.remove_now(id);
+    }
+
+    /// Removes live entry `id` and its descendants, recording every
+    /// removed ID.
+    fn remove_now(&mut self, id: EntryId) {
+        let key = self.index.key(id);
         for d in self.index.subtree(id) {
             self.batch.remove(d);
         }
         self.index.remove(key);
+    }
+
+    /// Removes the entries a rescan did not list. Volume roots among them
+    /// go offline first, with their whole subtree, so none of their
+    /// entries is removed before its volume is taken offline.
+    fn remove_unseen(&mut self, unseen: Vec<FileKey>) {
+        let roots = self.volume_roots();
+        let (gone_volumes, rest): (Vec<FileKey>, Vec<FileKey>) = unseen
+            .into_iter()
+            .partition(|&key| self.index.lookup(key).is_some_and(|id| roots.contains(&id)));
+        for key in gone_volumes.into_iter().chain(rest) {
+            self.remove_in(key, &roots);
+        }
+    }
+
+    /// The live volume roots: the entries directly in the volumes folder
+    /// on another volume than the folder's own, offline ones left out.
+    /// Empty without a volumes folder.
+    fn volume_roots(&self) -> Vec<EntryId> {
+        let Some(folder) = self.volumes_folder.as_deref() else {
+            return Vec::new();
+        };
+        let Some(folder_id) = paths::resolve(&self.index, &self.root, folder, None) else {
+            return Vec::new();
+        };
+        let home = self.index.key(folder_id).volume;
+        self.index
+            .children(folder_id)
+            .into_iter()
+            .filter(|&c| {
+                let volume = self.index.key(c).volume;
+                volume != home && !volume.is_offline()
+            })
+            .collect()
+    }
+
+    /// Takes the volume rooted at live entry `id` offline: its entries are
+    /// re-keyed onto a fresh offline volume ID, keeping their names,
+    /// folders and metadata, so the device number the system gives the
+    /// next volume never meets them. Entries of another volume inside it (a
+    /// mount point listed on the volume) are dropped. A volume with nothing
+    /// indexed below its root (a mount the scanner listed but did not
+    /// enter, such as a network share or a hidden system volume) is
+    /// removed: there is nothing to keep. So is every volume once the
+    /// offline IDs run out.
+    fn take_offline(&mut self, id: EntryId) {
+        let top = self.index.key(id);
+        // Parent first (`subtree`'s order), so every parent is back before
+        // its children.
+        let ids = self.index.subtree(id);
+        if ids.len() <= 1 {
+            self.remove_now(id);
+            return;
+        }
+        let entries: Vec<Entry> = ids
+            .into_iter()
+            .filter_map(|d| self.index.get(self.index.key(d)))
+            .collect();
+        let offline = self.next_offline_volume();
+        self.remove_now(id);
+        let Some(offline) = offline else {
+            return;
+        };
+        let remap = |key: FileKey| {
+            if key.volume == top.volume {
+                FileKey::new(offline, key.file_id)
+            } else {
+                key
+            }
+        };
+        for mut e in entries {
+            if e.key.volume != top.volume {
+                continue;
+            }
+            e.key = remap(e.key);
+            e.parent = e.parent.map(remap);
+            // An entry whose parent was dropped is dropped too; nothing on
+            // disk to rescan for.
+            let _ = self.upsert(e);
+        }
+    }
+
+    /// A fresh offline volume ID: one past the highest in the index (found
+    /// once), then counting up. `None` once the range is used up.
+    fn next_offline_volume(&mut self) -> Option<VolumeId> {
+        let next = match self.next_offline {
+            Some(n) => n,
+            None => (0..self.index.id_bound())
+                .map(|i| EntryId(i as u32))
+                .filter(|&id| self.index.is_live(id))
+                .map(|id| self.index.key(id).volume)
+                .filter(|v| v.is_offline())
+                .map(|v| v.0 - VolumeId::OFFLINE_FIRST + 1)
+                .max()
+                .unwrap_or(0),
+        };
+        let volume = VolumeId::offline(next)?;
+        self.next_offline = Some(next + 1);
+        Some(volume)
+    }
+
+    /// Where a live volume root is in the volumes folder, removes every
+    /// other entry there with its name that is not a volume root: an
+    /// offline volume of that name (mounted again, or another volume with
+    /// its name: the live entries replace the offline ones) or the plain
+    /// folder the volume is mounted on (covered by the volume now). A plain
+    /// folder alone, such as a mount point folder left behind after an
+    /// unmount, replaces no offline volume.
+    fn drop_replaced_offline(&mut self) {
+        let Some(folder) = self.volumes_folder.as_deref() else {
+            return;
+        };
+        let Some(folder_id) = paths::resolve(&self.index, &self.root, folder, None) else {
+            return;
+        };
+        let home = self.index.key(folder_id).volume;
+        let is_root = |v: VolumeId| v != home && !v.is_offline();
+        let children = self.index.children(folder_id);
+        if !children
+            .iter()
+            .any(|&c| self.index.key(c).volume.is_offline())
+        {
+            // Nothing offline: a covered folder can only be met at a mount,
+            // which the writer checks there and re-keys.
+            return;
+        }
+        let replaced: Vec<EntryId> = children
+            .into_iter()
+            .filter(|&c| !is_root(self.index.key(c).volume))
+            .filter(|&c| {
+                self.index.get(self.index.key(c)).is_some_and(|e| {
+                    self.index
+                        .children_named(folder_id, &e.name)
+                        .into_iter()
+                        .any(|n| is_root(self.index.key(n).volume))
+                })
+            })
+            .collect();
+        for id in replaced {
+            self.remove_now(id);
+        }
     }
 
     /// Merges the batch into the orders, compacts the index if due and
@@ -850,6 +1036,7 @@ where
             orders: Arc::clone(&self.orders),
             cursor: current.cursor,
             generation: self.generation,
+            hide_offline: current.hide_offline,
             priority: self.group.clone(),
             orders_pending: false,
         };
@@ -871,6 +1058,7 @@ where
             orders: Arc::clone(&current.orders),
             cursor,
             generation: current.generation,
+            hide_offline: current.hide_offline,
             priority: current.priority.clone(),
             orders_pending: false,
         };
@@ -891,11 +1079,16 @@ where
             self.group = self.priority.group(&self.index, &index, &self.orders);
             self.group_stale = false;
         }
+        // A look at the volumes folder's children: offline entries are
+        // hidden from searches only when there are some.
+        let hide_offline =
+            paths::has_offline(&self.index, &self.root, self.volumes_folder.as_deref());
         let snap = EngineSnapshot {
             index,
             orders: Arc::clone(&self.orders),
             cursor,
             generation: self.generation,
+            hide_offline,
             priority: self.group.clone(),
             orders_pending: false,
         };
@@ -1051,6 +1244,7 @@ mod tests {
             orders: Arc::new(Vec::new()),
             cursor: None,
             generation,
+            hide_offline: false,
             priority: None,
             orders_pending,
         }

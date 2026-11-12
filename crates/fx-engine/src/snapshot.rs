@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use fx_model::ResumeCursor;
+use fx_model::{EntryId, ResumeCursor};
 use fx_sort::{MatchSet, Order, SortKey};
 
 /// The sort keys the engine keeps merged, in the order they are stored.
@@ -83,6 +83,10 @@ pub struct EngineSnapshot {
     pub(crate) orders: Arc<Vec<Order>>,
     pub(crate) cursor: Option<ResumeCursor>,
     pub(crate) generation: u64,
+    /// The index may hold offline entries: searches check every hit and
+    /// leave them out ([`EngineSnapshot::is_offline`]). Off when the
+    /// engine knows there are none, so a search pays nothing for it.
+    pub(crate) hide_offline: bool,
     /// The priority group of this index; `None` without priority folders.
     pub(crate) priority: Option<Arc<MatchSet>>,
     /// Published only while the writer merges a batch into the orders in
@@ -136,6 +140,22 @@ impl EngineSnapshot {
         &self.index
     }
 
+    /// Whether entry `id` is on an offline volume: one that was unmounted
+    /// and is kept in the index (run 2.4,
+    /// [`EngineConfig::with_volumes_folder`](crate::EngineConfig::with_volumes_folder)).
+    /// Its path no longer exists until the volume is mounted again.
+    ///
+    /// Searches leave offline entries out (the owner, 11 Nov 2026: hidden
+    /// until the interface has a marker for them); they stay in the index
+    /// so that the volume, mounted again, replaces them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of range, as [`fx_index::Snapshot::key`] does.
+    pub fn is_offline(&self, id: EntryId) -> bool {
+        self.index.key(id).volume.is_offline()
+    }
+
     /// The merged order for `key`, or `None` if the engine does not keep it
     /// (see [`ENGINE_SORT_KEYS`]). Also `None` for every key in the one
     /// case where the engine publishes a snapshot without its orders: its
@@ -177,6 +197,7 @@ mod tests {
             orders: Arc::new(Vec::new()),
             cursor: None,
             generation,
+            hide_offline: false,
             priority: None,
             orders_pending,
         }
