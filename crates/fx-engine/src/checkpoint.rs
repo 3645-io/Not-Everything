@@ -111,17 +111,27 @@ pub(crate) fn load(path: &Path) -> Option<Loaded> {
                 [(_, only)] => Some(*only),
                 _ => None,
             });
+        // The checksums prove the saved orders are the bytes written, and
+        // `verify_checksums` that each is a permutation of the live
+        // entries, but not that they are sorted by this build's rules: a
+        // build that sorts names differently (a changed rule, or another
+        // Unicode version's case folding) saves orders this build would
+        // read as unsorted. The writer merges every batch into the orders
+        // by halving, which assumes they are sorted, so a wrong order would
+        // spread and stay wrong until a rebuild. Every order is checked
+        // here, and a store whose orders fail is served with orders built
+        // afresh from its index. `validate_all` checks the Name order by
+        // comparing names, then the others by its ranks, in parallel.
         let orders: Option<Vec<Order>> = ENGINE_SORT_KEYS
             .iter()
             .map(|&key| {
-                let order = Order {
+                Some(Order {
                     key,
                     ids: mapped.order(order_code(key)?)?.to_vec(),
-                };
-                order.validate(&*snap).ok()?;
-                Some(order)
+                })
             })
-            .collect();
+            .collect::<Option<Vec<Order>>>()
+            .filter(|orders| Order::validate_all(orders, &*snap).is_ok());
         (orders, cursor)
     };
     Some(Loaded {
