@@ -281,6 +281,36 @@ N` (default 2700000), `--selected N` (default 1000), `--runs N` (default
 completed run, 1 on an error or a wrong answer, 2 for bad arguments. It
 writes nothing to disk.
 
+## Search re-run benchmark
+
+```text
+cargo run --release -p fx-engine --example rerun_bench -- --entries 2000000 --cache warm
+```
+
+`examples/rerun_bench.rs` times what a window pays for each new
+generation while it shows a search: a full scan of the published
+snapshot, since a new snapshot can't be answered from the refinement
+cache. fx-query's `matcher_bench` measures that scan over its own view,
+which keeps a folded copy of every name and has no delta; this one
+measures it over the engine's snapshot. It builds `--entries` synthetic
+entries into a compacted base, saves it as a store and serves the base
+from the file's memory map, as the app does (`--heap-base` keeps it on
+the heap), then applies a delta of `--delta` percent of the live entries
+(default 10, the writer's compaction limit): half new files, half
+updates of base entries, every other one a rename. Each sample is one
+search with a fresh `Searcher` and the default options (case and
+diacritics folded) on rayon's global pool (`RAYON_NUM_THREADS` sets its
+size), for each of `matcher_bench`'s engine queries. Output follows the
+format above: the setup (`base_entries`, `delta_rows`, the share of names
+folding changes and what a folded copy of just those would take), then
+`rerun_<query>_p50_ms`, `_p95_ms`, `_max_ms` and `_n`, `rerun_worst_p95_ms`,
+`rerun_mean_p50_ms`, and the snapshot's `memory_*` report. Flags:
+`--entries N` (default 2000000), `--delta PCT` (0 to 10), `--iters K`
+(default 30), `--warmup W` (default 3), `--seed S`, `--heap-base`,
+`--cache`. Exit codes: 0 after a completed run, 1 on an error or a hit
+count that changes between runs, 2 for bad arguments. It writes only its
+store, in a temporary directory it removes at the end.
+
 ## Soak
 
 ```text

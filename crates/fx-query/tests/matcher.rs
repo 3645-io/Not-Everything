@@ -278,6 +278,86 @@ fn minimal_view_without_metadata_or_folded_copy() {
     assert_eq!(ids(&v, "dm:thisyear"), Vec::<u32>::new());
 }
 
+/// [`NamesOnly`] counting how often the matcher asks whether an entry is a
+/// folder.
+struct CountingFolders {
+    view: NamesOnly,
+    folder_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl SearchView for CountingFolders {
+    fn len(&self) -> usize {
+        self.view.len()
+    }
+    fn name(&self, id: u32) -> &str {
+        self.view.name(id)
+    }
+    fn parent(&self, id: u32) -> Option<u32> {
+        self.view.parent(id)
+    }
+    fn is_folder(&self, id: u32) -> bool {
+        self.folder_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.view.is_folder(id)
+    }
+    fn is_live(&self, id: u32) -> bool {
+        self.view.is_live(id)
+    }
+}
+
+#[test]
+fn terms_for_files_and_folders_alike_never_ask_for_the_kind() {
+    // Reading an entry's kind costs a row read in the engine's view, so a
+    // term that takes files and folders alike must not ask for it.
+    let v = CountingFolders {
+        view: NamesOnly {
+            names: vec!["/", "a.txt", "Ünïcode.TXT", "b.md", "Docs"],
+        },
+        folder_reads: Default::default(),
+    };
+    let reads = || v.folder_reads.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(ids(&v, "a"), vec![1]);
+    assert_eq!(ids(&v, "*.txt"), vec![1, 2]);
+    assert_eq!(ids(&v, "regex:^b"), vec![3]);
+    assert_eq!(reads(), 0, "plain terms read no kind");
+    assert_eq!(ids(&v, "file:docs"), vec![4]);
+    assert!(reads() > 0, "a kind filter does");
+}
+
+#[test]
+fn names_folded_one_after_another_never_leak_into_each_other() {
+    // Without a folded copy each thread folds names one after another; a
+    // long name with capitals followed by short ones must not leave its
+    // tail behind in what the next name is compared with.
+    let v = NamesOnly {
+        names: vec![
+            "/",
+            "CONFIGURATION-Backup.JSON",
+            "Co",
+            "c",
+            "CONF",
+            "Résumé-CONFIG.PDF",
+            "RE",
+            "it’s CONFIG",
+            "Its",
+            "plain config",
+            "x",
+        ],
+    };
+    assert_eq!(ids(&v, "conf"), vec![1, 4, 5, 7, 9]);
+    assert_eq!(ids(&v, "config"), vec![1, 5, 7, 9]);
+    assert_eq!(ids(&v, "backup.json"), vec![1]);
+    assert_eq!(ids(&v, "co"), vec![1, 2, 4, 5, 7, 9]);
+    assert_eq!(ids(&v, "resume"), vec![5]);
+    assert_eq!(ids(&v, "re"), vec![5, 6]);
+    assert_eq!(ids(&v, "its"), vec![7, 8]);
+    assert_eq!(ids(&v, "it's"), vec![7]);
+    assert_eq!(ids(&v, "*.json"), vec![1]);
+    assert_eq!(ids(&v, "ww:co"), vec![2]);
+    assert_eq!(ids(&v, "end-with:config"), vec![7, 9]);
+    assert_eq!(ids(&v, "start-with:c"), vec![1, 2, 3, 4]);
+}
+
 /// Apostrophe names, as macOS types them (`’`) and as typed on a keyboard
 /// (`'`), for the apostrophe rule.
 ///
