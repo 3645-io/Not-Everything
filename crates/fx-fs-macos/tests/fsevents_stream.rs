@@ -19,7 +19,13 @@
 //!   not `/System/Volumes/Data/...`).
 //! - With a `path_filter`, only events at or below the prefix are delivered,
 //!   except the HistoryDone marker, which is always delivered through the
-//!   channel as a `RawEvent` whose flags contain `EventFlags::HISTORY_DONE`.
+//!   channel as a `RawEvent` whose flags contain `EventFlags::HISTORY_DONE`,
+//!   and (run 2.1) the events `flags::admit` lets through from outside it:
+//!   volume-level flags on any path, and events on a folder above the
+//!   prefix that rescan, mount over, create, remove or rename it.
+//! - `scope_root(&self) -> &Path` (run 2.1) is the root of what the stream
+//!   delivers: the normalised path filter, or `mount_point()` without one.
+//!   It is the `volume_root` `FsEventsSource` passes to `classify`.
 //! - `recv_timeout(&self, Duration) -> Result<RawEvent, mpsc::RecvTimeoutError>`,
 //!   `try_iter(&self)` yielding `RawEvent`s, `cursor(&self) -> FsEventsCursor`
 //!   (the volume UUID plus an event ID; never the SinceNow sentinel, usable
@@ -53,7 +59,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fx_fs_macos::fsevents::flags::{EventAction, EventFlags, classify};
+use fx_fs_macos::fsevents::flags::{EventAction, EventFlags, admit, classify};
 use fx_fs_macos::fsevents::stream::{
     RawEvent, StreamConfig, VolumeStream as RealStream, normalise_firmlinks,
 };
@@ -186,14 +192,12 @@ fn wait_for(
             .unwrap_or(Duration::ZERO);
         match stream.recv_timeout(left) {
             Ok(ev) => {
-                if !is_marker(&ev) {
-                    assert!(
-                        ev.path.starts_with(root),
-                        "event outside the filter: {} ({:#x})",
-                        ev.path.display(),
-                        ev.flags.bits()
-                    );
-                }
+                assert!(
+                    admit(&ev.path, ev.flags, Some(root)),
+                    "event outside the filter: {} ({:#x})",
+                    ev.path.display(),
+                    ev.flags.bits()
+                );
                 if ev.path == path && ev.flags.contains(want) && ev.received >= since {
                     return ev;
                 }
@@ -539,9 +543,10 @@ fn offline_changes_replay_exactly_before_history_done() {
     // delivered IDs.
     for ev in &history {
         assert!(
-            ev.path.starts_with(dir),
-            "event outside the filter: {}",
-            ev.path.display()
+            admit(&ev.path, ev.flags, Some(dir)),
+            "event outside the filter: {} ({:#x})",
+            ev.path.display(),
+            ev.flags.bits()
         );
     }
     let dropped = stream.dropped_before_cursor();
@@ -639,7 +644,12 @@ fn offline_changes_replay_exactly_before_history_done() {
             allowed.insert(a);
         }
     }
-    let extra: Vec<&&Path> = reported.iter().filter(|p| !allowed.contains(**p)).collect();
+    // Events above the filter that `admit` let through rescan the whole
+    // directory; they are not scripted paths.
+    let extra: Vec<&&Path> = reported
+        .iter()
+        .filter(|p| p.starts_with(dir) && !allowed.contains(**p))
+        .collect();
     assert!(extra.is_empty(), "unexpected replayed paths: {extra:?}");
 
     let max_id = history
@@ -853,4 +863,44 @@ fn drop_while_events_flow_does_not_hang_or_crash() {
 
     running.store(false, Ordering::Relaxed);
     writer.join().expect("writer thread");
+}
+
+#[test]
+fn renaming_a_folder_above_the_filter_is_delivered_as_a_rescan_of_it() {
+    // Run 2.1: the filter used to drop every event outside it, so moving a
+    // folder above the filtered root went unseen.
+    let root = TempRoot::new("above-filter");
+    let outer = root.path().join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).expect("mkdir");
+    fs::write(inner.join("a.txt"), b"x").expect("write");
+    let (stream, _) = VolumeStream::start(filtered_config(&inner), None).expect("start");
+    assert_eq!(
+        stream.scope_root(),
+        inner.as_path(),
+        "the filter is the scope root"
+    );
+    // Let the stream settle, then move the folder above the filter.
+    stream.flush_sync();
+    thread::sleep(Duration::from_millis(200));
+    let since = Instant::now();
+    let moved = root.path().join("outer_moved");
+    fs::rename(&outer, &moved).expect("rename outer");
+
+    let ev = wait_for(&stream, &inner, &outer, EventFlags::ITEM_RENAMED, since);
+    assert_eq!(
+        classify(&ev.path, ev.flags, stream.scope_root()),
+        EventAction::RescanSubtree(inner.clone()),
+        "a folder above the filter that moved rescans the filtered root ({:#x})",
+        ev.flags.bits()
+    );
+    fs::rename(&moved, &outer).expect("rename back");
+}
+
+#[test]
+fn scope_root_is_the_mount_point_without_a_filter() {
+    let root = TempRoot::new("scope-mount");
+    let (stream, _) =
+        VolumeStream::start(StreamConfig::new(root.path().to_path_buf()), None).expect("start");
+    assert_eq!(stream.scope_root(), stream.mount_point());
 }

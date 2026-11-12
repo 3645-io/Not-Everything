@@ -12,9 +12,31 @@
 //! `press:TAG` (clicks the window's control with that tag: a chip, a
 //! column title, a syntax example), `wait`, `click:ROW` (a mouse-down and
 //! mouse-up on that row, sent to the window as the hardware would send
-//! them), `key:down` and `key:up` (an arrow key) and `type:TEXT` (each
-//! character as a key press, 80 ms apart). Each step logs where the focus
-//! is.
+//! them), `key:down` and `key:up` (an arrow key), `key:space` and
+//! `key:escape` (a key press sent to the window, as the hardware sends it:
+//! Quick Look with the results focused), `type:TEXT` (each character as a
+//! key press, 80 ms apart), `activate` (activates the app and makes the
+//! window key, as a summon does; Quick Look looks for its controller in the
+//! key window), `announce` (posts the result count announcement now, as a
+//! new search does while VoiceOver runs) and `ax` (logs the table's row
+//! counts as AppKit reports them to VoiceOver, the announcement a new
+//! search makes and the Quick Look panel's state). Each step logs where the focus is.
+//!
+//! The column dividers: `divider:I:drag:DX` (a mouse-down on divider I,
+//! 0 Name, 1 Path, 2 Size, dragged DX points and released, as the hardware
+//! sends them), `divider:I:double` (a double-click), `divider:I:key:right`,
+//! `divider:I:key:shift-left` and so on (an arrow key handed to the
+//! divider), and `scrollx:X` (the rows scrolled X points sideways).
+//!
+//! What VoiceOver reads is best seen from outside the app, through the
+//! Accessibility API (`AXUIElementCopyAttributeValue`), as VoiceOver
+//! sees it: asked from inside, AppKit doesn't report every label a control
+//! carries.
+
+use objc2::msg_send;
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2_foundation::{NSArray, NSString};
 
 /// One scripted step.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,10 +52,52 @@ pub(crate) enum Step {
     Dark(bool),
     Escape,
     Press(isize),
+    Divider(usize, DividerStep),
+    ScrollX(f64),
     Wait,
     Click(usize),
     Arrow(Arrow),
+    Key(NamedKey),
     Type(String),
+    Activate,
+    Announce,
+    Ax,
+}
+
+/// What [`Step::Divider`] does to a column divider.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DividerStep {
+    /// Pressed, dragged this many points and released.
+    Drag(f64),
+    /// Double-clicked.
+    DoubleClick,
+    /// Left or Right, with Shift or not.
+    Key { right: bool, shift: bool },
+}
+
+/// A `divider:` step's argument: `I:drag:DX`, `I:double` or
+/// `I:key:[shift-]left|right`.
+fn divider_step(arg: &str) -> Option<Step> {
+    let mut parts = arg.trim().splitn(3, ':');
+    let index = parts.next()?.parse().ok()?;
+    let step = match (parts.next()?, parts.next()) {
+        ("drag", Some(dx)) => DividerStep::Drag(dx.parse().ok()?),
+        ("double", None) => DividerStep::DoubleClick,
+        ("key", Some(key)) => {
+            let (shift, key) = match key.strip_prefix("shift-") {
+                Some(key) => (true, key),
+                None => (false, key),
+            };
+            let right = match key {
+                "right" => true,
+                "left" => false,
+                _ => return None,
+            };
+            DividerStep::Key { right, shift }
+        }
+        _ => return None,
+    };
+    Some(Step::Divider(index, step))
 }
 
 /// An arrow key for [`Step::Arrow`].
@@ -41,6 +105,28 @@ pub(crate) enum Step {
 pub(crate) enum Arrow {
     Up,
     Down,
+}
+
+/// A key for [`Step::Key`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NamedKey {
+    Space,
+    Escape,
+}
+
+/// How many elements the table's accessibility attribute `name` lists
+/// (`AXRows`, `AXVisibleRows`, `AXSelectedRows`), and how long asking took.
+pub(crate) fn ax_count(element: &AnyObject, name: &str) -> (Option<usize>, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let name = NSString::from_str(name);
+    // SAFETY: `accessibilityAttributeValue:` takes an attribute name and
+    // returns an object or nil; every AppKit object answers it.
+    let value: Option<Retained<AnyObject>> =
+        unsafe { msg_send![element, accessibilityAttributeValue: &*name] };
+    let count = value
+        .and_then(|v| v.downcast::<NSArray>().ok())
+        .map(|a| a.count());
+    (count, start.elapsed())
 }
 
 /// The script from the environment.
@@ -73,14 +159,21 @@ fn parse(text: &str) -> Vec<Step> {
                 "appearance" => Some(Step::Dark(arg.trim() == "dark")),
                 "escape" => Some(Step::Escape),
                 "press" => arg.trim().parse().ok().map(Step::Press),
+                "divider" => divider_step(arg),
+                "scrollx" => arg.trim().parse().ok().map(Step::ScrollX),
                 "wait" => Some(Step::Wait),
                 "click" => arg.trim().parse().ok().map(Step::Click),
                 "key" => match arg.trim() {
                     "down" => Some(Step::Arrow(Arrow::Down)),
                     "up" => Some(Step::Arrow(Arrow::Up)),
+                    "space" => Some(Step::Key(NamedKey::Space)),
+                    "escape" => Some(Step::Key(NamedKey::Escape)),
                     _ => None,
                 },
                 "type" => Some(Step::Type(arg.to_owned())),
+                "activate" => Some(Step::Activate),
+                "announce" => Some(Step::Announce),
+                "ax" => Some(Step::Ax),
                 _ => None,
             }
         })
@@ -122,10 +215,52 @@ mod tests {
         assert_eq!(parse("click:x;key:left"), vec![]);
     }
 
+    /// The column dividers can be dragged, double-clicked and stepped with
+    /// the arrow keys, and the rows scrolled sideways, for screenshots.
+    #[test]
+    fn divider_steps_parse() {
+        assert_eq!(
+            parse("divider:0:drag:-60.5;divider:2:double;divider:1:key:shift-right;scrollx:200"),
+            vec![
+                Step::Divider(0, DividerStep::Drag(-60.5)),
+                Step::Divider(2, DividerStep::DoubleClick),
+                Step::Divider(
+                    1,
+                    DividerStep::Key {
+                        right: true,
+                        shift: true
+                    }
+                ),
+                Step::ScrollX(200.0),
+            ]
+        );
+        assert_eq!(
+            parse("divider:x:double;divider:0:drag;divider:0:key:up;divider:1:double:2"),
+            vec![]
+        );
+    }
+
     /// `type:TEXT` types each character as a key press into whatever has
     /// the focus, 80 ms apart, so the search field's own timing applies.
     #[test]
     fn typing_parses_and_keeps_spaces() {
         assert_eq!(parse("type:bud get"), vec![Step::Type("bud get".into())]);
+    }
+
+    /// Quick Look and VoiceOver are checked in the app: `key:space` and
+    /// `key:escape` press those keys through the window, and `ax` logs
+    /// what AppKit reports to VoiceOver.
+    #[test]
+    fn quick_look_keys_and_the_accessibility_log_parse() {
+        assert_eq!(
+            parse("activate;key:space;ax;key:escape;announce"),
+            vec![
+                Step::Activate,
+                Step::Key(NamedKey::Space),
+                Step::Ax,
+                Step::Key(NamedKey::Escape),
+                Step::Announce
+            ]
+        );
     }
 }

@@ -12,7 +12,9 @@
 //! - [`window`]: the top bar, the access callout, the results card and the
 //!   status bar, stacked.
 //! - [`card`] and [`column_widths`]: the header over the rows and the four
-//!   columns (`minmax(220px, 1.25fr) minmax(200px, 1.5fr) 88px 156px`).
+//!   columns (`minmax(220px, 1.25fr) minmax(200px, 1.5fr) 88px 156px`),
+//!   or the widths the user set ([`resized_column_widths`]), and the
+//!   dividers between the column titles.
 //! - [`banner`]: the access callout's text and buttons.
 //! - [`status_bar`], [`hints`] and [`key_width`]: the status bar's three
 //!   slots, flowing and wrapping like the board's flex row.
@@ -21,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::column_sizes::{ColumnSizes, RESIZABLE};
 use crate::theme::{SPACE_2, SPACE_3, SPACE_4, SPACE_5, SPACE_6, metrics, styles};
 
 /// A rectangle, y running down.
@@ -313,14 +316,42 @@ pub fn column_widths(content: f64) -> [f64; 4] {
     [name, path, metrics::SIZE_COLUMN, metrics::DATE_COLUMN]
 }
 
+/// The widths of the four columns in `content` points once the user has
+/// resized them ([`crate::column_sizes`]): Name, Path and Size as
+/// `sizes` says, and Date Modified the rest (`minmax(140px, 1fr)`), never
+/// less than 140.
+///
+/// When the columns don't fit, Date Modified keeps its 140 points and the
+/// table is wider than `content`, so it scrolls sideways. The board's
+/// grid also keeps a 760-point floor, which would scroll a narrow window's
+/// table by its empty last column; as in [`column_widths`], the app leaves
+/// that floor out and scrolls only when the columns need it.
+pub fn resized_column_widths(content: f64, sizes: ColumnSizes) -> [f64; 4] {
+    let [name, path, size] = sizes.widths();
+    let rest = content - name - path - size - 3.0 * metrics::COLUMN_GAP;
+    [name, path, size, rest.max(metrics::REST_MIN_WIDTH)]
+}
+
 /// The four columns: widths and where each one's content starts in the
 /// card.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Columns {
-    /// [`column_widths`].
+    /// [`column_widths`] or [`resized_column_widths`].
     pub widths: [f64; 4],
     /// Each column's left edge, from the card's left edge.
     pub x: [f64; 4],
+}
+
+/// A column divider's parts, in the header before it scrolls sideways.
+/// See [`card`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DividerLayout {
+    /// What the pointer drags, as tall as the header cells.
+    pub hit: Rect,
+    /// The line at rest.
+    pub line: Rect,
+    /// The line while the divider is hovered, focused or dragged.
+    pub active_line: Rect,
 }
 
 /// The results card's parts. See [`card`].
@@ -332,17 +363,55 @@ pub struct CardLayout {
     pub rows: Rect,
     /// The columns.
     pub columns: Columns,
+    /// The dividers after Name, Path and Size.
+    pub dividers: [DividerLayout; RESIZABLE],
+    /// How wide the header's and rows' content is, from the card's left
+    /// edge: the card's width, or more when resized columns don't fit and
+    /// the table scrolls sideways.
+    pub width: f64,
+}
+
+/// The divider after the column ending at `end` in a header cell
+/// `cell_height` tall (`.ne-col-handle`): 12 points wide, centred in the
+/// gap after the column; its line 1 point wide and 13 points in from the
+/// cell's top and bottom at rest, 2 points wide and 9 points in when
+/// active.
+fn divider(end: f64, cell_height: f64) -> DividerLayout {
+    let mid = end + metrics::COLUMN_GAP / 2.0;
+    let (rest_inset, active_inset) = metrics::DIVIDER_INSET;
+    let (rest_width, active_width) = metrics::DIVIDER_LINE;
+    let line = |width: f64, inset: f64| {
+        Rect::new(
+            mid - width / 2.0,
+            inset,
+            width,
+            (cell_height - 2.0 * inset).max(0.0),
+        )
+    };
+    DividerLayout {
+        hit: Rect::new(
+            mid - metrics::DIVIDER_WIDTH / 2.0,
+            0.0,
+            metrics::DIVIDER_WIDTH,
+            cell_height,
+        ),
+        line: line(rest_width, rest_inset),
+        active_line: line(active_width, active_inset),
+    }
 }
 
 /// The parts of a `width` × `height` results card whose rows' vertical
 /// scroller takes `scroller` points of their width (a legacy scroller's
-/// width; 0 for overlay scrollers, which float over the rows).
+/// width; 0 for overlay scrollers, which float over the rows), with the
+/// columns the user resized to `sizes`, or the default layout.
 ///
 /// The columns share the card's width less its padding and the scroller,
 /// so the rows' table is exactly as wide as the part of the scroll view
 /// that shows it and every row, the selected one's rim included, shows
-/// whole. The column titles use the same columns.
-pub fn card(width: f64, height: f64, scroller: f64) -> CardLayout {
+/// whole; resized columns that don't fit make it wider, and it scrolls
+/// sideways. The column titles and dividers use the same columns. The
+/// header cells are the header less the 1-point line under it.
+pub fn card(width: f64, height: f64, scroller: f64, sizes: Option<ColumnSizes>) -> CardLayout {
     let pad = metrics::HEADER_PADDING_X;
     let header = Rect::new(0.0, 0.0, width, metrics::HEADER_HEIGHT);
     let rows = Rect::new(
@@ -351,17 +420,29 @@ pub fn card(width: f64, height: f64, scroller: f64) -> CardLayout {
         width,
         (height - header.height).max(0.0),
     );
-    let widths = column_widths(width - 2.0 * pad - scroller.max(0.0));
+    let scroller = scroller.max(0.0);
+    let content = width - 2.0 * pad - scroller;
+    let widths = match sizes {
+        Some(sizes) => resized_column_widths(content, sizes),
+        None => column_widths(content),
+    };
     let mut x = [pad; 4];
     for i in 1..4 {
         x[i] = x[i - 1] + widths[i - 1] + metrics::COLUMN_GAP;
     }
+    let cell = header.height - HEADER_LINE;
+    let dividers = [0, 1, 2].map(|i| divider(x[i] + widths[i], cell));
     CardLayout {
         header,
         rows,
         columns: Columns { widths, x },
+        dividers,
+        width: (x[3] + widths[3] + pad + scroller).max(width),
     }
 }
+
+/// The line under the header (`.ne-thead`'s `border-bottom`).
+pub const HEADER_LINE: f64 = 1.0;
 
 /// The callout's rim.
 const BANNER_BORDER: f64 = 1.0;

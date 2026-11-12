@@ -22,6 +22,20 @@ system appearance.
   main thread. Rows come from `Engine::search`, fetched a window at a time.
 - Clicking a column header sorts through the engine (`set_sort`); AppKit
   never sorts. Clicking it again flips the direction.
+- A thin divider sits between the column titles after Name, Path and
+  Size; it turns green while hovered, focused or dragged. Dragging it
+  resizes the column on its left, in the header and every row together,
+  never below that column's minimum (Name 140, Path 120, Size 64 points)
+  nor above 800; Date Modified takes the rest, never less than 140, and
+  when the columns don't fit, the table scrolls sideways with the titles
+  following it. Double-clicking a divider restores the default widths.
+  With the keyboard focus (Full Keyboard Access on, or VoiceOver running),
+  Left and Right move it 8 points, 32 with Shift; VoiceOver reads each
+  divider as a splitter ("Resize the Name column", its width in points)
+  and moves it with increment and decrement. The widths are saved as the
+  `column_widths` line of the settings file (`300,480,88`; no line for the
+  default layout) and restored at launch. The card draws its own titles
+  and dividers; the table's own header and column resizing are off.
 - A background thread receives the engine's new snapshot generations and
   wakes the main thread, which re-runs the query (at most every 100 ms), so
   results grow during the first scan and update when files change.
@@ -155,7 +169,7 @@ values and rules are pure modules, each pinned by tests:
   state; `key_caps`: key caps in Apple's order and the result hints.
 - `chips`, `main_layout` and `window_view`: the Aa, Path and .* search
   options, where the search window's parts go, and what it shows in each
-  state.
+  state; `column_sizes`: the widths the column dividers set.
 - `ui_text`, `settings_view` and `build_info`: the mockups' copy, the
   Settings copy and the channel tag.
 - `surface`: every surface of the mockups rendered once per theme and size
@@ -280,6 +294,8 @@ Keys and actions (all read-only):
 | Return / Enter in the results, double-click | Open the selection with its default app (at most 20 items) |
 | Cmd+Return / Cmd+Enter | Reveal the selection in Finder |
 | Option+Cmd+C | Copy the selection's full paths, one per line. Cmd+C and Edit > Copy do nothing in the results; Cmd+C will copy the files themselves, as in Finder, in a later version |
+| Space in the results | Show the selection in the system Quick Look panel (at most 1,000 files); Space again closes it |
+| Escape with Quick Look open | Close the Quick Look panel (nothing else) |
 | Return / Enter or Down arrow in the search field | Move into the results, selecting the first row (nothing happens with no results) |
 | Escape in the search field | Clear the search; with the field already empty, hide the window and go back to the previous app |
 | Escape in the results | Clear the search and move back to the field; with the field empty, hide the window and go back to the previous app |
@@ -288,7 +304,39 @@ Keys and actions (all read-only):
 Return in the search field moves into the results and never opens a file
 (`actions::search_field_key`); the arrow keys then pick the file and Return
 opens it. Cmd+Return in the search field reveals the selection, or the
-first row, in Finder. Quick Look on Space is not built yet.
+first row, in Finder. Space in the search field types a space.
+
+Quick Look works as in Finder (`quick_look`, `appkit::window::quick_look`):
+Space in the results opens macOS's own Quick Look panel (`QLPreviewPanel`)
+on the selected files, in row order; Space again, or Escape, closes it.
+While it is open the arrow keys move the selection and the panel follows
+(the panel hands the key presses it doesn't use to the results), reloading
+only when the selected files change, so a refresh while indexing never
+makes it flicker. The panel zooms from the selected row when the row is in
+view, and closes when the window hides. QuickLookUI is a system framework,
+loaded the first time the panel opens (so launches don't pay for it); no
+crate was added.
+
+VoiceOver (`accessibility`): the window draws its own look, so its views
+report what VoiceOver reads. Each cell names its column ("Name", "Path",
+"Size", "Date Modified") and reads its text in words, so a row reads in
+the order the columns show it: "report.pdf, Home/Documents/Finance, 182
+KB, 14 March 2026 at 09:12", with "folder" after a folder's name and no
+size for it. (AppKit reports a view-based table's rows through elements
+of its own, so the reading lives in the cells, which are the app's views.)
+The table ("Results") reports the result count as its row count, the
+status bar reads "8 results, 2,014,377 objects", "Up to date, 9 ms" and
+each hint as "Reveal in Finder, Command Return". The chips, column titles and search field keep their
+labels ("Match case", "Sort by Size, ascending", "Search file and folder
+names"); glyphs and texts their control already reads are hidden. While
+VoiceOver runs, a new search announces its count ("1,234 results", "No
+matches") once typing pauses for half a second. To check what VoiceOver
+reads, read the app's tree from outside it with the Accessibility API
+(`AXUIElementCopyAttributeValue`), as VoiceOver does: asked from inside
+the app, AppKit leaves out labels its controls carry. A debug build's
+script (`NE_DEBUG_SCRIPT`) has `key:space`, `key:escape`, `activate`,
+`announce` and `ax` (the table's row counts, the announcement and Quick
+Look's state) for checking both in the app.
 
 Escape backs out one step, as in Spotlight (`actions::escape_action`): it
 clears the search, and with the search field empty it hides the window as
@@ -520,6 +568,7 @@ The main modules, beside the interface modules above:
 | --- | --- | --- |
 | `source` | any host | `ResultsSource` over the engine (and, with `measure`, synthetic rows) |
 | `columns` | any host | The four columns and the header-click sort state |
+| `column_sizes` | any host | The widths the column dividers set: drag, arrow keys, minimums, the settings value |
 | `controller` | any host | `ResultsController`: query, sort, stale pages, throttled re-runs, status |
 | `actions` | any host | Read-only actions, key map, drag-out mask |
 | `app_args` | any host | Command line of the app, the data folder and the per-root store path |
@@ -618,8 +667,9 @@ result within about 2 ms of the budget as borderline.
 The shell never changes files. The spike has no file actions at all: no open,
 reveal, copy, drag, delete, rename, move or trash, and its cells are
 non-editable labels. The app's actions are limited to opening a result,
-revealing it in Finder and copying its full path (Quick Look is not built
-yet). There is no delete, rename, move or trash menu item, action, key
+revealing it in Finder, copying its full path and showing it in Quick Look
+(macOS's preview panel, which only reads the file). There is no delete,
+rename, move or trash menu item, action, key
 binding or command-line option; the delete keys do nothing. Dragging a
 result out offers copy and link only (`NSDragOperationCopy |
 NSDragOperationLink`, for drags to other apps and within the app), never

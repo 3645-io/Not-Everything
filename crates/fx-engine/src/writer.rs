@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, reconcile_path};
 use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
-use fx_model::{Change, Entry, EntryId, FileKey, ResumeCursor, StartOutcome};
+use fx_model::{Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome};
 use fx_sort::{Batch, MatchSet, Order};
 
 use crate::Shared;
@@ -37,6 +37,30 @@ const PAUSE_POLL: Duration = Duration::from_millis(20);
 /// slice. Only a batch in progress is sliced: the wait for its first change
 /// is not, since nothing is pending then.
 const BACKGROUND_SLICE: Duration = Duration::from_millis(250);
+
+/// The longest the writer expects readers to wait for a merge in place
+/// (`Writer::take_orders`): half of `snapshot::SETTLE_LIMIT`, the owner's
+/// 100 ms bound, so a merge slower than expected still ends inside it.
+pub(crate) const IN_PLACE_BUDGET: Duration = Duration::from_millis(50);
+
+/// How many order entries one batch entry counts for in `merge_units`.
+/// Measured on the M4 Pro (11 Nov, whole disk, 3.73M entries, batches of
+/// 74,000 to 126,000 changes): a merge in place took 1.1 to 1.65 s, about
+/// 10 µs per batch entry, some 800 units at [`FIRST_NS_PER_UNIT`].
+const BATCH_WEIGHT: f64 = 1024.0;
+
+/// The expected cost of a merge in place per unit, in nanoseconds, until
+/// the first one is timed: a cautious guess, so the first is tried only on
+/// an index of up to about 4M entries with a small batch. Every later
+/// merge goes by the time the last one took.
+const FIRST_NS_PER_UNIT: f64 = 12.0;
+
+/// What a refused merge in place takes off the cost estimate. Slow on
+/// purpose: hidden commits come every few seconds under steady changes,
+/// and a merge timed past the budget should be tried again only minutes
+/// later (about 80 refusals from 1.5 times the budget), each retry being
+/// a chance of a wait past the bound.
+const COST_DECAY: f64 = 0.995;
 
 /// A removal postponed to the end of the batch, so that an entry that only
 /// moved (reported at its old path first) is found at its new path before
@@ -82,6 +106,11 @@ pub(crate) struct Writer<C, P, V> {
     /// the next publish asks for that exact snapshot to be saved, so the
     /// base can then be served from the saved file (run 2.17 step 2).
     pub(crate) fresh_base: bool,
+    /// What the last merge in place took per unit of `merge_units`, in
+    /// nanoseconds, from publishing the snapshot without orders to
+    /// publishing the result: what readers could wait. `None` before the
+    /// first.
+    pub(crate) in_place_cost: Option<f64>,
 }
 
 /// What the writer must do before it reads the change source again.
@@ -438,31 +467,63 @@ where
         }
     }
 
-    /// Re-enumerates the folder at `path`: every listed entry is upserted
-    /// (and recorded in the batch only when it changed), then whatever the
-    /// folder holds that the walk didn't list is removed. A failed walk
-    /// removes nothing.
+    /// Re-enumerates the folder at `path`: the folder the disk has there now
+    /// is upserted with every entry the walk lists (each recorded in the
+    /// batch only when it changed), then whatever that folder holds in the
+    /// index and the walk didn't list is removed. A failed walk removes
+    /// nothing.
+    ///
+    /// The folder walked is the one the disk has at `path`, by key, not the
+    /// entry the index has there: after a swap of names (`a` to `t`, `b` to
+    /// `a`, `t` to `b`) the index still has the other entry at `path` until
+    /// that entry's own new path is checked. Comparing the walk with that
+    /// entry's subtree kept what the folder had lost meanwhile and removed
+    /// the other entry instead (found by the soak with restarts, whose
+    /// history replay reports `a` before `b`). The entry the index had at
+    /// `path`, when it is another one, is removed at the end of the batch
+    /// unless it is found at a new path by then, as `check_path` does.
     fn rescan_subtree(&mut self, path: &Path, deferred: &mut Vec<Deferred>, depth: u32) {
-        let top = paths::resolve(&self.index, &self.root, path, None).map(|id| self.index.key(id));
-        let Some(top) = top else {
-            // Not indexed: checking the path upserts it and, for a folder,
-            // rescans it from there.
-            if depth < MAX_DEPTH {
-                self.check_path(path, deferred, depth + 1);
-            }
-            return;
-        };
         // The folder's own entry: enumerators that list only what is below
         // it (the macOS scanner) don't emit it.
         let top_entry = match self.stat_at(path) {
-            Ok(Some(entry)) => Some(entry),
-            Ok(None) => None,
+            Ok(Some(entry)) if entry.kind == EntryKind::Dir => entry,
+            Ok(_) => {
+                // Gone, or not a folder (replaced by a file, or a swap put a
+                // file here): there is nothing to walk, and checking the
+                // path reconciles what it holds now.
+                if depth < MAX_DEPTH {
+                    self.check_path(path, deferred, depth + 1);
+                }
+                return;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
-                // Gone: checking the path removes it.
                 self.check_path(path, deferred, depth + 1);
                 return;
             }
             Err(_) => return,
+        };
+        let top = top_entry.key;
+        if self.index.lookup(top).is_none() {
+            // A folder new to the index: checking the path upserts it (and
+            // its parents if need be) and rescans it from there.
+            if depth < MAX_DEPTH {
+                self.check_path(path, deferred, depth + 1);
+            }
+            return;
+        }
+        // Another entry indexed at this path (replaced, or swapped away):
+        // removed at the end of the batch unless it is found elsewhere.
+        if let Some(old) = paths::resolve(&self.index, &self.root, path, Some(top))
+            .map(|id| self.index.key(id))
+            .filter(|&old| old != top)
+        {
+            deferred.push(Deferred { key: old });
+        }
+        // The folder itself, where the disk has it: a folder that moved here
+        // may need its new parent checked first.
+        self.upsert_at(top_entry, path, deferred, depth);
+        let Some(top_id) = self.index.lookup(top) else {
+            return;
         };
         // The entries stream into the index, as in a full rescan (run 2.17):
         // no list of every entry and no map of the old ones, which took more
@@ -473,22 +534,25 @@ where
             enumerator,
             ..
         } = self;
-        let mut seen = vec![false; index.id_bound()];
+        // A bit per entry: a byte per entry was 3.3 MB at 3.2M entries.
+        let mut seen = MatchSet::with_bound(index.id_bound());
+        seen.insert(top_id);
         let mut take = |e: Entry| {
             // Several hard links: keep the first listing, as a full rescan does.
-            if let Some(id) = index.lookup(e.key) {
-                if seen.get(id.index()).copied().unwrap_or(false) {
-                    return;
-                }
+            if index.lookup(e.key).is_some_and(|id| seen.contains(id)) {
+                return;
             }
             take_one(index, batch, &mut seen, e);
         };
-        if let Some(entry) = top_entry {
-            take(entry);
-        }
         match enumerator.enumerate(path, &mut take) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound && depth < MAX_DEPTH => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) && depth < MAX_DEPTH =>
+            {
+                // Gone or replaced since the stat: reconcile the path.
                 self.check_path(path, deferred, depth + 1);
                 return;
             }
@@ -499,19 +563,33 @@ where
         // Whatever the folder holds now (folders that moved in included,
         // with what they held) and the walk didn't list is gone, or is found
         // again at its new path.
-        let unseen: Vec<FileKey> = match self.index.lookup(top) {
-            Some(id) => self
-                .index
-                .subtree(id)
-                .into_iter()
-                .filter(|d| !seen.get(d.index()).copied().unwrap_or(false))
-                .map(|d| self.index.key(d))
-                .collect(),
+        let unseen = match self.index.lookup(top) {
+            Some(id) => self.unseen_below(id, &seen),
             None => Vec::new(),
         };
         for key in unseen {
             self.remove(key);
         }
+    }
+
+    /// The keys of `top` and every live entry below it that are not in
+    /// `seen`, each after its parent. The subtree is walked depth first,
+    /// holding only the folders still to visit: a list of the whole subtree
+    /// (`Index::subtree`) took 4 B per entry, 13 MB for a rescan of a
+    /// 3.2M-entry disk, just before the commit.
+    fn unseen_below(&self, top: EntryId, seen: &MatchSet) -> Vec<FileKey> {
+        let mut unseen = Vec::new();
+        if !self.index.is_live(top) {
+            return unseen;
+        }
+        let mut stack = vec![top];
+        while let Some(id) = stack.pop() {
+            if !seen.contains(id) {
+                unseen.push(self.index.key(id));
+            }
+            stack.extend(self.index.children(id));
+        }
+        unseen
     }
 
     /// Re-enumerates the whole volume and applies the difference. Readers
@@ -573,15 +651,13 @@ where
             enumerator,
             ..
         } = self;
-        let mut seen = vec![false; index.id_bound()];
+        let mut seen = MatchSet::with_bound(index.id_bound());
         let mut take = |e: Entry| {
             // A file with several hard links is listed once per link: keep
             // the first listing, as a first scan does, so rescans don't move
             // it back and forth.
-            if let Some(id) = index.lookup(e.key) {
-                if seen.get(id.index()).copied().unwrap_or(false) {
-                    return;
-                }
+            if index.lookup(e.key).is_some_and(|id| seen.contains(id)) {
+                return;
             }
             take_one(index, batch, &mut seen, e);
         };
@@ -594,7 +670,7 @@ where
         }
         let unseen: Vec<FileKey> = (0..self.index.id_bound())
             .map(|i| EntryId(i as u32))
-            .filter(|&id| self.index.is_live(id) && !seen.get(id.index()).copied().unwrap_or(false))
+            .filter(|&id| self.index.is_live(id) && !seen.contains(id))
             .map(|id| self.index.key(id))
             .collect();
         for key in unseen {
@@ -701,17 +777,28 @@ where
         let snap = self.index.snapshot();
         let rebuild = self.orders_stale || self.batch.len() > self.index.live_count() / 2;
         self.orders_stale = false;
-        let mut orders: Vec<Order> = if rebuild {
+        let units = self.merge_units();
+        // `pending` is held until the new snapshot is published.
+        let (mut orders, pending): (Vec<Order>, Option<Pending>) = if rebuild {
             // One Name sort shared by every order (a first scan lands here).
             let keys: Vec<_> = self.orders.iter().map(|o| o.key).collect();
-            Order::build_keys(&*snap, &keys)
+            (Order::build_keys(&*snap, &keys), None)
+        } else if let Some((mut orders, pending)) = self.take_orders() {
+            // Nothing else holds the orders: the batch goes into them in
+            // place, and none is copied.
+            for order in &mut orders {
+                order.apply(&*snap, &self.batch);
+            }
+            (orders, Some(pending))
         } else {
             // The published snapshot shares `self.orders`, so each order is
             // read, not changed: `applied` copies it once into the new one.
-            self.orders
+            let orders = self
+                .orders
                 .iter()
                 .map(|o| o.applied(&*snap, &self.batch))
-                .collect()
+                .collect();
+            (orders, None)
         };
         self.batch.clear();
         if self.compaction_due() {
@@ -730,6 +817,11 @@ where
         self.group_stale = true;
         self.generation += 1;
         self.publish(cursor);
+        if let Some(pending) = pending {
+            // How long readers could have waited: the next estimate.
+            self.in_place_cost = Some(pending.since.elapsed().as_nanos() as f64 / units);
+            drop(pending);
+        }
         if std::mem::take(&mut self.fresh_base) {
             // The snapshot just published holds exactly the new base: its
             // delta is empty and nothing is removed yet.
@@ -759,6 +851,7 @@ where
             cursor: current.cursor,
             generation: self.generation,
             priority: self.group.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
     }
@@ -779,6 +872,7 @@ where
             cursor,
             generation: current.generation,
             priority: current.priority.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
     }
@@ -803,9 +897,123 @@ where
             cursor,
             generation: self.generation,
             priority: self.group.clone(),
+            orders_pending: false,
         };
         self.shared.current.store(Arc::new(snap));
         self.shared.notify(self.generation);
+    }
+
+    /// The work of merging the batch into the orders, in the units of
+    /// `in_place_cost`: each order is read once or twice whole, and each
+    /// entry of the batch is sorted and placed by halving in every order
+    /// (some 25 name comparisons each), counted as [`BATCH_WEIGHT`] order
+    /// entries.
+    fn merge_units(&self) -> f64 {
+        self.index.live_count() as f64 + BATCH_WEIGHT * self.batch.len() as f64
+    }
+
+    /// Whether a merge in place is expected to end within
+    /// [`IN_PLACE_BUDGET`], from the time the last one took per unit (or
+    /// [`FIRST_NS_PER_UNIT`] before any). A refusal lowers the estimate a
+    /// little, so a merge timed during a busy moment doesn't rule the
+    /// in-place path out for good: it is tried, and timed, again later.
+    fn in_place_fits(&mut self) -> bool {
+        let per_unit = self.in_place_cost.unwrap_or(FIRST_NS_PER_UNIT);
+        let expected = per_unit * self.merge_units();
+        if expected <= IN_PLACE_BUDGET.as_nanos() as f64 {
+            return true;
+        }
+        if let Some(cost) = &mut self.in_place_cost {
+            *cost *= COST_DECAY;
+        }
+        false
+    }
+
+    /// Takes the published orders over, so the batch can be merged into
+    /// them in place: only while no window shows, when no compaction is
+    /// due, when the merge is expected to end well inside the wait readers
+    /// accept ([`in_place_fits`](Self::in_place_fits)), and only when
+    /// nothing but the writer and the published snapshot holds them.
+    ///
+    /// The writer always merged into a copy of each order, since the
+    /// published snapshot still held the old one: 16 B per entry at every
+    /// commit, about 51 MB at 3.2M entries after a rescan that changed
+    /// anything. Instead it publishes the current snapshot without its
+    /// orders, marked `orders_pending` (readers wait for the next one, see
+    /// `snapshot::settled`), and takes the orders when that leaves them to
+    /// it alone. A reader may hold the old snapshot (a window keeps the one
+    /// it shows; a save may be writing it): then it is put back as it was
+    /// and `None` returned, and the batch is merged into copies as before.
+    /// While a window shows, searches never wait for a merge: the orders
+    /// are copied, as before.
+    fn take_orders(&mut self) -> Option<(Vec<Order>, Pending)> {
+        // A compaction would run while readers wait; a merge expected to
+        // take long would keep them waiting past `snapshot::SETTLE_LIMIT`.
+        if self.foreground() || self.compaction_due() || !self.in_place_fits() {
+            return None;
+        }
+        let current = self.shared.current.load_full();
+        // Between commits the published orders are the writer's own.
+        if !Arc::ptr_eq(&current.orders, &self.orders) {
+            return None;
+        }
+        let interim = Arc::new(EngineSnapshot {
+            orders: Arc::new(Vec::new()),
+            orders_pending: true,
+            ..(*current).clone()
+        });
+        drop(current);
+        // The swap settles the loans of readers that are still reading the
+        // old snapshot (arc-swap's `load`), so the counts below are exact.
+        let since = Instant::now();
+        let old = self.shared.current.swap(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&self.shared),
+            interim,
+            since,
+        };
+        let mut old = match Arc::try_unwrap(old) {
+            Ok(old) => old,
+            Err(held) => {
+                self.shared.current.store(held);
+                return None;
+            }
+        };
+        let orders = std::mem::replace(&mut old.orders, Arc::new(Vec::new()));
+        drop(std::mem::replace(&mut self.orders, Arc::new(Vec::new())));
+        match Arc::try_unwrap(orders) {
+            Ok(orders) => Some((orders, pending)),
+            Err(held) => {
+                // A reader kept a copy of the snapshot's fields.
+                self.orders = Arc::clone(&held);
+                old.orders = held;
+                self.shared.current.store(Arc::new(old));
+                None
+            }
+        }
+    }
+}
+
+/// The snapshot the writer publishes while it merges the orders in place
+/// ([`Writer::take_orders`]), held until the merge's result is published.
+/// If the merge unwinds before that, dropping it publishes the same
+/// snapshot without the pending mark, so readers don't wait for a snapshot
+/// that won't come: an order they need is then built on the spot.
+struct Pending {
+    shared: Arc<Shared>,
+    interim: Arc<EngineSnapshot>,
+    /// When it was published: readers may wait from then on.
+    since: Instant,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let still_published = Arc::ptr_eq(&*self.shared.current.load(), &self.interim);
+        if still_published {
+            let mut snap = (*self.interim).clone();
+            snap.orders_pending = false;
+            self.shared.current.store(Arc::new(snap));
+        }
     }
 }
 
@@ -813,7 +1021,7 @@ where
 /// order batch when it changed, and marked seen. A rejected entry is
 /// dropped, as during any full rescan: the rescan is already the fallback
 /// for an inconsistent batch.
-fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut Vec<bool>, e: Entry) {
+fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut MatchSet, e: Entry) {
     let Ok((id, what)) = index.upsert_reporting(e) else {
         return;
     };
@@ -822,8 +1030,107 @@ fn take_one(index: &mut Index, batch: &mut Batch, seen: &mut Vec<bool>, e: Entry
         Upserted::Moved => batch.moved(id),
         Upserted::Updated | Upserted::Inserted => batch.upsert(id),
     }
-    if id.index() >= seen.len() {
-        seen.resize(id.index() + 1, false);
+    // A new entry's ID may be past the bound the set was made for: it grows.
+    seen.insert(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use arc_swap::ArcSwap;
+
+    use super::*;
+    use crate::checkpoint::Checkpoints;
+    use crate::health::HealthState;
+
+    fn snapshot(generation: u64, orders_pending: bool) -> EngineSnapshot {
+        EngineSnapshot {
+            index: Index::new().snapshot(),
+            orders: Arc::new(Vec::new()),
+            cursor: None,
+            generation,
+            priority: None,
+            orders_pending,
+        }
     }
-    seen[id.index()] = true;
+
+    fn shared(current: Arc<EngineSnapshot>) -> Arc<Shared> {
+        Arc::new(Shared {
+            current: ArcSwap::new(current),
+            subscribers: Mutex::new(Vec::new()),
+            health: HealthState::new(EngineHealth::Live),
+            paused: AtomicBool::new(false),
+            foreground: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            checkpoints: Checkpoints::new(None, None, Duration::from_secs(60), None),
+        })
+    }
+
+    #[test]
+    fn a_merge_that_unwinds_leaves_no_snapshot_pending() {
+        let interim = Arc::new(snapshot(3, true));
+        let shared = shared(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&shared),
+            interim,
+            since: Instant::now(),
+        };
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _pending = pending;
+            panic!("the merge failed");
+        }));
+        assert!(unwound.is_err());
+        let now = shared.current.load_full();
+        assert!(!now.orders_pending, "readers would wait for nothing");
+        assert_eq!(now.generation, 3, "the same snapshot, without its mark");
+    }
+
+    #[test]
+    fn a_published_merge_is_left_alone() {
+        let interim = Arc::new(snapshot(3, true));
+        let shared = shared(Arc::clone(&interim));
+        let pending = Pending {
+            shared: Arc::clone(&shared),
+            interim,
+            since: Instant::now(),
+        };
+        let published = Arc::new(snapshot(4, false));
+        shared.current.store(Arc::clone(&published));
+        drop(pending);
+        assert!(Arc::ptr_eq(&shared.current.load_full(), &published));
+    }
+
+    #[test]
+    fn the_writer_waits_less_than_the_readers_accept() {
+        // The owner's bound for a search waiting on a hidden merge (11 Nov),
+        // and the writer's own budget well inside it.
+        assert!(crate::snapshot::SETTLE_LIMIT <= Duration::from_millis(100));
+        assert!(IN_PLACE_BUDGET * 2 <= crate::snapshot::SETTLE_LIMIT);
+    }
+
+    #[test]
+    fn a_merge_expected_past_the_budget_is_not_done_in_place() {
+        // The first estimate: a small batch over a few million entries
+        // fits; the whole-disk rescans measured on 11 Nov (74,000 changes
+        // and more, 1.1 s and more in place) don't, nor does a far smaller
+        // batch.
+        let budget = IN_PLACE_BUDGET.as_nanos() as f64;
+        let entries = 3_500_000.0;
+        assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * 100.0) <= budget);
+        for batch in [1_000.0, 74_000.0] {
+            assert!(FIRST_NS_PER_UNIT * (entries + BATCH_WEIGHT * batch) > budget);
+        }
+        // A refusal lowers a timed estimate, so the path is tried again,
+        // but only after many commits (minutes of steady changes).
+        let slow = budget / entries * 1.5;
+        let mut cost = slow;
+        let mut refusals = 0;
+        while cost * entries > budget {
+            cost *= COST_DECAY;
+            refusals += 1;
+        }
+        assert!((50..=120).contains(&refusals), "{refusals} refusals");
+    }
 }

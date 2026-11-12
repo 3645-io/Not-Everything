@@ -459,9 +459,12 @@ impl WinController {
     /// [`crate::actions::escape_action`]). As [`hide_mode`] decides, it
     /// hides the app, so macOS activates the app the user was using before,
     /// or, when the user came from the Settings window, orders out only the
-    /// search window and leaves Settings in front.
+    /// search window and leaves Settings in front. An open Quick Look panel
+    /// closes with it, so it neither floats on alone nor comes back with
+    /// the next summon.
     pub(crate) fn hide_window(&self) {
         let Some(ui) = self.ui() else { return };
+        super::quick_look::close();
         let (active_at_summon, settings_visible) = self
             .with_resident(|r| {
                 let settings = r.settings_ui.as_ref().is_some_and(|s| s.is_visible());

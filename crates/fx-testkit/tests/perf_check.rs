@@ -21,6 +21,8 @@
 //!   Access;
 //! - its quick-tier map from crates to steps is the one the agent rule
 //!   (`.agents/rules/performance.md`) lists;
+//! - the soak (C3) runs only when asked for with `--step soak` at the rc
+//!   tier, in the scratch folder, and is in no default list of steps;
 //! - `check-perf-report.sh` passes a pull request that changes no shipped
 //!   code, or whose description has a passing summary of a run with no
 //!   skipped step or the owner's approval to skip, fails one without, and
@@ -288,6 +290,40 @@ fn quick_steps_match_the_agent_rule() {
     );
 }
 
+/// The soak (C3) runs for hours, so it runs only when asked for: never in
+/// a default list of steps, always in the scratch folder in `$TMPDIR`, and
+/// its `soak_differences` goes to the metrics.
+#[test]
+fn perf_check_runs_the_soak_only_when_asked() {
+    let code = code();
+    let soaks: Vec<&String> = code.iter().filter(|l| l.contains("\"$EX/soak\"")).collect();
+    assert!(!soaks.is_empty(), "{SCRIPT} must run the soak example");
+    for line in &soaks {
+        assert!(
+            line.contains("--dir \"$SCRATCH\"") && line.contains("--duration"),
+            "{SCRIPT}: the soak must run for its duration in the scratch folder: {}",
+            line.trim()
+        );
+    }
+    let text = code.join("\n");
+    assert!(
+        text.contains("emit soak_differences"),
+        "{SCRIPT} must report soak_differences"
+    );
+    let defaults: Vec<&String> = code
+        .iter()
+        .filter(|l| l.trim_start().starts_with("STEPS=\""))
+        .collect();
+    assert!(!defaults.is_empty(), "{SCRIPT} must set default steps");
+    for line in defaults {
+        assert!(
+            !line.contains("soak"),
+            "{SCRIPT}: the soak must not be a default step: {}",
+            line.trim()
+        );
+    }
+}
+
 #[cfg(unix)]
 mod refusals {
     use super::*;
@@ -336,6 +372,76 @@ mod refusals {
             assert_refused(&res, 2, phrase, &format!("{args:?}"));
             assert!(!out_dir.exists(), "{args:?} must not create --out");
         }
+    }
+
+    #[test]
+    fn refuses_bad_soak_arguments_before_creating_anything() {
+        let out_dir = temp_path("perf-check-soak-refused");
+        let out = out_dir.to_str().unwrap();
+        let cases: [(&[&str], &str); 5] = [
+            (
+                &["--tier", "pr", "--out", out, "--step", "soak"],
+                "--step soak runs at the rc tier only",
+            ),
+            (
+                &["--tier", "quick", "--out", out, "--step", "soak"],
+                "--step soak runs at the rc tier only",
+            ),
+            (
+                &[
+                    "--tier",
+                    "rc",
+                    "--out",
+                    out,
+                    "--step",
+                    "soak",
+                    "--soak-minutes",
+                    "ten",
+                ],
+                "--soak-minutes must be a whole number",
+            ),
+            (
+                &[
+                    "--tier",
+                    "rc",
+                    "--out",
+                    out,
+                    "--step",
+                    "soak",
+                    "--soak-minutes",
+                    "0",
+                ],
+                "--soak-minutes must be above 0",
+            ),
+            (
+                &["--tier", "rc", "--out", out, "--soak-minutes", "5"],
+                "--soak-minutes needs --step soak",
+            ),
+        ];
+        for (args, phrase) in cases {
+            let res = run(args);
+            assert_refused(&res, 2, phrase, &format!("{args:?}"));
+            assert!(!out_dir.exists(), "{args:?} must not create --out");
+        }
+    }
+
+    /// A valid soak request gets past every argument check: without cargo
+    /// on PATH it stops there, before building or creating anything.
+    #[test]
+    fn accepts_the_soak_at_the_rc_tier() {
+        let dir = temp_path("perf-check-soak-accepted");
+        let res = run(&[
+            "--tier",
+            "rc",
+            "--out",
+            dir.to_str().unwrap(),
+            "--step",
+            "soak",
+            "--soak-minutes",
+            "1440",
+        ]);
+        assert_refused(&res, 2, "cargo is not on PATH", "a valid soak request");
+        assert!(!dir.exists(), "--out must not be created without cargo");
     }
 
     #[test]
