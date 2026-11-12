@@ -21,7 +21,8 @@
 //!   on top of it (macOS only), plus the cross-platform event-flag
 //!   classifier, the pure event-to-`Change` mapping and the cursor logic.
 //! * `path_stat` (macOS only) holds `MacPathStat`, the `lstat`-based
-//!   `fx_fs::PathStat` that keys entries like `MacScanner` and never
+//!   `fx_fs::PathStat` that keys entries like `MacScanner`, names them as
+//!   the volume stores them, whatever spelling the path used, and never
 //!   materializes cloud files.
 //! * [`volumes`] is the mount table: `getfsstat` (macOS only) and the pure
 //!   mount policy. Only `/` is indexed in the MVP; every other mount point
