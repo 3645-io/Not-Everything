@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 
 use fx_fs::{ChangeSource, PathStat, VolumeEnumerator, reconcile_path};
 use fx_index::{DEFAULT_COMPACT_FRACTION, Index, IndexBuilder, IndexError, Upserted};
-use fx_model::{
-    Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome, VolumeId,
-};
+use fx_model::{Change, Entry, EntryId, EntryKind, FileKey, ResumeCursor, StartOutcome, VolumeId};
 use fx_sort::{Batch, MatchSet, Order};
 
 use crate::Shared;
