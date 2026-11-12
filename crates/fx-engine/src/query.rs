@@ -42,11 +42,21 @@ impl EngineSnapshot {
     }
 
     /// The search hits (entry IDs of this snapshot) as a match set for
-    /// [`fx_sort::emit`].
+    /// [`fx_sort::emit`], without the offline entries when the snapshot may
+    /// hold some ([`EngineSnapshot::is_offline`]): they are hidden from
+    /// every search until the interface can mark them.
     pub(crate) fn match_set(&self, hits: &[u32]) -> MatchSet {
         let mut matches = MatchSet::with_bound(self.index.id_bound());
-        for &id in hits {
-            matches.insert(EntryId(id));
+        if self.hide_offline {
+            for &id in hits {
+                if !self.is_offline(EntryId(id)) {
+                    matches.insert(EntryId(id));
+                }
+            }
+        } else {
+            for &id in hits {
+                matches.insert(EntryId(id));
+            }
         }
         matches
     }

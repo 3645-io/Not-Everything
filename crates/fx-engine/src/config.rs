@@ -53,6 +53,7 @@ pub struct EngineConfig {
     restart_backoff: Duration,
     priority_include: Vec<PathBuf>,
     priority_exclude: Vec<PathBuf>,
+    volumes_folder: Option<PathBuf>,
 }
 
 impl EngineConfig {
@@ -73,7 +74,34 @@ impl EngineConfig {
             restart_backoff: DEFAULT_RESTART_BACKOFF,
             priority_include: Vec::new(),
             priority_exclude: Vec::new(),
+            volumes_folder: None,
         }
+    }
+
+    /// Sets the folder volumes are mounted in (run 2.4): `/Volumes` for
+    /// the app, an absolute path at or below the root.
+    ///
+    /// A *volume root* is a live entry directly in that folder whose key is
+    /// on another volume than the folder's own (a mount point the scanner
+    /// entered, keyed by the mounted volume's root). When a volume root
+    /// disappears from the disk (its path is gone, or a rescan does not
+    /// list it), the volume goes offline instead of away: its entries stay
+    /// in the index, re-keyed onto a reserved offline volume ID
+    /// ([`fx_model::VolumeId::is_offline`];
+    /// [`EngineSnapshot::is_offline`](crate::EngineSnapshot::is_offline)),
+    /// and searches leave them out until the interface can mark them.
+    /// Rescans keep offline entries, and a volume mounted with the same
+    /// name in the folder replaces them. Without a volumes folder (the
+    /// default) a vanished mount point is removed like any folder.
+    pub fn with_volumes_folder(mut self, folder: impl Into<PathBuf>) -> EngineConfig {
+        self.volumes_folder = Some(folder.into());
+        self
+    }
+
+    /// The folder volumes are mounted in, if set
+    /// ([`with_volumes_folder`](Self::with_volumes_folder)).
+    pub fn volumes_folder(&self) -> Option<&Path> {
+        self.volumes_folder.as_deref()
     }
 
     /// Sets the folders of the priority group ("Your files first"): an

@@ -160,6 +160,14 @@ const PLATFORM_DEPENDENCY_ALLOWLIST: &[(&str, &[AllowedDep])] = &[
                 targets: &[None, Some(MACOS_CFG)],
                 path: Some("../fx-bench"),
             },
+            // Workspace crate (std only); the disk images of the
+            // external-volume tests (run 2.4).
+            AllowedDep {
+                name: "fx-testkit",
+                kind: DepKind::Dev,
+                targets: &[None, Some(MACOS_CFG)],
+                path: Some("../fx-testkit"),
+            },
         ],
     ),
     (

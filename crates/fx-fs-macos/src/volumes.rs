@@ -5,11 +5,16 @@
 //! [`mount_policy`] decides, purely from a [`MountInfo`], whether the
 //! scanner indexes a mount or only lists it:
 //!
-//! * In the MVP only the local boot volume at `/` is indexed.
+//! * The local boot volume at `/` is indexed.
+//! * With [`ExternalVolumes`] given ([`mount_policy_with`]; run 2.4),
+//!   external volumes are indexed too: a local, non-network APFS, HFS+,
+//!   FAT or exFAT volume mounted directly in the external volumes folder
+//!   (`/Volumes`) that the Finder shows (`MNT_DONTBROWSE` clear, so Time
+//!   Machine snapshots, the Recovery volume and `-nobrowse` disk images are
+//!   left out unless [`ExternalVolumes::include_hidden`] is set).
 //! * Every other mount point, including the Data volume at
 //!   `/System/Volumes/Data` (reached through firmlinks from `/`), the other
 //!   system volumes, `devfs` and `autofs`, is listed but not entered.
-//! * External volumes are out of scope until Phase 2 of `docs/PLAN.md`.
 //! * Network mounts (`MNT_LOCAL` clear, or `smbfs`, `nfs`, `afpfs`,
 //!   `webdav`) are never entered (Phase 6).
 //!
@@ -21,6 +26,15 @@ use std::path::{Path, PathBuf};
 const MNT_RDONLY: u32 = 0x0000_0001;
 /// `MNT_LOCAL` (`sys/mount.h`).
 const MNT_LOCAL: u32 = 0x0000_1000;
+/// `MNT_DONTBROWSE` (`sys/mount.h`): the Finder does not show the mount.
+const MNT_DONTBROWSE: u32 = 0x0010_0000;
+
+/// The folder macOS mounts external volumes in.
+pub const EXTERNAL_VOLUMES_FOLDER: &str = "/Volumes";
+
+/// File-system types indexed on external volumes: APFS, HFS+, FAT
+/// (`msdos`) and exFAT.
+pub const EXTERNAL_FS_TYPES: &[&str] = &["apfs", "hfs", "msdos", "exfat"];
 
 /// File-system types that are always network mounts.
 const NETWORK_FS_TYPES: &[&str] = &["smbfs", "nfs", "afpfs", "webdav"];
@@ -34,6 +48,8 @@ pub struct MountFlags {
     pub readonly: bool,
     /// `MNT_LOCAL` is clear, or the type is a network file system.
     pub network: bool,
+    /// `MNT_DONTBROWSE` is clear: the Finder shows the mount.
+    pub browsable: bool,
 }
 
 impl MountFlags {
@@ -46,6 +62,7 @@ impl MountFlags {
             local,
             readonly: raw & MNT_RDONLY != 0,
             network: !local || NETWORK_FS_TYPES.contains(&fs_type),
+            browsable: raw & MNT_DONTBROWSE == 0,
         }
     }
 }
@@ -74,12 +91,62 @@ pub enum MountPolicy {
     ListOnly,
 }
 
-/// The MVP policy: only the local, non-network root `/` is indexed; every
-/// other mount is [`MountPolicy::ListOnly`]. Pure.
+/// Which external volumes are indexed (run 2.4): those mounted directly
+/// in [`folder`](Self::folder), of a type in [`EXTERNAL_FS_TYPES`], local
+/// and not network, and shown by the Finder unless
+/// [`include_hidden`](Self::include_hidden) is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalVolumes {
+    /// The folder external volumes are mounted in, canonical (no symlinks):
+    /// [`EXTERNAL_VOLUMES_FOLDER`] for the app. Only mounts directly in it
+    /// are indexed.
+    pub folder: PathBuf,
+    /// Index mounts the Finder hides (`MNT_DONTBROWSE`) too. Off for the
+    /// app, where those are Time Machine snapshots, the Recovery volume and
+    /// disk images attached with `-nobrowse`; tests turn it on to index
+    /// the disk images they attach that way.
+    pub include_hidden: bool,
+}
+
+impl ExternalVolumes {
+    /// The app's setting: browsable volumes in `/Volumes`.
+    #[must_use]
+    pub fn system() -> ExternalVolumes {
+        ExternalVolumes {
+            folder: PathBuf::from(EXTERNAL_VOLUMES_FOLDER),
+            include_hidden: false,
+        }
+    }
+
+    /// Whether `mount` is an external volume this setting indexes. Never
+    /// true for the root mount.
+    #[must_use]
+    pub fn indexes(&self, mount: &MountInfo) -> bool {
+        !mount.is_root
+            && mount.flags.local
+            && !mount.flags.network
+            && (mount.flags.browsable || self.include_hidden)
+            && EXTERNAL_FS_TYPES.contains(&mount.fs_type.as_str())
+            && mount.mount_point.parent() == Some(self.folder.as_path())
+            && mount.mount_point.file_name().is_some()
+    }
+}
+
+/// The policy without external volumes: only the local, non-network root
+/// `/` is indexed; every other mount is [`MountPolicy::ListOnly`]. Pure.
 #[must_use]
 pub fn mount_policy(mount: &MountInfo) -> MountPolicy {
+    mount_policy_with(mount, None)
+}
+
+/// The policy: the local, non-network root `/` is indexed, and so is every
+/// external volume `external` indexes ([`ExternalVolumes::indexes`]);
+/// every other mount is [`MountPolicy::ListOnly`]. Pure.
+#[must_use]
+pub fn mount_policy_with(mount: &MountInfo, external: Option<&ExternalVolumes>) -> MountPolicy {
     let is_root = mount.is_root && mount.mount_point == Path::new("/");
-    if is_root && mount.flags.local && !mount.flags.network {
+    let local_root = is_root && mount.flags.local && !mount.flags.network;
+    if local_root || external.is_some_and(|e| e.indexes(mount)) {
         MountPolicy::Index
     } else {
         MountPolicy::ListOnly

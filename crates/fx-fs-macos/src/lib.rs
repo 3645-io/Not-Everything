@@ -25,8 +25,11 @@
 //!   the volume stores them, whatever spelling the path used, and never
 //!   materializes cloud files.
 //! * [`volumes`] is the mount table: `getfsstat` (macOS only) and the pure
-//!   mount policy. Only `/` is indexed in the MVP; every other mount point
-//!   is listed but not entered, and network mounts are never entered.
+//!   mount policy. `/` is indexed, and with [`volumes::ExternalVolumes`]
+//!   the external APFS, HFS+, FAT and exFAT volumes in `/Volumes` too (run
+//!   2.4); every other mount point is listed but not entered, and network
+//!   mounts are never entered. `fsevents::volumes_source` watches the
+//!   external volumes and reports their mounts and unmounts.
 //! * [`firmlinks`] parses `/usr/share/firmlinks` and folds
 //!   `/System/Volumes/Data/...` paths onto their canonical `/` form, so the
 //!   Data volume is never indexed twice.

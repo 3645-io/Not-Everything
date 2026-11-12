@@ -45,3 +45,20 @@ pub(crate) fn resolve(
     }
     Some(cur)
 }
+
+/// Whether the index holds an offline volume: an entry directly in the
+/// volumes folder `folder` keyed on an offline volume ID (run 2.4; the
+/// writer takes volumes offline only there). Looks at that folder's
+/// children only. `false` without a volumes folder.
+pub(crate) fn has_offline(index: &Index, root: &Path, folder: Option<&Path>) -> bool {
+    let Some(folder) = folder else {
+        return false;
+    };
+    let Some(folder_id) = resolve(index, root, folder, None) else {
+        return false;
+    };
+    index
+        .children(folder_id)
+        .into_iter()
+        .any(|c| index.key(c).volume.is_offline())
+}
