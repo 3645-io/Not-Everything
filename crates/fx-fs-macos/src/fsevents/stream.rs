@@ -483,9 +483,22 @@ fn deliver(
             let bytes = unsafe { CStr::from_ptr(raw_path) }.to_bytes();
             absolute_path(&shared.mount, Path::new(OsStr::from_bytes(bytes)))
         };
-        if !admit(&path, flags, shared.filter.as_deref()) {
+        // A rescan reported on the volume's mount point or on an ancestor of
+        // the filter is a rescan of the filtered folder (`filter_event`):
+        // FSEvents reports dropped events that way, and with a firmlinked
+        // filter (`/private/var/...`) the mount point is not its ancestor.
+        // Anything else outside the filter passes only if `admit` lets it.
+        let path = if marker {
+            path
+        } else if let Some(routed) =
+            filter_event(&path, flags, shared.filter.as_deref(), &shared.mount)
+        {
+            routed
+        } else if admit(&path, flags, shared.filter.as_deref()) {
+            path
+        } else {
             continue;
-        }
+        };
         if !inner.tracker.on_raw_event(id, flags) {
             // An item event at or before the replay start: already applied,
             // counted in `dropped_before_cursor`.
@@ -501,6 +514,40 @@ fn deliver(
             });
         }
     }
+}
+
+/// Applies [`StreamConfig::path_filter`] to one event (not the HistoryDone
+/// marker): the path to deliver it with, or `None` when it is for
+/// [`admit`] to decide.
+///
+/// Events at or below `filter` pass unchanged, and everything passes
+/// without a filter. Outside the filter only a rescan that covers it
+/// passes, as a rescan of the filtered folder itself: an event asking for
+/// a rescan (`MustScanSubDirs`, `UserDropped`, `KernelDropped`,
+/// `EventIdsWrapped`, `RootChanged`) on the volume's mount point `mount`
+/// or on an ancestor of the filter. FSEvents reports the events it dropped
+/// that way, as a rescan of the volume root (observed by the soak on the
+/// Data volume: `MustScanSubDirs | UserDropped` on `/System/Volumes/Data`,
+/// in bursts while the Mac was busy and at the start of a replay). The
+/// mount point is not an ancestor of a filter in its firmlinked form
+/// (`/private/var/...`), hence the separate test. Dropping such an event
+/// lost every change it stood for.
+fn filter_event(
+    path: &Path,
+    flags: EventFlags,
+    filter: Option<&Path>,
+    mount: &Path,
+) -> Option<PathBuf> {
+    let Some(filter) = filter else {
+        return Some(path.to_path_buf());
+    };
+    if path.starts_with(filter) {
+        return Some(path.to_path_buf());
+    }
+    if flags.asks_rescan() && (path == mount || filter.starts_with(path)) {
+        return Some(filter.to_path_buf());
+    }
+    None
 }
 
 /// Turns a path reported by the stream into an absolute, firmlinked path.
@@ -608,6 +655,81 @@ mod tests {
         FirmlinkMap::parse(&String::from_utf8_lossy(text))
             .entries()
             .to_vec()
+    }
+
+    const DROPPED: EventFlags =
+        EventFlags(EventFlags::MUST_SCAN_SUB_DIRS.0 | EventFlags::USER_DROPPED.0);
+    const CREATED: EventFlags = EventFlags(EventFlags::ITEM_CREATED.0 | EventFlags::ITEM_IS_FILE.0);
+
+    fn routed(path: &str, flags: EventFlags, filter: Option<&str>) -> Option<PathBuf> {
+        filter_event(
+            Path::new(path),
+            flags,
+            filter.map(Path::new),
+            Path::new("/System/Volumes/Data"),
+        )
+    }
+
+    #[test]
+    fn events_at_or_below_the_filter_pass_unchanged() {
+        let filter = Some("/private/var/t/root");
+        for flags in [CREATED, DROPPED] {
+            assert_eq!(
+                routed("/private/var/t/root/a/b", flags, filter),
+                Some(PathBuf::from("/private/var/t/root/a/b"))
+            );
+            assert_eq!(
+                routed("/private/var/t/root", flags, filter),
+                Some(PathBuf::from("/private/var/t/root"))
+            );
+        }
+        assert_eq!(
+            routed("/elsewhere/x", CREATED, None),
+            Some(PathBuf::from("/elsewhere/x"))
+        );
+    }
+
+    #[test]
+    fn other_events_outside_the_filter_are_dropped() {
+        let filter = Some("/private/var/t/root");
+        assert_eq!(routed("/private/var/t/other", CREATED, filter), None);
+        assert_eq!(routed("/private/var/t", CREATED, filter), None);
+        assert_eq!(routed("/System/Volumes/Data", CREATED, filter), None);
+        // A rescan of a folder beside the filter doesn't cover it.
+        assert_eq!(routed("/private/var/t/other", DROPPED, filter), None);
+        assert_eq!(routed("/private/var/t/root2", DROPPED, filter), None);
+    }
+
+    /// Found by the soak: FSEvents reports events it dropped as a rescan of
+    /// the volume root (`MustScanSubDirs | UserDropped` on
+    /// `/System/Volumes/Data`), which the filter used to hide, so the
+    /// dropped changes were never picked up.
+    #[test]
+    fn a_rescan_of_the_volume_root_or_an_ancestor_rescans_the_filtered_folder() {
+        let filter = Some("/private/var/t/root");
+        let want = Some(PathBuf::from("/private/var/t/root"));
+        assert_eq!(routed("/System/Volumes/Data", DROPPED, filter), want);
+        assert_eq!(routed("/private/var/t", DROPPED, filter), want);
+        assert_eq!(routed("/", DROPPED, filter), want);
+        let kernel = EventFlags(EventFlags::MUST_SCAN_SUB_DIRS.0 | EventFlags::KERNEL_DROPPED.0);
+        assert_eq!(routed("/System/Volumes/Data", kernel, filter), want);
+        assert_eq!(
+            routed(
+                "/System/Volumes/Data",
+                EventFlags::MUST_SCAN_SUB_DIRS,
+                filter
+            ),
+            want
+        );
+        // A volume rescan reaches the source too, whatever its path.
+        assert_eq!(
+            routed(
+                "/System/Volumes/Data",
+                EventFlags::EVENT_IDS_WRAPPED,
+                filter
+            ),
+            want
+        );
     }
 
     #[test]

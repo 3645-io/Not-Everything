@@ -32,10 +32,17 @@
 //!
 //! Actions are read-only (see [`crate::actions`]): Enter opens, Cmd+Enter
 //! reveals in Finder, Option+Cmd+C copies full paths, double-click opens,
+//! Space shows the selection in the system Quick Look panel (`quick_look.rs`),
 //! and dragging rows out offers file URLs with copy and link operations
 //! only.
 //! In the resident app Escape clears the search, then hides the window and
-//! hands the focus back to the previous app, as the summon hotkey does.
+//! hands the focus back to the previous app, as the summon hotkey does;
+//! with the Quick Look panel open it closes the panel first.
+//!
+//! The views report what VoiceOver reads ([`crate::accessibility`]): each
+//! result cell its column and its text in words (so a row reads in the
+//! columns' order), the status bar in words, and a new search's result
+//! count as an announcement.
 //!
 //! The app runs resident when [`WindowConfig::resident`] is set: a status
 //! item and menu, the global summon hotkey, Launch at Login and the Full
@@ -58,6 +65,7 @@ mod debug_script;
 pub mod paint;
 #[cfg(feature = "measure")]
 mod probes;
+mod quick_look;
 mod resident;
 mod ribbon;
 mod settings_controls;

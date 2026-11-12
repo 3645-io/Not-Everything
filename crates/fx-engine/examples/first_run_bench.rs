@@ -13,7 +13,8 @@
 //! and the engine is live, the time to the first non-empty snapshot, and
 //! how many non-empty snapshots were published up to then (the progressive
 //! count: 1 means the scan appeared at once). The final snapshot's memory
-//! report follows as `memory_*` metrics.
+//! report follows as `memory_*` metrics. `--stream-kb N` sets the scanner's
+//! buffer (`ScanOptions::stream_budget`) to compare sizes.
 //!
 //! Output: `metric=value` lines (see the crate README) and the gate lines
 //! `GATE first run scan <= 15 s`, `GATE first run results shown
@@ -59,10 +60,12 @@ mod bench {
 
     const USAGE: &str = "\
 usage:
-  first_run_bench [--root DIR] [--timeout SECS] [--cache warm|cold|unknown]
+  first_run_bench [--root DIR] [--timeout SECS] [--stream-kb N]
+                  [--cache warm|cold|unknown]
 
   --root DIR      the folder to scan (default /)
   --timeout SECS  give up after SECS, 1..=86400 (default 600)
+  --stream-kb N   the scanner's buffer in KiB (default: the scanner's own)
   --cache STATE   cache state label for the report (default unknown)
 
 Gates: first run scan <= 15 s (for about 2M entries); results shown
@@ -76,12 +79,17 @@ progressively; memory <= 100 B per entry.";
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        let parsed = Flags::parse(&args, &["--root", "--timeout", "--cache"], &[]).and_then(|f| {
+        let flags = ["--root", "--timeout", "--stream-kb", "--cache"];
+        let parsed = Flags::parse(&args, &flags, &[]).and_then(|f| {
             let timeout = Duration::from_secs(f.number("--timeout", 600, 1, 86_400)?);
             let root = PathBuf::from(f.get("--root").unwrap_or("/"));
-            Ok((root, timeout, f.cache()?))
+            let mut scan = ScanOptions::default();
+            if f.get("--stream-kb").is_some() {
+                scan.stream_budget = (f.number("--stream-kb", 0, 1, 4 << 20)? as usize) << 10;
+            }
+            Ok((root, timeout, scan, f.cache()?))
         });
-        let (root, timeout, cache) = match parsed {
+        let (root, timeout, scan, cache) = match parsed {
             Ok(p) => p,
             Err(UsageError(msg)) => {
                 eprintln!("first_run_bench: {msg}\n\n{USAGE}");
@@ -89,7 +97,7 @@ progressively; memory <= 100 B per entry.";
             }
         };
         header("first_run", cache);
-        match run(root, timeout) {
+        match run(root, timeout, scan) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("first_run_bench: error: {e}");
@@ -98,7 +106,7 @@ progressively; memory <= 100 B per entry.";
         }
     }
 
-    fn run(root: PathBuf, timeout: Duration) -> io::Result<()> {
+    fn run(root: PathBuf, timeout: Duration, scan: ScanOptions) -> io::Result<()> {
         let root = std::fs::canonicalize(&root)?;
         if !root.is_dir() {
             return Err(io::Error::other(format!(
@@ -107,6 +115,7 @@ progressively; memory <= 100 B per entry.";
             )));
         }
         metric("root", root.display());
+        metric("stream_budget_bytes", scan.stream_budget);
         let mut stream = StreamConfig::new(root.clone());
         stream.path_filter = Some(root.clone());
         let t = Instant::now();
@@ -115,7 +124,7 @@ progressively; memory <= 100 B per entry.";
             EngineConfig::new(&root),
             FsEventsSource::new(stream),
             MacPathStat::new(),
-            MacScanner::new(ScanOptions::default()),
+            MacScanner::new(scan),
         )?;
         let announced = engine.subscribe();
         let mut nonempty = 0usize;
