@@ -12,11 +12,13 @@
 //! - **Literals** fold the needle once and keep one
 //!   [`memchr::memmem::Finder`] for it, run over the folded name (from the
 //!   view's prebuilt folded copy when it holds the term's folding, else
-//!   folded per entry). The folding follows the apostrophe rule
-//!   ([`FoldOptions::for_term`]): a term with an apostrophe reads the
-//!   default copy, where apostrophes are kept as `'`; a term without one
-//!   reads the copy's side table for the names that have an apostrophe and
-//!   the default copy for the others (see [`crate::fold`]).
+//!   folded per entry into a buffer each search thread reuses, so an
+//!   ASCII name, nearly every one, costs no allocation). The folding
+//!   follows the apostrophe rule ([`FoldOptions::for_term`]): a term with
+//!   an apostrophe reads the default copy, where apostrophes are kept as
+//!   `'`; a term without one reads the copy's side table for the names
+//!   that have an apostrophe and the default copy for the others (see
+//!   [`crate::fold`]).
 //!   `start-with:`, `end-with:`, `ww:` and `wfn:` check the positions the
 //!   finder reports.
 //! - **Wildcards** fold their literal pieces once. A name-only `*.ext`
@@ -26,7 +28,8 @@
 //!   invalid expression matches nothing, like the oracle.
 //! - **Functions** precompute what they can (lowercased `ext:` lists,
 //!   resolved date periods) and otherwise use [`crate::eval::filter_matches`].
-//! - **Kind filters** (`file:`, `folder:`) are checked before the text.
+//! - **Kind filters** (`file:`, `folder:`) are checked before the text;
+//!   a term for files and folders alike never reads the entry's kind.
 //! - `And` children are ordered cheapest first (kind, extension, metadata
 //!   and literals before regexes and path terms), which is safe because
 //!   every node is a pure function of the entry.
@@ -51,7 +54,6 @@
 //! `count:N` is exposed through [`CompiledQuery::limit`] and not applied:
 //! the limit belongs after sorting.
 
-use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
@@ -60,8 +62,8 @@ use memchr::memmem::Finder;
 use rayon::prelude::*;
 
 use crate::eval::{Candidate, EvalContext, filter_matches};
-use crate::fold::{FoldOptions, FoldedColumn, fold_str};
-use crate::paths::{PathCache, PathMemo, PathNeedle, folded_name, join};
+use crate::fold::{FoldOptions, FoldedColumn, fold_into, fold_str};
+use crate::paths::{PathCache, PathMemo, PathNeedle, join};
 use crate::regex_term::RegexTerm;
 use crate::substring::{CHECK_INTERVAL, CancelToken, Cancelled, DEFAULT_CHUNK_ENTRIES, NameColumn};
 use crate::syntax::functions::{Cmp, DateField, Filter, ValueTest};
@@ -522,6 +524,17 @@ impl<'a, V: SearchView + ?Sized> Entry<'a, V> {
         self.view.is_folder(self.id)
     }
 
+    /// Whether the entry is of `kind`. Files and folders alike
+    /// ([`TermKind::Any`], most terms) never read the entry's kind, which
+    /// costs a row read in a view such as the engine's.
+    fn kind_ok(&self, kind: TermKind) -> bool {
+        match kind {
+            TermKind::Any => true,
+            TermKind::FilesOnly => !self.is_dir(),
+            TermKind::FoldersOnly => self.is_dir(),
+        }
+    }
+
     fn parent_path(&mut self) -> &str {
         if self.parent_path.is_none() {
             let pp = match self.view.parent(self.id) {
@@ -542,14 +555,66 @@ impl<'a, V: SearchView + ?Sized> Entry<'a, V> {
         self.path.as_deref().unwrap_or("")
     }
 
-    /// The name or the full path, folded under `fold`. The full path is
-    /// the folder's cached folded path plus the folded name.
-    fn hay(&mut self, path: bool, fold: FoldOptions) -> Cow<'a, str> {
+    /// `test` of the name or the full path, folded under `fold`. The full
+    /// path is the folder's cached folded path plus the folded name. A name
+    /// is read from the view's folded copy when it has one, and is
+    /// otherwise folded into the thread's buffer, so testing an ASCII name
+    /// allocates nothing (a search re-run folds every name).
+    fn with_hay(
+        &mut self,
+        path: bool,
+        fold: FoldOptions,
+        test: impl FnOnce(Hay<'_>) -> bool,
+    ) -> bool {
         let (view, id) = (self.view, self.id);
         if path {
-            Cow::Owned(self.cache.folded_path(view, id, view.parent(id), fold))
+            return test(Hay::Text(&self.cache.folded_path(
+                view,
+                id,
+                view.parent(id),
+                fold,
+            )));
+        }
+        if let Some(folded) = view.folded(id, fold) {
+            return test(Hay::Text(folded));
+        }
+        let name = view.name(id);
+        let buf = &mut self.cache.fold_buf;
+        if fold_into(name, fold, buf) {
+            test(Hay::Folded(buf))
         } else {
-            folded_name(view, id, fold)
+            test(Hay::Text(name))
+        }
+    }
+}
+
+/// A folded name or full path under test. A plain substring or `*.ext`
+/// test reads its bytes; tests that need characters read it as text, which
+/// costs a UTF-8 check for a name folded into the thread's buffer (a check
+/// that costs about as much as folding a short name, so the plain tests,
+/// most of them, skip it).
+#[derive(Debug, Clone, Copy)]
+enum Hay<'h> {
+    /// Text that needed no folding, or was folded elsewhere.
+    Text(&'h str),
+    /// What [`fold_into`] wrote, which is always UTF-8.
+    Folded(&'h [u8]),
+}
+
+impl<'h> Hay<'h> {
+    fn bytes(self) -> &'h [u8] {
+        match self {
+            Hay::Text(text) => text.as_bytes(),
+            Hay::Folded(bytes) => bytes,
+        }
+    }
+
+    fn text(self) -> &'h str {
+        match self {
+            Hay::Text(text) => text,
+            // Never fails (see `Folded`); an empty text would only miss a
+            // match, never panic in a search.
+            Hay::Folded(bytes) => std::str::from_utf8(bytes).unwrap_or_default(),
         }
     }
 }
@@ -623,14 +688,6 @@ enum DateTest {
     Range(Option<(i64, i64)>),
 }
 
-fn kind_ok(kind: TermKind, is_dir: bool) -> bool {
-    match kind {
-        TermKind::Any => true,
-        TermKind::FilesOnly => !is_dir,
-        TermKind::FoldersOnly => is_dir,
-    }
-}
-
 impl M {
     fn eval<V: SearchView + ?Sized>(&self, e: &mut Entry<'_, V>) -> bool {
         match self {
@@ -639,10 +696,10 @@ impl M {
             M::Not(inner) => !inner.eval(e),
             M::And(children) => children.iter().all(|c| c.eval(e)),
             M::Or(children) => children.iter().any(|c| c.eval(e)),
-            M::Lit(t) => kind_ok(t.kind, e.is_dir()) && t.eval(e),
-            M::Wild(t) => kind_ok(t.kind, e.is_dir()) && t.matches(&e.hay(t.path, t.fold)),
+            M::Lit(t) => e.kind_ok(t.kind) && t.eval(e),
+            M::Wild(t) => e.kind_ok(t.kind) && e.with_hay(t.path, t.fold, |hay| t.matches(hay)),
             M::Regex { term, kind, path } => {
-                kind_ok(*kind, e.is_dir())
+                e.kind_ok(*kind)
                     && if *path {
                         term.is_match(e.path())
                     } else {
@@ -777,7 +834,7 @@ impl LitTerm {
             };
             return memos[k].is_hit(e.view, &needle, e.id, &mut e.cache.scratch);
         }
-        self.matches(&e.hay(self.path, self.fold))
+        e.with_hay(self.path, self.fold, |hay| self.matches(hay))
     }
 
     /// Whether the term is a plain substring test over the full path,
@@ -789,15 +846,23 @@ impl LitTerm {
             && !(o.whole_word || o.start_with || o.end_with || o.whole_filename)
     }
 
-    fn matches(&self, hay: &str) -> bool {
+    fn matches(&self, hay: Hay<'_>) -> bool {
         let opts = &self.opts;
         let constrained =
             opts.whole_word || opts.start_with || opts.end_with || opts.whole_filename;
+        if !constrained && !self.needle.is_empty() {
+            return self.finder.find(hay.bytes()).is_some();
+        }
+        self.matches_text(hay.text())
+    }
+
+    /// [`matches`](Self::matches) for an empty needle or a constrained one
+    /// (`start-with:`, `end-with:`, `ww:`, `wfn:`), which look at
+    /// characters around the match.
+    fn matches_text(&self, hay: &str) -> bool {
+        let opts = &self.opts;
         if self.needle.is_empty() {
             return find_constrained(hay, &self.needle, opts);
-        }
-        if !constrained {
-            return self.finder.find(hay.as_bytes()).is_some();
         }
         let n = self.needle.len();
         let must_start = opts.start_with || opts.whole_filename;
@@ -845,12 +910,15 @@ impl LitTerm {
 }
 
 impl WildTerm {
-    fn matches(&self, hay: &str) -> bool {
+    fn matches(&self, hay: Hay<'_>) -> bool {
         match &self.shape {
             WildShape::Suffix(suffix) => {
-                hay.ends_with(suffix.as_str()) && !hay[..hay.len() - suffix.len()].contains('/')
+                // `/` is ASCII, so no other character's bytes contain it.
+                let hay = hay.bytes();
+                hay.ends_with(suffix.as_bytes())
+                    && memchr::memchr(b'/', &hay[..hay.len() - suffix.len()]).is_none()
             }
-            WildShape::Steps(steps) => run_steps(steps, hay),
+            WildShape::Steps(steps) => run_steps(steps, hay.text()),
         }
     }
 }

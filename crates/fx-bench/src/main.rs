@@ -6,9 +6,10 @@
 //! Phase 1 benchmark results into `summary.md`.
 //!
 //! For the performance gate: `sample` records a process's resource use
-//! (macOS only), `churn` keeps files changing at a steady rate, and
-//! `perf-compare` judges metrics against a baseline file, and
-//! `perf-release` writes the performance section of a release's notes.
+//! (macOS only), `churn` keeps files changing at a steady rate, `saves`
+//! projects the index saves a phase is too short to see, `perf-compare`
+//! judges metrics against a baseline file, and `perf-release` writes the
+//! performance section of a release's notes.
 //!
 //! Argument parsing is hand-written (std only). Bad arguments print usage
 //! to stderr and exit with code 2; I/O failures exit with code 1, except in
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use fx_bench::{
     BenchConfig, CacheState, MachineInfo, Names, TreeShape, churn, gate, gate1, generate_names,
-    generate_tree, materialize, perf, release, run,
+    generate_tree, materialize, perf, release, run, saves,
 };
 
 const USAGE: &str = "\
@@ -70,8 +71,18 @@ usage:
       then create, rename and delete files in it at N operations per second
       (default 20) for SECS seconds, seeded by S (default 1), with at most
       --max-files files (default 5000). Touches nothing outside NEW_DIR and
-      leaves it in place. Prints churn_ops, churn_seconds and churn_rate.
+      leaves it in place. Prints churn_ops, churn_creates, churn_renames,
+      churn_deletes, churn_seconds and churn_rate.
       Exits 2 for bad arguments or an existing NEW_DIR, 1 for I/O errors.
+  fx-bench saves --label LABEL --entries N --save-bytes B --creates C --deletes D --duration SECS [--measured-per-day BYTES]
+      Project the index saves of a day at a phase's pace: the engine
+      compacts an index of N entries after 10% of N (at least 1,024) files
+      created or deleted, and each compaction rewrites the B-byte store.
+      From C creates and D deletes in SECS seconds, print LABEL_entries,
+      LABEL_rows_per_compaction, LABEL_compactions_per_day, LABEL_save_bytes
+      and LABEL_compaction_saves_per_day_bytes, and with the phase's
+      measured writes a day, LABEL_disk_written_with_saves_per_day_bytes,
+      their sum. Exits 2 for bad arguments.
   fx-bench perf-compare --baseline FILE --tier quick|pr|rc [--format md|json] [--out FILE] [--print-values] [--partial] METRICS_FILE...
       Judge each metric of the tier in the baseline FILE against the
       key=value METRICS_FILEs: PASS, FAIL (target or regression), NOT
@@ -140,6 +151,7 @@ fn main() -> ExitCode {
         }) => cmd_phase1_summary(&machine, cache, &dir),
         Ok(Command::Sample(args)) => cmd_sample(args),
         Ok(Command::Churn { dir, opts }) => cmd_churn(&dir, &opts),
+        Ok(Command::Saves(args)) => cmd_saves(&args),
         Ok(Command::PerfCompare(args)) => cmd_perf_compare(&args),
         Ok(Command::PerfRelease(args)) => cmd_perf_release(&args),
         Ok(cmd) => match execute(cmd) {
@@ -190,6 +202,7 @@ enum Command {
         dir: PathBuf,
         opts: churn::Options,
     },
+    Saves(SavesArgs),
     PerfCompare(PerfCompareArgs),
     PerfRelease(PerfReleaseArgs),
 }
@@ -204,6 +217,15 @@ struct SampleArgs {
     label: String,
     burst_pct: f64,
     out: PathBuf,
+}
+
+/// The arguments of `saves`.
+struct SavesArgs {
+    label: String,
+    entries: u64,
+    save_bytes: u64,
+    activity: saves::Activity,
+    measured_per_day: Option<u64>,
 }
 
 /// The arguments of `perf-compare`.
@@ -255,6 +277,11 @@ struct Flags {
     dir: Option<PathBuf>,
     rate: Option<f64>,
     max_files: Option<usize>,
+    entries: Option<u64>,
+    save_bytes: Option<u64>,
+    creates: Option<u64>,
+    deletes: Option<u64>,
+    measured_per_day: Option<u64>,
     baseline: Option<PathBuf>,
     tier: Option<perf::Tier>,
     print_values: bool,
@@ -294,6 +321,15 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             "--burst-pct",
         ],
         "churn" => &["--dir", "--duration", "--rate", "--seed", "--max-files"],
+        "saves" => &[
+            "--label",
+            "--entries",
+            "--save-bytes",
+            "--creates",
+            "--deletes",
+            "--duration",
+            "--measured-per-day",
+        ],
         "perf-compare" => &[
             "--baseline",
             "--tier",
@@ -424,6 +460,40 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
                     max_files: flags.max_files.unwrap_or(DEFAULT_CHURN_MAX_FILES),
                 },
             })
+        }
+        "saves" => {
+            let (
+                Some(label),
+                Some(entries),
+                Some(save_bytes),
+                Some(creates),
+                Some(deletes),
+                Some(duration),
+            ) = (
+                flags.label,
+                flags.entries,
+                flags.save_bytes,
+                flags.creates,
+                flags.deletes,
+                flags.duration,
+            )
+            else {
+                return Err(UsageError(format!(
+                    "{sub}: --label, --entries, --save-bytes, --creates, --deletes and \
+                     --duration are required"
+                )));
+            };
+            Ok(Command::Saves(SavesArgs {
+                label,
+                entries,
+                save_bytes,
+                activity: saves::Activity {
+                    creates,
+                    deletes,
+                    seconds: duration.as_secs_f64(),
+                },
+                measured_per_day: flags.measured_per_day,
+            }))
         }
         "perf-compare" => {
             let (Some(baseline), Some(tier)) = (flags.baseline, flags.tier) else {
@@ -576,6 +646,26 @@ fn parse_flags(
                 }
                 flags.max_files.replace(n).is_some()
             }
+            "--entries" => flags
+                .entries
+                .replace(number(sub, flag, value()?)?)
+                .is_some(),
+            "--save-bytes" => flags
+                .save_bytes
+                .replace(number(sub, flag, value()?)?)
+                .is_some(),
+            "--creates" => flags
+                .creates
+                .replace(number(sub, flag, value()?)?)
+                .is_some(),
+            "--deletes" => flags
+                .deletes
+                .replace(number(sub, flag, value()?)?)
+                .is_some(),
+            "--measured-per-day" => flags
+                .measured_per_day
+                .replace(number(sub, flag, value()?)?)
+                .is_some(),
             "--baseline" => flags.baseline.replace(PathBuf::from(value()?)).is_some(),
             "--tier" => flags.tier.replace(tier(sub, value()?)?).is_some(),
             "--print-values" => std::mem::replace(&mut flags.print_values, true),
@@ -762,8 +852,9 @@ fn cmd_sample(_args: SampleArgs) -> ExitCode {
 }
 
 /// `churn`: refuses an existing or parentless NEW_DIR (exit 2), runs the
-/// stream and prints `churn_ops`, `churn_seconds` and `churn_rate` (exit
-/// 0), or reports an I/O error (exit 1).
+/// stream and prints `churn_ops`, `churn_creates`, `churn_renames`,
+/// `churn_deletes`, `churn_seconds` and `churn_rate` (exit 0), or reports
+/// an I/O error (exit 1).
 fn cmd_churn(dir: &Path, opts: &churn::Options) -> ExitCode {
     if let Err(msg) = check_new_dir(dir) {
         eprintln!("fx-bench: churn: {msg}");
@@ -772,6 +863,9 @@ fn cmd_churn(dir: &Path, opts: &churn::Options) -> ExitCode {
     match churn::run(dir, opts) {
         Ok(stats) => {
             println!("churn_ops={}", stats.ops);
+            println!("churn_creates={}", stats.creates);
+            println!("churn_renames={}", stats.renames);
+            println!("churn_deletes={}", stats.deletes);
             println!("churn_seconds={:.3}", stats.seconds);
             println!("churn_rate={:.3}", stats.rate());
             ExitCode::SUCCESS
@@ -781,6 +875,21 @@ fn cmd_churn(dir: &Path, opts: &churn::Options) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `saves`: prints the projection's metric lines (exit 0).
+fn cmd_saves(args: &SavesArgs) -> ExitCode {
+    // `--duration` is a positive number of seconds, so there is always a
+    // projection; the check stays in case that parsing ever changes.
+    let Some(p) = saves::project(args.entries, args.save_bytes, &args.activity) else {
+        eprintln!("fx-bench: saves: --duration must be a positive number of seconds");
+        return ExitCode::from(2);
+    };
+    let measured = args.measured_per_day.map(|b| b as f64);
+    for line in saves::metric_lines(&args.label, &p, measured) {
+        println!("{line}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `perf-compare`: reads the baseline and metrics files, prints the report
@@ -1016,6 +1125,7 @@ fn execute(cmd: Command) -> Result<(), String> {
         | Command::Phase1Summary { .. }
         | Command::Sample(_)
         | Command::Churn { .. }
+        | Command::Saves(_)
         | Command::PerfCompare(_)
         | Command::PerfRelease(_) => {
             unreachable!("these commands set their own exit code and are run from main")

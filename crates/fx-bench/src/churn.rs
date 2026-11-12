@@ -193,15 +193,33 @@ pub struct Options {
 }
 
 /// What a run did.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChurnStats {
     /// Operations applied, not counting the folders made first.
     pub ops: u64,
+    /// Of those, files created: the index adds a row for each, and `fx-bench
+    /// saves` projects the index's saves from these and the deletes.
+    pub creates: u64,
+    /// Files renamed.
+    pub renames: u64,
+    /// Files deleted: the index keeps a removed row for each until it
+    /// compacts.
+    pub deletes: u64,
     /// Seconds from the first operation's tick to the end of the run.
     pub seconds: f64,
 }
 
 impl ChurnStats {
+    /// Counts one applied operation.
+    pub fn record(&mut self, op: &Op) {
+        self.ops += 1;
+        match op {
+            Op::Create { .. } => self.creates += 1,
+            Op::Rename { .. } => self.renames += 1,
+            Op::Delete { .. } => self.deletes += 1,
+        }
+    }
+
     /// Operations per second over the run.
     pub fn rate(&self) -> f64 {
         if self.seconds > 0.0 {
@@ -242,19 +260,17 @@ pub fn run(dir: &Path, opts: &Options) -> io::Result<ChurnStats> {
         .checked_add(opts.duration)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "duration out of range"))?;
     let mut next = start;
-    let mut ops = 0u64;
+    let mut stats = ChurnStats::default();
     while next < end {
         sleep_until(next);
         let op = planner.next_op();
         apply(dir, &op).map_err(|e| io::Error::new(e.kind(), format!("{op:?}: {e}")))?;
-        ops += 1;
+        stats.record(&op);
         next = (next + period).max(Instant::now());
     }
     sleep_until(end);
-    Ok(ChurnStats {
-        ops,
-        seconds: start.elapsed().as_secs_f64(),
-    })
+    stats.seconds = start.elapsed().as_secs_f64();
+    Ok(stats)
 }
 
 fn sleep_until(t: Instant) {
