@@ -6,7 +6,9 @@
 //! ([`AppearanceMode`]: `system`, `light` or `dark`), `app_icon`
 //! ([`AppIcon`], such as `match-row`), `your_files_first` (`true` /
 //! `false`, default `true`), `sort` (the results table's [`SortState`], such
-//! as `size:descending`), the search chips `match_case`, `match_path` and
+//! as `size:descending`), `column_widths` (the Name, Path and Size widths
+//! the column dividers set, such as `300,480,88`; absent for the default
+//! layout; [`ColumnSizes`]), the search chips `match_case`, `match_path` and
 //! `regex` (`true` / `false`, default `false`; [`crate::chips`]) and
 //! `index_size` (the entry count of the last complete index, for
 //! "Indexing… N of about M"; absent until there is one). Reading never fails
@@ -34,6 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::app_icon::AppIcon;
 use crate::appearance::AppearanceMode;
 use crate::chips::{Chip, QueryOptions};
+use crate::column_sizes::ColumnSizes;
 use crate::columns::SortState;
 use crate::data_folder::{create_private_file, make_dir_private};
 use crate::hotkey::HotkeySpec;
@@ -54,6 +57,7 @@ const KEY_APP_ICON: &str = "app_icon";
 const KEY_YOUR_FILES_FIRST: &str = "your_files_first";
 const KEY_SORT: &str = "sort";
 const KEY_INDEX_SIZE: &str = "index_size";
+const KEY_COLUMN_WIDTHS: &str = "column_widths";
 
 /// User settings. [`Default`] is this build channel's defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +87,10 @@ pub struct Settings {
     /// How many entries the last complete index held, saved when a scan
     /// finishes; `None` until one has.
     pub index_size: Option<usize>,
+    /// The Name, Path and Size widths the column dividers set, saved when
+    /// a drag ends, on each arrow key and on a reset; `None`, the default,
+    /// for the default layout.
+    pub column_widths: Option<ColumnSizes>,
 }
 
 impl Default for Settings {
@@ -104,7 +112,8 @@ impl Settings {
     /// The defaults of the app built for `channel`: its default hotkey, not
     /// launching at login, the onboarding not dismissed, the system
     /// appearance, the Match Row icon, your files first, Name ascending,
-    /// every search chip off and no index size yet.
+    /// every search chip off, no index size yet and the default column
+    /// layout.
     pub fn defaults_for(channel: Channel) -> Settings {
         Settings {
             hotkey: HotkeySpec::default_for(channel),
@@ -116,6 +125,7 @@ impl Settings {
             sort: SortState::default(),
             search_options: QueryOptions::default(),
             index_size: None,
+            column_widths: None,
         }
     }
 
@@ -159,6 +169,9 @@ impl Settings {
                 KEY_INDEX_SIZE => {
                     s.index_size = value.parse().ok().filter(|&n| n > 0);
                 }
+                KEY_COLUMN_WIDTHS => {
+                    s.column_widths = ColumnSizes::parse(value);
+                }
                 key => {
                     if let Some(chip) = Chip::ALL.into_iter().find(|c| c.settings_key() == key) {
                         let on = parse_bool(value).unwrap_or(chip.is_on(defaults.search_options));
@@ -195,6 +208,9 @@ impl Settings {
         }
         if let Some(size) = self.index_size {
             text.push_str(&format!("{KEY_INDEX_SIZE}={size}\n"));
+        }
+        if let Some(widths) = self.column_widths {
+            text.push_str(&format!("{KEY_COLUMN_WIDTHS}={widths}\n"));
         }
         text
     }

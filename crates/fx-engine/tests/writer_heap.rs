@@ -111,7 +111,11 @@ fn the_engine_keeps_no_second_copy_of_the_entries() {
 /// lists. It streams the entries into the index, as a full rescan does
 /// (run 2.17): a list of every entry and a map of the old ones took more
 /// than 300 B per entry, and macOS asks for such rescans of busy folders.
-const MAX_RESCAN_PEAK_PER_ENTRY: usize = 40;
+/// What is left is a bit per entry to mark the entries it listed, which
+/// took a byte per entry before. (The test's enumerator holds the whole
+/// tree while it walks, so what the rescan allocates after the walk, less
+/// than that list, doesn't show here; `rescan_bench` measures it.)
+const MAX_RESCAN_PEAK_PER_ENTRY: f64 = 0.5;
 
 #[test]
 fn a_subtree_rescan_streams_its_entries() {
@@ -125,6 +129,15 @@ fn a_subtree_rescan_streams_its_entries() {
     let source = FakeSource::new(StartOutcome::Resumed);
     let engine = start(&tree, &source, Index::new(), config());
     drop(wait_for_tree(&engine, &tree, "first scan published"));
+    // A first change builds what the writer keeps for good (its children
+    // index, 4 B per entry), so the rescan below shows its own peak.
+    let old_cursor = source.current_cursor();
+    tree.set_size(&format!("{ROOT}/d0000/file-0.dat"), 1);
+    source.push(vec![check(&format!("{ROOT}/d0000/file-0.dat"))]);
+    drop(wait_for(&engine, "the first change's cursor", |s| {
+        let now = source.current_cursor();
+        now != old_cursor && s.cursor() == Some(now)
+    }));
     thread::sleep(Duration::from_millis(300));
 
     // The test's enumerator builds its own list of the tree before it hands
@@ -150,16 +163,84 @@ fn a_subtree_rescan_streams_its_entries() {
         .load(Ordering::Relaxed)
         .saturating_sub(before)
         .saturating_sub(enumerator);
-    let per_entry = peak / entries;
+    let per_entry = peak as f64 / entries as f64;
     eprintln!(
         "subtree rescan peak beyond the enumerator's {enumerator} B: {peak} B, \
-         {per_entry} B per entry ({entries} entries)"
+         {per_entry:.2} B per entry ({entries} entries)"
     );
     assert!(
         per_entry <= MAX_RESCAN_PEAK_PER_ENTRY,
-        "a subtree rescan took {per_entry} B per entry at its peak, more than {MAX_RESCAN_PEAK_PER_ENTRY} B"
+        "a subtree rescan took {per_entry:.2} B per entry at its peak, more than {MAX_RESCAN_PEAK_PER_ENTRY} B"
     );
     let snap = wait_for_tree(&engine, &tree, "the index after the rescan");
+    assert_orders_match(&snap);
+    engine.shutdown();
+}
+
+/// The most extra heap a commit of a small batch may take while no window
+/// shows, per indexed entry. With no snapshot pinned, the writer merges the
+/// batch into its four sort orders in place: well under one order's 4 B
+/// per entry. Copying the orders while the published snapshot still held
+/// the old ones took 16 B per entry, about 51 MB at 3.2M entries, at the
+/// end of every rescan that changed anything.
+const MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY: usize = 2;
+
+#[test]
+fn a_hidden_commit_merges_the_orders_in_place() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let tree = FakeTree::new();
+    for d in 0..1000 {
+        tree.mkdir(&format!("{ROOT}/d{d:04}"));
+        tree.add_files(&format!("{ROOT}/d{d:04}"), "file-", 100);
+    }
+    let entries = tree.entries().len();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = start(&tree, &source, Index::new(), config());
+    drop(wait_for_tree(&engine, &tree, "first scan published"));
+    engine.set_foreground(false);
+
+    let apply = |changes: Vec<fx_model::Change>| {
+        let old_cursor = source.current_cursor();
+        source.push(changes);
+        // The source's cursor moves when the writer takes the batch, and
+        // the writer publishes it once the batch is applied.
+        drop(wait_for(&engine, "the batch's cursor", |s| {
+            let now = source.current_cursor();
+            now != old_cursor && s.cursor() == Some(now)
+        }));
+    };
+    // A first batch builds what the writer keeps for good (its children
+    // index), so the measured batch shows the commit's own peak.
+    tree.set_size(&format!("{ROOT}/d0000/file-0.dat"), 1);
+    apply(vec![check(&format!("{ROOT}/d0000/file-0.dat"))]);
+    thread::sleep(Duration::from_millis(300));
+
+    // Changed sizes, new files and removed files, spread over the tree.
+    let mut changes = Vec::new();
+    for d in (0..1000).step_by(50) {
+        let dir = format!("{ROOT}/d{d:04}");
+        tree.set_size(&format!("{dir}/file-1.dat"), 123_456);
+        tree.touch(&format!("{dir}/new.txt"), 7);
+        tree.remove(&format!("{dir}/file-2.dat"));
+        for name in ["file-1.dat", "new.txt", "file-2.dat"] {
+            changes.push(check(&format!("{dir}/{name}")));
+        }
+    }
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    apply(changes);
+    let peak = PEAK.load(Ordering::Relaxed).saturating_sub(before);
+    eprintln!(
+        "hidden commit of 60 changes: peak {peak} B above the engine's heap, \
+         {:.2} B per entry ({entries} entries)",
+        peak as f64 / entries as f64
+    );
+    assert!(
+        peak <= entries * MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY,
+        "a hidden commit of 60 changes took {peak} B at its peak, more than \
+         {MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY} B per entry ({entries} entries)"
+    );
+    let snap = wait_for_tree(&engine, &tree, "the index after the batch");
     assert_orders_match(&snap);
     engine.shutdown();
 }

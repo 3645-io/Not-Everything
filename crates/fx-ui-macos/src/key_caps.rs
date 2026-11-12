@@ -87,7 +87,9 @@ pub struct KeyHint {
 }
 
 /// The hints shown while the results have the focus and a row is selected
-/// (the Main board, without "Space Quick Look": Quick Look is not built).
+/// (the Main board, without its "Space Quick Look" hint: Space works since
+/// run 2.5, but the hint waits for the owner to confirm its place on the
+/// board, so the status bar is unchanged).
 pub const RESULT_HINTS: [KeyHint; 3] = [
     KeyHint {
         action: Action::Open,

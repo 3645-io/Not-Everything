@@ -70,6 +70,15 @@ pub fn sort_label(column_title: &str, sorted: Option<Direction>) -> String {
     }
 }
 
+/// A column divider's accessibility label, for the column on its left
+/// (`.ne-col-handle`'s `aria-label`).
+pub fn resize_label(column_title: &str) -> String {
+    format!("Resize the {column_title} column")
+}
+
+/// A column divider's tooltip and accessibility help (its `title`).
+pub const RESIZE_HINT: &str = "Drag to resize. Double-click to reset.";
+
 /// The empty state's title for `query` (trimmed), in curly quotes.
 pub fn no_matches_title(query: &str) -> String {
     format!("No matches for \u{201c}{}\u{201d}", query.trim())

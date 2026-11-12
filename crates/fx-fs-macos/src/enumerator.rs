@@ -25,11 +25,14 @@
 //!
 //! Entries reach the sink in parent-before-child order, as the walk lists
 //! them ([`crate::scan::scan_streaming`]): the walk runs on its own threads
-//! and sends each directory's entries through a bounded channel, and the
+//! and sends each directory's entries through a channel bounded by the heap
+//! they hold ([`crate::budget`], [`ScanOptions::stream_budget`]), and the
 //! sink is called on the calling thread. Nothing collects every entry
-//! first (run 2.17: that copy took about 330 MB for a whole disk). Below a
-//! traverse-only ancestor of an include-only root, the first emitted level
-//! has a parent that is never emitted (the top of the emitted tree).
+//! first (run 2.17: that copy took about 330 MB for a whole disk), and a
+//! sink slower than the walk, such as the writer rescanning a big folder,
+//! holds the walk to the budget. Below a traverse-only ancestor of an
+//! include-only root, the first emitted level has a parent that is never
+//! emitted (the top of the emitted tree).
 //!
 //! # Keys of firmlinked directories
 //!
@@ -55,21 +58,18 @@
 //! The scanner is read-only.
 
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
 
 use fx_fs::VolumeEnumerator;
 use fx_model::{Entry, EntryFlags, EntryKind, FileKey, VolumeId};
 
 use crate::attrbuf;
+use crate::budget;
 use crate::scan::{ScanOptions, ScannedEntry, scan_streaming};
 
 /// `UF_IMMUTABLE` (`sys/stat.h`).
 const UF_IMMUTABLE: u32 = 0x0000_0002;
 /// `SF_IMMUTABLE` (`sys/stat.h`).
 const SF_IMMUTABLE: u32 = 0x0002_0000;
-
-/// Directories' worth of entries the walk may send ahead of the sink.
-const STREAM_BATCHES: usize = 256;
 
 /// The production macOS scanner. See the module docs.
 ///
@@ -129,10 +129,11 @@ fn to_entry(e: &ScannedEntry, parent: FileKey) -> Entry {
 impl VolumeEnumerator for MacScanner {
     fn enumerate(&self, root: &Path, sink: &mut dyn FnMut(Entry)) -> fx_fs::Result<()> {
         let opts = self.opts.clone();
-        let (tx, rx) = sync_channel::<Vec<ScannedEntry>>(STREAM_BATCHES);
+        let (tx, rx) = budget::channel::<Vec<ScannedEntry>>(opts.stream_budget);
         std::thread::scope(|s| {
             // The walk owns the sender: when it ends, the channel closes and
-            // the loop below finishes.
+            // the loop below finishes. A sink that panics drops the
+            // receiver, which releases a walk waiting for room.
             let walk = s.spawn(move || scan_streaming(root, &opts, &tx));
             for batch in rx {
                 for e in &batch {
