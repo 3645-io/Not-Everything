@@ -297,11 +297,42 @@ fn a_short_run_leaves_only_new_dir_and_follows_the_plan() {
     walk(&dir, "", &mut dirs, &mut files);
     let want_dirs: BTreeSet<String> = churn::folders(9).into_iter().collect();
     assert_eq!(dirs, want_dirs);
-    let want_files = replay(&churn::plan(9, ops, 5_000), 5_000);
+    let planned = churn::plan(9, ops, 5_000);
+    let want_files = replay(&planned, 5_000);
     assert_eq!(
         files, want_files,
         "the disk must hold what {ops} planned ops leave"
     );
+
+    // The counts by kind, which `fx-bench saves` projects index saves from.
+    let count = |kind: fn(&Op) -> bool| planned.iter().filter(|op| kind(op)).count();
+    let creates = count(|op| matches!(op, Op::Create { .. }));
+    let renames = count(|op| matches!(op, Op::Rename { .. }));
+    let deletes = count(|op| matches!(op, Op::Delete { .. }));
+    assert_eq!(value(&text, "churn_creates"), creates.to_string());
+    assert_eq!(value(&text, "churn_renames"), renames.to_string());
+    assert_eq!(value(&text, "churn_deletes"), deletes.to_string());
+    assert_eq!(creates + renames + deletes, ops);
+}
+
+#[test]
+fn stats_count_each_kind_of_operation() {
+    let mut stats = churn::ChurnStats::default();
+    for op in churn::plan(3, 400, 50) {
+        stats.record(&op);
+    }
+    assert_eq!(stats.ops, 400);
+    assert_eq!(stats.creates + stats.renames + stats.deletes, 400);
+    let planned = churn::plan(3, 400, 50);
+    let creates = planned
+        .iter()
+        .filter(|op| matches!(op, Op::Create { .. }))
+        .count() as u64;
+    let deletes = planned
+        .iter()
+        .filter(|op| matches!(op, Op::Delete { .. }))
+        .count() as u64;
+    assert_eq!((stats.creates, stats.deletes), (creates, deletes));
 }
 
 #[test]

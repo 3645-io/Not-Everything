@@ -48,7 +48,11 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 | B4 | CPU energy, window hidden | `hidden_energy_mw` | ≤50 mW | 10%, ≥5 mW | P R |
 | B5 | CPU energy, window showing a search | `search_energy_mw` | ≤250 mW | 10%, ≥5 mW | P R |
 | B6 | Wakeups a second, window hidden | `hidden_wakeups_per_s` | ≤2 | 10%, ≥0.5 | P R |
-| B7 | Disk writes, scaled to a day | `disk_written_per_day_mb` | ≤512 MB | 5%, ≥10 MB | P R |
+| B7 | Disk writes a day: those measured, scaled to a day, plus the projected index saves (below; tracked until its target is set at a realistic change rate, the owner's decision of 12 Nov 2026) | `disk_written_per_day_mb` | ≤512 MB | tracked | P R |
+
+B7 adds the index saves a phase is too short to see. After each compaction the app saves its whole index to the store file, about 150 MB for a whole-disk index of 2M entries. The writer compacts when the files created since the last compaction, or the files deleted since then, pass 10% of the index's entries (at least 1,024): about every 200,000 at that scale, where a 10-minute phase at 20 operations a second creates about 6,000. So after each phase `perf-check.sh` runs `fx-bench saves`. It takes the store file the run's app saved (its size, and its entry count from `not-everything -get-result-count`) and the files `fx-bench churn` created and deleted in the phase, scales the larger of the two counts to a day, and projects one save of the store's size for every 10% of the entries in it. B7 is the measured writes plus that projection. At the pr tier's 20 operations a second, about half of them creates, that comes to about 4.3 saves a day: about 650 MB on the 2M-entry index. The summary shows the parts by phase, and fx-engine's `tests/compaction_saves.rs` checks the model against the real writer.
+
+The projection counts only the scripted activity: the rc tier's phases, with none, project no saves, though a Mac in daily use compacts too, and the daily save, which comes only after a day without one, is not projected either.
 
 ### Memory
 

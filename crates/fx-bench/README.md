@@ -337,9 +337,15 @@ and leaves `--dir` in place at the end. It prints:
 
 ```text
 churn_ops=1200
+churn_creates=603
+churn_renames=298
+churn_deletes=299
 churn_seconds=60.001
 churn_rate=19.999
 ```
+
+The creates, renames and deletes add up to the operations; `saves` projects
+the index's saves from the creates and deletes.
 
 Exit codes: 0 after a run; 1 for an I/O error; 2 for bad arguments, an
 existing `--dir` or a missing parent folder.
@@ -348,6 +354,49 @@ From Rust, use the `churn` module: `plan(seed, n, max_files)` gives the
 first `n` operations without touching the disk (a shorter plan is a prefix
 of a longer one), `folders(seed)` the 16 folders, `Planner` the stream one
 operation at a time, and `run` applies it.
+
+## Saves
+
+`saves` projects the index saves a background phase of the performance
+gate is too short to see, for B7 ("Disk writes a day",
+`docs/gates/performance.md`).
+
+```sh
+cargo run --release -p fx-bench -- saves --label hidden --entries 2000000 \
+    --save-bytes 157286400 --creates 6000 --deletes 3000 --duration 600 \
+    --measured-per-day 0
+```
+
+The engine's writer compacts the index when the rows added since the last
+compaction (one per file created), or the entries removed since then (one
+per file deleted), pass 10% of the live entries, at least 1,024; a file
+renamed after it was created changes its row in place. Each compaction then
+rewrites the whole store file. A 10-minute phase at 20 operations a second
+adds about 6,000 rows where a whole-disk index of 2M entries compacts every
+200,000, so its sampled writes never include a save. From `--entries` (the
+index's live entries), `--save-bytes` (the store file's size) and the
+phase's `--creates` and `--deletes` over `--duration` seconds, `saves`
+prints, each key prefixed with the label:
+
+| Key | Meaning |
+|---|---|
+| `<label>_entries` | the index's live entries |
+| `<label>_rows_per_compaction` | the rows of one kind that bring a compaction: 10% of the entries (at least 1,024), plus one |
+| `<label>_compactions_per_day` | the larger of creates and deletes a second, times 86,400, over the rows per compaction |
+| `<label>_save_bytes` | what one save writes: the store file's size |
+| `<label>_compaction_saves_per_day_bytes` | compactions a day times one save |
+| `<label>_disk_written_with_saves_per_day_bytes` | with `--measured-per-day` (the phase's measured writes scaled to a day, `sample`'s `<label>_disk_written_per_day_bytes`): their sum, which B7 reads |
+
+The example prints 4.320 compactions a day and 679,477,248 bytes (648 MB).
+Two small effects pull the model either way: a file created and deleted
+within one of the writer's batches never gets a row, though the model
+counts it; and the first change after a compaction to a file already in
+the base adds a row the model leaves out (with `churn`, at most its 5,000
+files per compaction, 2.5% of a whole-disk index's 200,000). fx-engine's
+`tests/compaction_saves.rs` drives the real writer with `churn`'s stream
+and checks the model against it; from Rust, use the `saves` module.
+
+Exit codes: 0, or 2 for bad arguments.
 
 ## Performance comparison
 
