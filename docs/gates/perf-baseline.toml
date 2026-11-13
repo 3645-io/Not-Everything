@@ -376,10 +376,15 @@ aggregate = "median"
 scale_key = "summon_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 10.97
+# 0.4.0 read 10.97 ms at its RC-1. On 12 and 13 Nov 2026 the measuring Mac
+# read 21 to 25 ms for 0.4.0 and 0.5.0 alike, in alternating runs of the
+# probe, so the rise is the machine's state, not the code. The baseline is
+# 0.5.0-RC-1's rc tier at 2876754, the first run that measured it.
+baseline = 21.28
 quick_baseline = 10.54
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0-RC-1"
+baseline_date = "2026-11-12"
+exception = "21 to 25 ms on the measuring Mac since 11 Nov 2026 for 0.4.0 and 0.5.0 alike, so the machine's state, not the code; accepted by the owner for 0.5.0, approved in #40"
 
 [F4]
 name = "First scan of the disk"
