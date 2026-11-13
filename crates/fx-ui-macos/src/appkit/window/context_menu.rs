@@ -8,7 +8,8 @@
 //! and font, so the boards' `.ne-menu` styling can't be applied; it follows
 //! the app's Light or Dark appearance. Each item shows the SF Symbol
 //! closest to the boards' glyph as a template image, and each Open With
-//! app its own icon, as in Finder.
+//! app its own icon, as in Finder; on macOS 27, which hides menu images by
+//! default, each item asks for its image to show.
 //!
 //! Main thread only, except the pasteboard functions.
 

@@ -72,7 +72,7 @@ use objc2_foundation::{NSDate, NSRunLoop};
 use super::callout::Callout;
 use super::card::{ResultCell, ResultRowView, ResultsCard};
 use super::chrome::{RootView, SearchField, SearchWindow, TopBar};
-use super::context_menu as menus;
+use super::context_menu::{self as menus, file_url};
 use super::quick_look;
 use super::resident::ResidentState;
 use super::status::StatusBar;
@@ -442,13 +442,19 @@ fn debug_app_key(
 ) {
     let text = NSString::from_str(chars);
     let ignoring = NSString::from_str(ignoring);
+    // The hardware sends keys to the key window: the Quick Look panel
+    // while it shows.
+    let app = NSApplication::sharedApplication(mtm);
+    let number = app
+        .keyWindow()
+        .map_or_else(|| window.windowNumber(), |w| w.windowNumber());
     for kind in [NSEventType::KeyDown, NSEventType::KeyUp] {
         let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
             kind,
             NSPoint::new(0.0, 0.0),
             flags,
             0.0,
-            window.windowNumber(),
+            number,
             None,
             &text,
             &ignoring,
@@ -912,6 +918,7 @@ define_class!(
             self.menu_will_show(menu);
         }
 
+        /// The right-click menu closed, before its chosen item acts.
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, menu: &NSMenu) {
             self.menu_closed(menu);
@@ -936,7 +943,7 @@ define_class!(
                 .map(|p| p.to_string());
             if let Some(app) = app {
                 let paths = self.menu_paths(ContextItem::OpenWith);
-                menus::open_with(&paths, &menus::file_url(&app));
+                menus::open_with(&paths, &file_url(&app));
             }
         }
 
@@ -1588,6 +1595,19 @@ impl WinController {
                     let (count, took) = super::debug_script::ax_count(table.as_ref(), name);
                     eprintln!("debug ax {name}: {count:?} in {took:?}");
                 }
+                // SAFETY: every AppKit object answers
+                // `accessibilityActionNames` with an array of strings.
+                let actions: Option<Retained<NSArray>> =
+                    unsafe { msg_send![table, accessibilityActionNames] };
+                eprintln!(
+                    "debug ax actions: {:?}",
+                    actions.map(|a| a
+                        .iter()
+                        .map(|s| s
+                            .downcast::<NSString>()
+                            .map_or_else(|_| String::new(), |s| s.to_string()))
+                        .collect::<Vec<_>>())
+                );
                 let results = self.ivars().results.borrow();
                 eprintln!(
                     "debug ax announcement: {:?}",
@@ -3349,11 +3369,6 @@ fn highlighted(
         }
     }
     Retained::into_super(s)
-}
-
-/// A file URL for `path`.
-fn file_url(path: &str) -> Retained<NSURL> {
-    NSURL::fileURLWithPath(&NSString::from_str(path))
 }
 
 /// Prints and flushes, since `terminate:` exits without running Rust
