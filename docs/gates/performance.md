@@ -17,6 +17,8 @@ Every change that ships is measured before its pull request against the metrics 
 
 GitHub's shared macOS runners vary more between runs than the allowances, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
 
+Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a locked screen the app's window can't come forward, so every probe that summons it times out: on 13 Nov 2026 the screen locked two minutes into an rc run, and all 50 shortcut presses of F3 timed out at 5 s. `perf-check.sh` refuses to start on a locked screen (exit 2, nothing changed), and checks again once it holds the lock. `run.txt` records the screen at the start and at the end, and notes each step after which it was locked.
+
 ## Allowances
 
 A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.4.0's CPU showing a search, B2, and its first results during the first scan, F5), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
