@@ -657,6 +657,112 @@ fn only_metrics_of_the_tier_are_reported() {
     assert!(!text.contains("| S2 |"), "{text}");
 }
 
+#[test]
+fn the_pr_tier_uses_pr_baseline_when_there_is_one() {
+    // The pr tier measures the background under file activity and the rc
+    // tier without it, so a background metric carries a baseline for each.
+    let t = table(
+        "B2",
+        "a_ms",
+        "lower",
+        "pr rc",
+        "target = 5\nbaseline = 10\npr_baseline = 60\nallow_pct = 10\n",
+    );
+    // 62 is within 60 + 10% at the pr tier, where the pr baseline misses the
+    // target, so the allowance alone holds it...
+    let pr = compare("pr", std::slice::from_ref(&t), &["a_ms=62\n"], &[]);
+    assert_exit(&pr, 0);
+    let text = stdout(&pr);
+    assert_eq!(verdict(&text, "B2"), "PASS (target not yet met)");
+    assert_eq!(row(&text, "B2")[2], "60 ms", "the pr baseline is shown");
+    assert_eq!(row(&text, "B2")[4], "+3.3%");
+
+    // ...and far over 10 + 10% at the rc tier.
+    let rc = compare("rc", &[t], &["a_ms=62\n"], &[]);
+    assert_exit(&rc, 1);
+    let text = stdout(&rc);
+    assert!(verdict(&text, "B2").contains("regression"), "{text}");
+    assert_eq!(row(&text, "B2")[2], "10 ms");
+}
+
+#[test]
+fn a_pr_baseline_that_meets_the_target_holds_it_at_the_pr_tier() {
+    let t = table(
+        "M1",
+        "a_ms",
+        "lower",
+        "pr rc",
+        "target = 200\nbaseline = 120\npr_baseline = 130\nallow_floor = 100\n",
+    );
+    // 210 is within 130 + 100 but over the target.
+    let out = compare("pr", &[t], &["a_ms=210\n"], &[]);
+    assert_exit(&out, 1);
+    let v = verdict(&stdout(&out), "M1");
+    assert!(v.contains("target") && !v.contains("regression"), "{v}");
+}
+
+#[test]
+fn without_a_pr_baseline_the_pr_tier_uses_the_baseline() {
+    let t = table(
+        "S1",
+        "a_ms",
+        "lower",
+        "pr rc",
+        "baseline = 10\nallow_pct = 10\n",
+    );
+    let out = compare("pr", &[t], &["a_ms=12\n"], &[]);
+    assert_exit(&out, 1);
+    let text = stdout(&out);
+    assert_eq!(row(&text, "S1")[2], "10 ms");
+    assert!(verdict(&text, "S1").contains("regression"), "{text}");
+}
+
+#[test]
+fn the_pr_tier_header_names_the_pr_baselines_build_and_date() {
+    // Keys after META's last line still belong to [meta].
+    let meta = "pr_build = \"0.4.0\"\npr_date = \"2026-11-12\"\n".to_owned();
+    let t = table(
+        "B1",
+        "a_ms",
+        "lower",
+        "pr rc",
+        "baseline = 1\npr_baseline = 2\n",
+    );
+    let pr = compare("pr", &[meta.clone(), t.clone()], &["a_ms=2\n"], &[]);
+    assert_exit(&pr, 0);
+    let text = stdout(&pr);
+    assert!(text.contains("PR-tier baseline build: 0.4.0"), "{text}");
+    assert!(text.contains("PR-tier baseline date: 2026-11-12"), "{text}");
+
+    let rc = compare("rc", &[meta, t], &["a_ms=1\n"], &[]);
+    assert_exit(&rc, 0);
+    assert!(!stdout(&rc).contains("PR-tier"), "{}", stdout(&rc));
+}
+
+#[test]
+fn a_pr_baseline_needs_the_pr_tier_and_a_number() {
+    let rc_only = table(
+        "B1",
+        "a_ms",
+        "lower",
+        "rc",
+        "baseline = 1\npr_baseline = 2\n",
+    );
+    let out = compare("rc", &[rc_only], &["a_ms=1\n"], &[]);
+    assert_exit(&out, 2);
+    let err = stderr(&out);
+    assert!(err.contains("baseline.toml:"), "{err}");
+    assert!(
+        err.contains("pr_baseline") && err.contains("tiers"),
+        "{err}"
+    );
+
+    let text = table("B1", "a_ms", "lower", "pr", "pr_baseline = \"2\"\n");
+    let out = compare("pr", &[text], &["a_ms=1\n"], &[]);
+    assert_exit(&out, 2);
+    assert!(stderr(&out).contains("pr_baseline"), "{}", stderr(&out));
+}
+
 // ---------------------------------------------------------------------------
 // Exceptions and bad input
 // ---------------------------------------------------------------------------
