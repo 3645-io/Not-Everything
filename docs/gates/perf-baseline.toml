@@ -5,7 +5,8 @@
 # scripts/perf-check.sh writes to metrics.txt, the target, the allowance, the
 # tiers that measure it and the baseline it is compared with. The quick tier
 # compares with `quick_baseline` (200,000 entries) and checks no targets; the
-# pr and rc tiers compare with `baseline` at gate scale.
+# rc tier compares with `baseline` at gate scale, and the pr tier with
+# `pr_baseline` where a metric has one, else with `baseline`.
 #
 # The baseline moves only at a release, from the release candidate's run
 # (`fx-bench perf-compare --print-values`), or by an exception the owner
@@ -19,6 +20,15 @@ machine = "Apple M4 Pro, 24 GB, macOS 27"
 cache = "warm"
 build = "0.4.0"
 date = "2026-11-10"
+# The build and date of the `pr_baseline` values. The pr tier runs its
+# background phases for 10 minutes under 20 file operations a second (`fx-bench
+# churn`), the rc tier for 30 minutes without, so the background metrics
+# (B1 to B6, M1, M2) carry a pr-tier baseline too: 0.4.0 at 4e9be6e measured
+# with its own scripts/perf-check.sh --tier pr --step summon --step background
+# (macOS 27.2.1, AC power, warm cache, display on, 2.87M files on the disk,
+# 12 Nov 2026). B7 has none: 0.4.0's script didn't project the index's saves.
+pr_build = "0.4.0"
+pr_date = "2026-11-12"
 # The rows of the summary table in a release's notes (fx-bench perf-release).
 summary = "B1 B4 B7 B2 M1 S1 S5 F1 F6 F2"
 # `baseline` values: 0.4.0-RC-1's rc tier at 489a11e, the commit 0.4.0 was
@@ -40,6 +50,7 @@ allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 0.397
+pr_baseline = 1.705
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -54,6 +65,7 @@ allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 6.705
+pr_baseline = 59.382
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -68,6 +80,7 @@ allow_pct = 25
 aggregate = "max"
 tiers = "pr rc"
 baseline = 27.066
+pr_baseline = 61.865
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -82,6 +95,7 @@ allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 3.816
+pr_baseline = 12.105
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -96,6 +110,7 @@ allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 94.24
+pr_baseline = 765.581
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -110,6 +125,7 @@ allow_floor = 0.5
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 1.504
+pr_baseline = 0.252
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -147,6 +163,7 @@ allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 125
+pr_baseline = 133
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
@@ -163,6 +180,7 @@ allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 125.2
+pr_baseline = 176.6
 baseline_build = "0.4.0"
 baseline_date = "2026-11-10"
 
