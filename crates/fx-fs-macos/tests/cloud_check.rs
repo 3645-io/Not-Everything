@@ -106,7 +106,10 @@ fn census_finds_dataless_items_without_entering_them_or_symlinks() {
     let found = census(&root, &test).unwrap();
     assert_eq!(
         found.dataless,
-        set(&root, &["cloud-file.txt", "docs/cloud-doc.pdf", "cloud-folder"])
+        set(
+            &root,
+            &["cloud-file.txt", "docs/cloud-doc.pdf", "cloud-folder"]
+        )
     );
     assert_eq!(found.unreadable, 0);
     let seen = seen.into_inner().unwrap();
