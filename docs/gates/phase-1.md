@@ -182,7 +182,8 @@ Run benchmarks one at a time on an otherwise idle machine, plugged in.
 For each of the two gate machines (M4 Pro 24 GB, 8 GB Apple Silicon Mac):
 
 1. Warm pass (builds the release binaries, writes the startup store and,
-   through the warm-up launch, the app's index for `/`):
+   through the warm-up launch, the app's index for `/` in
+   `<store-dir>/app-data`, never the daily app's data folder):
 
    ```sh
    scripts/phase1-gate.sh --machine "M4 Pro" --cache warm \
@@ -197,8 +198,8 @@ For each of the two gate machines (M4 Pro 24 GB, 8 GB Apple Silicon Mac):
        --store-dir ~/fx-gate-store --reuse --out ~/fx-gate/m4-cold
    ```
 
-   `--store-dir` keeps the 2M-entry `startup_bench` store; `--reuse` times
-   that store as is. A cold pass without a kept store skips `startup_bench`
+   `--store-dir` keeps the 2M-entry `startup_bench` store and the app's
+   index for the gate probe; `--reuse` times that store as is. A cold pass without a kept store skips `startup_bench`
    rather than time a freshly written (page-cached) store as cold. The cold
    pass runs the gate probe launch, `startup_bench` and `first_run_bench`
    first and uses one launch and one startup run, judged as is (worst

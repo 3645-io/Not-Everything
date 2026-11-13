@@ -25,7 +25,9 @@
 # below the gate scale (e.g. --quick) as NOT MEASURED, never PASS or FAIL.
 #
 # Safety: this script only creates the new <out> directory and files inside
-# it, plus the startup_bench store in --store-dir when that is given. It
+# it, plus the startup_bench store and the gate probe's data folder
+# (app-data) in --store-dir when that is given. The app's launches never
+# open the daily app's data folder. It
 # never deletes, renames or moves anything and never flushes the disk cache.
 # "Cold" means the first run after a reboot; see docs/gates/phase-1.md.
 #
@@ -43,7 +45,8 @@ usage: scripts/phase1-gate.sh --machine LABEL --cache warm|cold --out NEW_DIR
   --cache STATE     warm, or cold (the first run after a reboot)
   --out NEW_DIR     directory for the logs and summary.md; must not exist yet
   --store-dir DIR   keep the 2M-entry startup_bench store in DIR
-                    (startup_bench --store-dir DIR)
+                    (startup_bench --store-dir DIR) and the gate probe's
+                    index in DIR/app-data, for the cold pass
   --reuse           time the store already kept in --store-dir as is
                     (startup_bench --reuse); a cold pass needs it, because
                     only a store written before the reboot is really cold.
@@ -323,16 +326,30 @@ ui_probe() {
         skip "fx-ui-macos gate probe" "$UI_SKIP_REASON"
         return 0
     fi
+    # The launches keep their index and settings in a data folder of their
+    # own (--data-dir), never the daily app's, and leave its shortcut alone.
+    # With --store-dir the folder is kept there, so the cold pass after the
+    # reboot opens the index the warm pass wrote.
+    if [ -n "$STORE_DIR" ]; then
+        app_data="$STORE_DIR/app-data"
+    else
+        app_data="$OUT/app-data"
+    fi
+    if [ "$CACHE" = cold ] && [ ! -d "$app_data" ]; then
+        skip "fx-ui-macos gate probe cold" "no kept index in $app_data: run the warm pass with the same --store-dir first"
+        return 0
+    fi
+    mkdir -p "$app_data"
     mkdir "$OUT/gate_probe"
     if [ "$CACHE" = warm ]; then
-        run_step gate_probe_warmup "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --gate-probe "$OUT/gate_probe/warmup.txt"
+        run_step gate_probe_warmup "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/warmup.txt"
     fi
     ok=0
     i=1
     while [ "$i" -le "$LAUNCHES" ]; do
         status=0
         printf '# phase1-gate: launch %s of %s\n' "$i" "$LAUNCHES" >>"$OUT/gate_probe.log"
-        "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --gate-probe "$OUT/gate_probe/launch-$i.txt" >>"$OUT/gate_probe.log" 2>&1 || status=$?
+        "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/launch-$i.txt" >>"$OUT/gate_probe.log" 2>&1 || status=$?
         if [ "$status" -eq 0 ] && [ -f "$OUT/gate_probe/launch-$i.txt" ]; then
             ok=$((ok + 1))
         fi

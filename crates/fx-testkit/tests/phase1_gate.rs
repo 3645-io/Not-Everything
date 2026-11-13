@@ -429,6 +429,25 @@ fn script_builds_with_the_measure_feature() {
     }
 }
 
+/// Without `--data-dir`, the app opens the daily app's data folder: its
+/// index, its settings and its shortcut. Every launch of the gate probe
+/// names a folder of the run's own instead, as `perf-check.sh` does.
+#[test]
+fn every_app_launch_has_its_own_data_folder() {
+    let launches: Vec<String> = code_lines(&script_text())
+        .into_iter()
+        .filter(|l| l.contains("/fx-ui-macos\""))
+        .collect();
+    assert!(!launches.is_empty(), "{SCRIPT} must launch fx-ui-macos");
+    for line in &launches {
+        assert!(
+            line.contains("--data-dir"),
+            "{SCRIPT} must give every fx-ui-macos launch its own `--data-dir`: {}",
+            line.trim()
+        );
+    }
+}
+
 #[test]
 fn script_never_deletes_moves_or_purges() {
     let forbidden = ["rm", "rmdir", "unlink", "mv", "purge", "-delete", "srm"];
