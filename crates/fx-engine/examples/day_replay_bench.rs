@@ -35,10 +35,17 @@
 //!    window is closed). It times the replay until the history, up to
 //!    FSEvents' HistoryDone marker, is handed out and the engine has
 //!    published it, and reads the process's peak memory footprint. It then
-//!    compares the index with a fresh scan (unless `--no-compare`): the
-//!    disk keeps changing meanwhile, so entries that differ on a path
-//!    FSEvents reported during the comparison are counted apart, and only
-//!    the others make the index unequal.
+//!    compares the index with a fresh scan (unless `--no-compare`), by
+//!    file key (`day_replay_compare`): a file with several hard links,
+//!    which the index holds at one link, equals the scan at any of them.
+//!    Three kinds of difference are counted apart, since they are not
+//!    something the replay lost: those on a path FSEvents reported during
+//!    the comparison (the disk keeps changing); entries only the index has,
+//!    in folders that refuse to be listed (FSEvents reported them and
+//!    `lstat` reads them, but the scanner can't list them); and files whose
+//!    size alone differs and that were written during the run or that
+//!    FSEvents never reported (a log a process keeps open). Every other
+//!    difference makes the index unequal.
 //! 4. Back in the first process, reads the same history once more,
 //!    untimed, and counts its raw events and the distinct paths created,
 //!    removed, renamed and modified; from the created and removed paths and
@@ -60,6 +67,10 @@
 
 #[cfg(target_os = "macos")]
 mod bench_common;
+
+#[cfg(target_os = "macos")]
+#[path = "day_replay_compare/mod.rs"]
+mod compare;
 
 use std::process::ExitCode;
 
@@ -86,8 +97,8 @@ mod mac {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use fx_bench::saves::{Activity, project};
-    use fx_engine::{Engine, EngineConfig, EngineHealth, EngineSnapshot};
-    use fx_fs::{ChangeSource, VolumeEnumerator};
+    use fx_engine::{Engine, EngineConfig, EngineHealth};
+    use fx_fs::ChangeSource;
     use fx_fs_macos::enumerator::MacScanner;
     use fx_fs_macos::fsevents::flags::EventFlags;
     use fx_fs_macos::fsevents::source::FsEventsSource;
@@ -97,10 +108,11 @@ mod mac {
     };
     use fx_fs_macos::path_stat::MacPathStat;
     use fx_fs_macos::scan::ScanOptions;
-    use fx_model::{Change, Entry, EntryKind, FileKey, ResumeCursor, StartOutcome, VolumeId};
+    use fx_model::{Change, FileKey, ResumeCursor, StartOutcome, VolumeId};
     use fx_store::{MappedIndex, SaveInput, write_checkpoint};
 
     use crate::bench_common::{Flags, TempRoot, UsageError, gate, header, metric, ms};
+    use crate::compare;
 
     const USAGE: &str = "\
 usage:
@@ -705,6 +717,11 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         rescan_volume: u64,
         /// When the HistoryDone marker was handed out, and the cursor then.
         history_done: Option<(Instant, u64)>,
+        /// Every path handed out to check or rescan, during the replay and
+        /// after it: what FSEvents told the engine of.
+        reported: HashSet<PathBuf>,
+        /// A rescan of the whole volume was handed out at some point.
+        volume_rescanned: bool,
     }
 
     /// The app's FSEvents source, recording the replay.
@@ -728,6 +745,15 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         fn next_batch(&mut self, deadline: Instant) -> fx_fs::Result<Vec<Change>> {
             let mut batch = self.inner.next_batch(deadline)?;
             let mut r = lock(&self.replay);
+            for change in &batch {
+                match change {
+                    Change::CheckPath(path) | Change::RescanSubtree(path) => {
+                        r.reported.insert(path.clone());
+                    }
+                    Change::RescanVolume => r.volume_rescanned = true,
+                    _ => {}
+                }
+            }
             if r.history_done.is_some() {
                 return Ok(batch);
             }
@@ -799,6 +825,7 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
             replay: Arc::clone(&replay),
         };
         let saved_before = fs::metadata(store)?.modified()?;
+        let started = SystemTime::now();
         let t = Instant::now();
         let engine = app_engine(root, store, source)?;
         let opened = t.elapsed();
@@ -842,7 +869,7 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         }
         let in_budget = caught_up <= GATE_CAUGHT_UP;
         let equal = if compare {
-            compare_with_fresh_scan(&engine, root)?
+            compare_with_fresh_scan(&engine, root, started, &replay)?
         } else {
             true
         };
@@ -861,80 +888,6 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         );
         drop(engine);
         Ok(equal)
-    }
-
-    /// One entry as the comparison sees it: its place, kind and, for a
-    /// file, its size.
-    #[derive(PartialEq, Eq)]
-    struct Item {
-        parent: FileKey,
-        name: String,
-        kind: EntryKind,
-        size: u64,
-    }
-
-    /// Every entry below the root, by key.
-    type Listing = HashMap<FileKey, Item>;
-
-    fn item(e: Entry) -> Option<(FileKey, Item)> {
-        let size = if e.kind == EntryKind::File { e.size } else { 0 };
-        Some((
-            e.key,
-            Item {
-                parent: e.parent?,
-                name: e.name,
-                kind: e.kind,
-                size,
-            },
-        ))
-    }
-
-    fn engine_listing(snap: &EngineSnapshot) -> Listing {
-        let idx = snap.index();
-        idx.live_ids()
-            .filter_map(|id| {
-                let p = idx.parent(id);
-                let parent = (!p.is_none() && p != id).then(|| idx.key(p));
-                item(Entry {
-                    key: idx.key(id),
-                    parent,
-                    name: idx.name(id).to_string(),
-                    kind: idx.kind(id),
-                    flags: idx.flags(id),
-                    size: idx.size(id),
-                    modified: idx.modified(id),
-                    created: idx.created(id),
-                })
-            })
-            .collect()
-    }
-
-    fn scan_listing(root: &Path) -> io::Result<Listing> {
-        let mut out = Listing::new();
-        MacScanner::new(ScanOptions::default())
-            .enumerate(root, &mut |e: Entry| {
-                if let Some((key, item)) = item(e) {
-                    out.insert(key, item);
-                }
-            })
-            .map_err(|e| other(format!("fresh scan: {e}")))?;
-        Ok(out)
-    }
-
-    /// The path of `key` in `listing`, below `root`.
-    fn path_of(listing: &Listing, root: &Path, key: FileKey) -> PathBuf {
-        let mut names = Vec::new();
-        let mut at = listing.get(&key);
-        while let Some(item) = at {
-            names.push(item.name.as_str());
-            if names.len() > 4096 {
-                break;
-            }
-            at = listing.get(&item.parent);
-        }
-        let mut path = root.to_path_buf();
-        path.extend(names.iter().rev());
-        path
     }
 
     /// Paths FSEvents reported while the comparison ran.
@@ -965,19 +918,40 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
             }
         }
 
-        /// Whether FSEvents reported `path` or a folder above it.
-        fn covers(&self, path: &Path) -> bool {
-            path.ancestors().any(|p| self.paths.contains(p))
+        /// Whether FSEvents reported `path` or a folder above it, below
+        /// `root`: an event on the root itself (a rescan of everything)
+        /// would explain every difference, so it explains none.
+        fn covers(&self, root: &Path, path: &Path) -> bool {
+            path.ancestors()
+                .take_while(|p| *p != root)
+                .any(|p| self.paths.contains(p))
         }
     }
 
-    /// Compares the engine's index with a fresh scan of `root` and prints
-    /// the differences; returns whether every one is on a path FSEvents
-    /// reported while the comparison ran.
-    fn compare_with_fresh_scan(engine: &Engine, root: &Path) -> io::Result<bool> {
+    /// Compares the engine's index with a fresh scan of `root`
+    /// (`day_replay_compare`) and prints the differences; returns whether
+    /// each one is the disk moving on or something the scan can't see:
+    ///
+    /// - on a path FSEvents reported while the comparison ran;
+    /// - an entry only the index has, in a folder that refuses to be
+    ///   listed ([`compare::in_unlistable_folder`]);
+    /// - a file whose size alone differs and which was written after the
+    ///   replay began, `started` ([`compare::written_since`]), or which
+    ///   FSEvents never reported to the engine, neither it nor a folder
+    ///   above it: the engine can't know of a write FSEvents hasn't
+    ///   reported, such as to a database log a process keeps open.
+    ///
+    /// Anything else makes the index unequal, among them a change FSEvents
+    /// reported that the index doesn't show.
+    fn compare_with_fresh_scan(
+        engine: &Engine,
+        root: &Path,
+        started: SystemTime,
+        replay: &Mutex<Replay>,
+    ) -> io::Result<bool> {
         let t = Instant::now();
         let mut touched = Touched::start(root)?;
-        let fresh = scan_listing(root)?;
+        let fresh = compare::scan(root)?;
         // Let the engine apply what changed during the scan.
         touched.drain();
         let end = Instant::now() + SETTLE_TIMEOUT;
@@ -986,45 +960,70 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let indexed = engine_listing(&engine.snapshot());
+        let indexed = compare::engine_listing(&engine.snapshot());
         touched.drain();
         touched.stream.stop();
 
-        let (mut missing, mut extra, mut changed, mut unexplained) = (0u64, 0u64, 0u64, 0u64);
-        for (key, item) in &fresh {
-            let differs = match indexed.get(key) {
-                None => {
-                    missing += 1;
-                    true
-                }
-                Some(i) if i != item => {
-                    changed += 1;
-                    true
-                }
-                Some(_) => false,
-            };
-            if differs
-                && !touched.covers(&path_of(&fresh, root, *key))
-                && !(indexed.contains_key(key) && touched.covers(&path_of(&indexed, root, *key)))
-            {
-                unexplained += 1;
-            }
-        }
-        for key in indexed.keys().filter(|k| !fresh.contains_key(k)) {
-            extra += 1;
-            if !touched.covers(&path_of(&indexed, root, *key)) {
-                unexplained += 1;
-            }
-        }
-        metric("compare_fresh_entries", fresh.len());
+        let d = compare::compare(&indexed, &fresh);
+        // A difference on a path FSEvents reported meanwhile is the disk
+        // moving on, not something the replay lost.
+        let explained = |key: FileKey| {
+            [&fresh.items, &indexed].iter().any(|listing| {
+                listing.contains_key(&key)
+                    && touched.covers(root, &compare::path_of(listing, root, key))
+            })
+        };
+        let missing: Vec<FileKey> = d
+            .missing
+            .iter()
+            .copied()
+            .filter(|&k| !explained(k))
+            .collect();
+        let (unlistable, extra): (Vec<FileKey>, Vec<FileKey>) = d
+            .extra
+            .iter()
+            .copied()
+            .filter(|&k| !explained(k))
+            .partition(|&k| compare::in_unlistable_folder(&indexed, root, k));
+        let (size_only, changed): (Vec<FileKey>, Vec<FileKey>) = d
+            .changed
+            .iter()
+            .copied()
+            .filter(|&k| !explained(k))
+            .partition(|&k| fresh.only_size_differs(k, &indexed[&k]));
+        let (written, size_only): (Vec<FileKey>, Vec<FileKey>) = size_only
+            .into_iter()
+            .partition(|&k| compare::written_since(&fresh.items, root, k, started));
+        let (unreported, reported_stale): (Vec<FileKey>, Vec<FileKey>) = {
+            let r = lock(replay);
+            size_only.into_iter().partition(|&k| {
+                let path = compare::path_of(&indexed, root, k);
+                !r.volume_rescanned
+                    && !path
+                        .ancestors()
+                        .take_while(|p| *p != root)
+                        .any(|p| r.reported.contains(p))
+            })
+        };
+        let changed: Vec<FileKey> = changed.into_iter().chain(reported_stale).collect();
+        metric("compare_fresh_entries", fresh.items.len());
         metric("compare_index_entries", indexed.len());
-        metric("compare_missing", missing);
-        metric("compare_extra", extra);
-        metric("compare_changed", changed);
+        metric("compare_hard_linked_files", fresh.other_links.len());
+        metric("compare_missing", d.missing.len());
+        metric("compare_extra", d.extra.len());
+        metric("compare_changed", d.changed.len());
+        metric("compare_changed_kind_or_size", d.changed_kind_or_size);
         metric("compare_touched_paths", touched.paths.len());
-        metric("compare_unexplained", unexplained);
+        metric("compare_extra_in_unlistable_folders", unlistable.len());
+        metric("compare_changed_written_during_run", written.len());
+        metric("compare_changed_unreported", unreported.len());
+        metric("compare_unexplained_missing", missing.len());
+        metric("compare_unexplained_extra", extra.len());
+        metric("compare_unexplained_changed", changed.len());
+        let total = missing.len() + extra.len() + changed.len();
+        metric("compare_unexplained", total);
         metric("compare_ms", ms(t.elapsed()));
-        let equal = unexplained == 0;
+        let equal = total == 0;
         metric("equal_to_fresh_scan", equal);
         Ok(equal)
     }

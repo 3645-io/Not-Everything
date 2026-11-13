@@ -334,8 +334,15 @@ resident app with its window closed), and reports the start (`replay`,
 or a rescan when the history is gone), the changes and rescans replayed,
 `history_handed_out_ms`, `caught_up_ms` (until the engine has published
 the history), the peak memory footprint, and whether the index then
-equals a fresh scan, counting apart the differences on paths FSEvents
-reported during the comparison (`--no-compare` skips it). Last, untimed,
+equals a fresh scan (`--no-compare` skips it). The comparison
+(`examples/day_replay_compare/mod.rs`, tested by
+`tests/macos_fresh_scan_compare.rs`) goes by file key, and a file with
+several hard links, which the index holds at one link, equals the scan
+at any of them. It counts apart the differences the replay can't have
+caused: on paths FSEvents reported during the comparison; entries only
+the index has, in folders that refuse to be listed; and files whose size
+alone differs that were written during the run or that FSEvents never
+reported. Last, untimed,
 it counts the history's raw events and the distinct paths created,
 removed, renamed and modified, and projects the compactions, and so the
 saves, a day of such changes brings (`fx_bench::saves`). Gate line: `day
