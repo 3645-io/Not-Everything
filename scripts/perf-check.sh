@@ -21,9 +21,16 @@
 #
 # Output in <out>: one <step>.log per step, metrics.txt (the metric=value
 # lines perf-compare reads), summary.md (the table that goes in the PR) and
-# run.txt (machine, build, load). The exit code is perf-compare's: 0 when
-# every gated metric passes, 1 when one fails or was not measured, 2 for bad
-# arguments.
+# run.txt (machine, build, load, the screen). The exit code is
+# perf-compare's: 0 when every gated metric passes, 1 when one fails or was
+# not measured, 2 for bad arguments or a locked screen.
+#
+# A locked screen stops the run before it starts, and again once the lock
+# is held: on a locked screen the app's window can't come forward, so the
+# probes that summon it time out. On 13 Nov 2026 the screen locked two
+# minutes into an rc run, all 50 shortcut presses of F3 timed out at 5 s and
+# the 75-minute run was wasted. run.txt records the screen at the start and
+# at the end, and notes each step after which it was locked.
 #
 # Safety: the script creates only <out>, a lock folder and a scratch folder
 # in $TMPDIR. The app's data (--data-dir) and the startup store go inside
@@ -76,8 +83,9 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
   --dmg FILE        rc tier: the release candidate's DMG, for its size
   --soak-minutes N  with --step soak: how long the soak runs (default 1440)
 
-Run it from a quiet Mac: plugged in, nothing heavy running. cargo must be on
-PATH. The script never runs sudo or flushes caches itself.
+Run it from a quiet Mac: plugged in, nothing heavy running, the screen
+unlocked and the display awake (it refuses to start on a locked screen).
+cargo must be on PATH. The script never runs sudo or flushes caches itself.
 EOF
 }
 
@@ -304,6 +312,41 @@ if wants background && [ "$BG_SECONDS" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# The screen. On a locked screen the app's window can't come forward, so
+# every probe that summons it times out (the comment at the top says what
+# that cost once).
+# ---------------------------------------------------------------------------
+
+# screen_state: locked, unlocked, or unknown when ioreg is missing or fails.
+# The console user's session in the I/O Registry carries
+# "CGSSessionScreenIsLocked"=Yes while the screen is locked. Only the state
+# is printed: the registry also holds the user's name.
+screen_state() {
+    if ! screen_registry=$(ioreg -n Root -d1 2>/dev/null); then
+        echo unknown
+        return 0
+    fi
+    case $screen_registry in
+        *'"CGSSessionScreenIsLocked"=Yes'*) echo locked ;;
+        *) echo unlocked ;;
+    esac
+}
+
+# refuse_a_locked_screen: exits 2 on a locked screen, before the run has
+# changed anything (once the lock is held, the EXIT trap gives it back). An
+# unknown state is not refused: the run goes on, and run.txt says unknown.
+refuse_a_locked_screen() {
+    SCREEN=$(screen_state)
+    if [ "$SCREEN" = locked ]; then
+        echo "perf-check: the screen is locked: the app's window can't come forward on a locked screen, so its probes would time out. Unlock the Mac, keep the display awake and run again (nothing was changed)" >&2
+        exit 2
+    fi
+}
+
+SCREEN=""
+refuse_a_locked_screen
+
+# ---------------------------------------------------------------------------
 # The lock, then the output folder. The lock is taken before the build:
 # compiling would disturb another run's measurements as much as a benchmark.
 # ---------------------------------------------------------------------------
@@ -313,9 +356,16 @@ HAVE_LOCK=0
 APP_PID=""
 CHURN_PID=""
 SCRATCH=""
+RUN_TXT=0
 
 # shellcheck disable=SC2329 # called by the EXIT trap
 cleanup() {
+    # The screen when the run ended, however it ended, once run.txt exists:
+    # a locked screen explains probes that timed out. Never in the way of
+    # the clean-up below.
+    if [ "$RUN_TXT" -eq 1 ]; then
+        echo "screen at the end: $(screen_state)" >>"$OUT/run.txt" || true
+    fi
     # Only processes this script started, by their PID.
     for p in $CHURN_PID $APP_PID; do
         kill -TERM "$p" 2>/dev/null || true
@@ -359,6 +409,9 @@ done
 HAVE_LOCK=1
 echo $$ >"$LOCK/pid"
 
+# Waiting for another run can take an hour: check the screen again.
+refuse_a_locked_screen
+
 mkdir -p "$(dirname "$OUT")"
 mkdir "$OUT"
 SCRATCH="${TMPDIR:-/tmp}/not-everything-perf-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
@@ -396,6 +449,7 @@ displays() {
     echo "model: $(sysctl -n hw.model 2>/dev/null || echo unknown)"
     echo "power: $(pmset -g batt 2>/dev/null | sed -n "1s/^Now drawing from '\\(.*\\)'.*/\\1/p")"
     echo "displays: $(displays)"
+    echo "screen at the start: $SCREEN"
     echo "load before: $(sysctl -n vm.loadavg 2>/dev/null || echo unknown)"
     echo "git: $(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet 2>/dev/null || echo ' (uncommitted changes)')"
     echo "rustc: $(rustc --version 2>/dev/null || echo unknown)"
@@ -408,6 +462,7 @@ displays() {
         echo "soak: $SOAK_MINUTES min, seed 1"
     fi
 } >"$OUT/run.txt"
+RUN_TXT=1
 
 LOAD1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print int($2) }')
 if [ -n "$LOAD1" ] && [ "$LOAD1" -ge 4 ]; then
@@ -747,6 +802,8 @@ step_soak() {
 
 for s in matcher startup catchup freshness first-run cli gate-probe summon sort background soak dmg; do
     wants "$s" || continue
+    # Kept apart from $s, which step_background reuses.
+    this_step=$s
     case "$s" in
         matcher) step_matcher ;;
         startup) step_startup ;;
@@ -761,6 +818,11 @@ for s in matcher startup catchup freshness first-run cli gate-probe summon sort 
         soak) step_soak ;;
         dmg) [ -n "$DMG" ] && step_dmg ;;
     esac
+    # Between steps, never during one: a screen that locked makes the
+    # window's probes time out, so the note says which results to doubt.
+    if [ "$(screen_state)" = locked ]; then
+        note "screen locked after the $this_step step: the app's window can't come forward on a locked screen, so its probes time out"
+    fi
 done
 
 echo "load after: $(sysctl -n vm.loadavg 2>/dev/null || echo unknown)" >>"$OUT/run.txt"
