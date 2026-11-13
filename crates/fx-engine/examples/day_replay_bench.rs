@@ -18,8 +18,10 @@
 //!    FSEvents database UUID. FSEvents has a call for that ID
 //!    (`FSEventsGetLastEventIdForDeviceBeforeTime`), used when it answers;
 //!    on macOS 27.2 it returns 0 for every time and volume tried, so the
-//!    ID is estimated from the history instead (`estimate_event_id`: each
-//!    reported path's last event ID against its status-change time). A
+//!    ID is estimated from the history instead (`estimate_event_id`: the
+//!    last event IDs of paths created once and not changed since, against
+//!    their creation times). The estimate is rough, so the reliable span
+//!    of a day is `--prepare` and `--store` below. A
 //!    copied store keeps its own cursor unless `--hours` is given. A
 //!    freshly built index is current, so the replay re-checks a day of
 //!    reported paths against the disk, which is where the time goes, but
@@ -341,9 +343,9 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         if span_known {
             metric("replay_span_hours", hours);
         } else {
-            // The estimate found no change under the root before the time
-            // asked for, and replays from further back.
-            metric("replay_span_hours_at_least", hours);
+            // The estimate's history never reached back to the time asked
+            // for: the replay starts later than that.
+            metric("replay_span_hours_less_than", hours);
         }
         let cursor_id = event_id(Some(cursor)).ok_or_else(|| other("not an FSEvents cursor"))?;
         metric(
@@ -442,7 +444,8 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
 
     /// Rewrites the store with its cursor set to the root's volume's last
     /// event before `hours` ago, and returns that cursor, with whether it
-    /// is that event (`false`: an earlier one, see [`estimate_event_id`]).
+    /// reaches back that far (`false`: a later one, see
+    /// [`estimate_event_id`]).
     fn set_cursor_back(store: &Path, root: &Path, hours: u64) -> io::Result<(ResumeCursor, bool)> {
         let dev = device_of(root)?;
         let db_uuid =
@@ -490,13 +493,18 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
     /// Estimates the root's volume's last event ID before `target` (Unix
     /// seconds) from its history, read from further back each round until
     /// it reaches before `target`. Every path the history reports comes with
-    /// the ID of its last event, and the path's status-change time (ctime),
-    /// which every reported change sets, is that event's time unless an
-    /// unreported change came later. The estimate is the ID that best splits
-    /// the paths last changed before `target` from those changed after it.
-    /// When no path under the root was changed before `target` even in the
-    /// last round, the start of that round's history stands in, and the
-    /// second value is `false`: the replay then spans more than asked.
+    /// the ID of its last event. A path's status-change time (ctime) is not
+    /// reliably that event's time: a hard link added or removed elsewhere,
+    /// or an attribute set, moves it without an event for the path (Cargo's
+    /// build folders link hundreds of thousands of files). So only the
+    /// paths created once and not changed since count: their creation time
+    /// (`st_birthtime`) and ctime agree within [`PINNED`], and that is when
+    /// their event came. They are taken in event-ID order in slices of
+    /// [`ESTIMATE_SLICES`], and the estimate is the last ID of the last slice
+    /// whose median time is at or before `target`. When even the last
+    /// round's first slice is after `target`, the start of that round's
+    /// history stands in, and the second value is `false`: the replay then
+    /// spans less than asked.
     fn estimate_event_id(root: &Path, db_uuid: [u8; 16], target: f64) -> io::Result<(u64, bool)> {
         use std::os::unix::fs::MetadataExt;
 
@@ -520,17 +528,34 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
                     db_uuid,
                 },
             )?;
-            // Each path still there: its last event ID, and whether it was
-            // changed before `target`.
-            let mut points: Vec<(u64, bool)> = last
+            // Each path still there, created once and not changed since: its
+            // last event ID and that event's time.
+            let mut points: Vec<(u64, f64)> = last
                 .iter()
                 .filter_map(|(path, &id)| {
                     let meta = fs::symlink_metadata(path).ok()?;
                     let ctime = meta.ctime() as f64 + meta.ctime_nsec() as f64 / 1e9;
-                    Some((id, ctime <= target))
+                    let born = meta
+                        .created()
+                        .ok()?
+                        .duration_since(UNIX_EPOCH)
+                        .ok()?
+                        .as_secs_f64();
+                    (ctime - born <= PINNED).then_some((id, ctime))
                 })
                 .collect();
-            let before = points.iter().filter(|p| p.1).count();
+            points.sort_unstable_by_key(|&(id, _)| id);
+            let slice = (points.len() / ESTIMATE_SLICES).max(1);
+            // Each slice's last ID and its paths' median ctime.
+            let medians: Vec<(u64, f64)> = points
+                .chunks(slice)
+                .map(|chunk| {
+                    let mut times: Vec<f64> = chunk.iter().map(|&(_, t)| t).collect();
+                    times.sort_unstable_by(f64::total_cmp);
+                    (chunk[chunk.len() - 1].0, times[times.len() / 2])
+                })
+                .collect();
+            let before = medians.iter().take_while(|&&(_, t)| t <= target).count();
             if before == 0 && round < ESTIMATE_ROUNDS && from > 1 {
                 back = back.saturating_mul(4);
                 round += 1;
@@ -538,37 +563,22 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
             }
             metric("cursor_estimate_rounds", round);
             metric("cursor_estimate_paths", points.len());
-            metric("cursor_estimate_paths_before", before);
-            if before == 0 {
-                return Ok((from, false));
-            }
-            // The split with the fewest paths on the wrong side: changed
-            // after `target` below it, or before `target` above it.
-            points.sort_unstable();
-            let (mut best, mut split) = (before, 0);
-            let (mut after_below, mut before_below) = (0, 0);
-            for (i, &(_, was_before)) in points.iter().enumerate() {
-                if was_before {
-                    before_below += 1;
-                } else {
-                    after_below += 1;
-                }
-                let misplaced = after_below + (before - before_below);
-                if misplaced < best {
-                    (best, split) = (misplaced, i + 1);
-                }
-            }
-            metric("cursor_estimate_paths_misplaced", best);
-            return Ok((
-                if split == 0 {
-                    from
-                } else {
-                    points[split - 1].0
-                },
-                true,
-            ));
+            metric("cursor_estimate_slices", medians.len());
+            metric("cursor_estimate_slices_before", before);
+            return Ok(match before {
+                0 => (from, false),
+                n => (medians[n - 1].0, true),
+            });
         }
     }
+
+    /// How many slices of paths, in event-ID order, the estimate takes the
+    /// median time of.
+    const ESTIMATE_SLICES: usize = 50;
+
+    /// How far apart, in seconds, a path's creation time and ctime may be
+    /// for the estimate to take its ctime as its event's time.
+    const PINNED: f64 = 2.0;
 
     /// The last event ID of each path in the root's history from `from` up
     /// to the HistoryDone marker.
@@ -1006,6 +1016,26 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
             })
         };
         let changed: Vec<FileKey> = changed.into_iter().chain(reported_stale).collect();
+        // What is left but equal by path: entries under another file key
+        // at the same path. The index still equals the scan by path, kind
+        // and size, but not by key.
+        let same_path =
+            compare::same_path_other_key(&indexed, &fresh, root, &missing, &extra, &changed);
+        let strict = missing.len() + extra.len() + changed.len();
+        let (missing, extra, changed): (Vec<FileKey>, Vec<FileKey>, Vec<FileKey>) = (
+            missing
+                .into_iter()
+                .filter(|k| !same_path.contains(k))
+                .collect(),
+            extra
+                .into_iter()
+                .filter(|k| !same_path.contains(k))
+                .collect(),
+            changed
+                .into_iter()
+                .filter(|k| !same_path.contains(k))
+                .collect(),
+        );
         metric("compare_fresh_entries", fresh.items.len());
         metric("compare_index_entries", indexed.len());
         metric("compare_hard_linked_files", fresh.other_links.len());
@@ -1017,12 +1047,16 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
         metric("compare_extra_in_unlistable_folders", unlistable.len());
         metric("compare_changed_written_during_run", written.len());
         metric("compare_changed_unreported", unreported.len());
+        metric("compare_same_path_other_key", same_path.len());
         metric("compare_unexplained_missing", missing.len());
         metric("compare_unexplained_extra", extra.len());
         metric("compare_unexplained_changed", changed.len());
         let total = missing.len() + extra.len() + changed.len();
         metric("compare_unexplained", total);
         metric("compare_ms", ms(t.elapsed()));
+        // By key, every entry under the scan's key; by path, what a search
+        // shows.
+        metric("equal_by_key", strict == 0);
         let equal = total == 0;
         metric("equal_to_fresh_scan", equal);
         Ok(equal)

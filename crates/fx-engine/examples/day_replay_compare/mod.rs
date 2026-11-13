@@ -101,23 +101,64 @@ impl Fresh {
     }
 }
 
-/// Whether the folder that holds `key` in `listing` refuses to be listed
-/// (`EPERM` or `EACCES`). macOS keeps some folders under `~/Library` from
-/// being listed, even by a process with Full Disk Access, while a path
-/// inside them can still be read with `lstat`. The scanner skips such a
-/// folder, but when FSEvents reports a change inside it, the writer reads
-/// the path and indexes the entry: the index then holds entries a fresh
-/// scan can't see. That is not something the replay lost.
+/// Whether a folder above `key` in `listing`, below `root`, refuses to be
+/// listed (`EPERM` or `EACCES`). macOS keeps some folders from being
+/// listed, even by a process with Full Disk Access (data stores under
+/// `~/Library`), and some system folders allow passing through but not
+/// listing (`drwxr-x--x`), while a path inside them can still be read with
+/// `lstat`. The scanner skips such a folder and everything below it, but
+/// when FSEvents reports a change inside it, the writer reads the path and
+/// indexes the entry: the index then holds entries a fresh scan can't see.
+/// That is not something the replay lost.
 pub fn in_unlistable_folder(listing: &Listing, root: &Path, key: FileKey) -> bool {
-    let Some(item) = listing.get(&key) else {
+    if !listing.contains_key(&key) {
         return false;
+    }
+    let path = path_of(listing, root, key);
+    path.ancestors()
+        .skip(1)
+        .take_while(|folder| folder.starts_with(root) && *folder != root)
+        .any(|folder| {
+            matches!(std::fs::read_dir(folder),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied)
+        })
+}
+
+/// The differences that vanish when compared by path: entries at the same
+/// path, with the same kind and size, on both sides, but under another file
+/// key (one of `changed` whose path is the same on both sides, or one of
+/// `missing` matched by one of `extra`). The scanner and `lstat` can key a
+/// folder differently: a firmlink's System-volume entry against the Data
+/// volume folder it leads to.
+pub fn same_path_other_key(
+    indexed: &Listing,
+    fresh: &Fresh,
+    root: &Path,
+    missing: &[FileKey],
+    extra: &[FileKey],
+    changed: &[FileKey],
+) -> std::collections::HashSet<FileKey> {
+    let shape = |listing: &Listing, key: FileKey| {
+        let item = &listing[&key];
+        (path_of(listing, root, key), item.kind, item.size)
     };
-    let folder = if listing.contains_key(&item.parent) {
-        path_of(listing, root, item.parent)
-    } else {
-        root.to_path_buf()
-    };
-    matches!(std::fs::read_dir(&folder), Err(e) if e.kind() == io::ErrorKind::PermissionDenied)
+    let mut out = std::collections::HashSet::new();
+    for &key in changed {
+        if shape(&fresh.items, key) == shape(indexed, key) {
+            out.insert(key);
+        }
+    }
+    let by_shape: HashMap<_, FileKey> = missing
+        .iter()
+        .map(|&key| (shape(&fresh.items, key), key))
+        .collect();
+    for &key in extra {
+        if let Some(&other) = by_shape.get(&shape(indexed, key)) {
+            out.insert(key);
+            out.insert(other);
+        }
+    }
+    out
 }
 
 /// Whether the entry at `key`'s path in `listing` was modified at or after

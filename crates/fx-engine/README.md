@@ -326,8 +326,11 @@ in a temporary folder, or copies a saved store (`--store PATH`), and sets
 the store's cursor `--hours` back (default 24; a copied store keeps its
 own cursor unless `--hours` is given). FSEvents' call for the last event
 ID before a time (`FSEventsGetLastEventIdForDeviceBeforeTime`) returns 0
-on macOS 27.2, so the ID is then estimated from the history: each
-reported path's last event ID against its status-change time. It then
+on macOS 27.2, so the ID is then estimated from the history: the last
+event IDs of paths created once and not changed since, against their
+creation times. The estimate is rough (`cursor_from`, and
+`replay_span_hours_less_than` when its history never reaches back that
+far); `--prepare` and then `--store` a day later give a real day. It then
 relaunches in a process of its own, as the app does, with the app's
 engine configuration (`--hidden` for the background batch window of a
 resident app with its window closed), and reports the start (`replay`,
