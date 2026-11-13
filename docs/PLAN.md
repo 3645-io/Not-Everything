@@ -371,7 +371,7 @@ The checklists below hold every acceptance criterion per phase; tick them off as
 - [ ] Goal 2: engine p95 ≤16 ms at 2M entries and ≤30 ms at 5M; keystroke to repaint p95 ≤50 ms; regex and full-path p95 ≤100 ms at 2M
 - [ ] Goal 3: create, rename or delete shown in an open result list ≤1 s p99 over 1,000 scripted operations (stretch ≤250 ms p95)
 - [ ] Offline catch-up: 10,000 changes made while quit; after relaunch the index equals a fresh scan within 10 s, search usable within 2 s
-- [ ] First run: \~2M entries in ≤15 s warm, results shown progressively
+- [ ] First run: \~2M entries in ≤15 s warm (showing results progressively during the scan moved to Phase 2 by the owner on 13 Nov 2026)
 - [ ] Memory: ≤100 B per entry with default columns
 - [ ] `es`-style CLI with csv, json and txt output and documented exit codes
 
@@ -381,6 +381,7 @@ The checklists below hold every acceptance criterion per phase; tick them off as
 - [ ] 24 h soak with 100k random file operations: 0 differences against ground truth, memory growth ≤5%
 - [ ] 200 `kill -9` runs during checkpoints: the index always loads, never corrupts
 - [ ] External APFS/HFS+ indexed on mount; FAT/exFAT rescanned; network off by default; no duplicates from `/System/Volumes/Data`
+- [ ] First run: results shown progressively during the first scan, the first within 2 s (moved from Phase 1 by the owner on 13 Nov 2026; F5 in the performance gate tracks it)
 - [ ] iCloud and File Provider folders: indexing triggers 0 downloads
 - [ ] Non-FDA mode triggers no consent prompts; an FDA grant is detected within 2 s of app activation
 - [ ] VoiceOver reads row, column and total count
