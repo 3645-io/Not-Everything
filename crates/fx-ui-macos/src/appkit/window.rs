@@ -31,10 +31,11 @@
 //! AppKit never sorts.
 //!
 //! Actions are read-only (see [`crate::actions`]): Enter opens, Cmd+Enter
-//! reveals in Finder, Option+Cmd+C copies full paths, double-click opens,
-//! Space shows the selection in the system Quick Look panel (`quick_look.rs`),
-//! and dragging rows out offers file URLs with copy and link operations
-//! only.
+//! reveals in Finder, Cmd+C copies the files and Option+Cmd+C their full
+//! paths, double-click opens, Space shows the selection in the system
+//! Quick Look panel (`quick_look.rs`), a right-click shows the menu of
+//! [`crate::context_menu`] (`context_menu.rs`), and dragging rows out
+//! offers file URLs with copy and link operations only.
 //! In the resident app Escape clears the search, then hides the window and
 //! hands the focus back to the previous app, as the summon hotkey does;
 //! with the Quick Look panel open it closes the panel first.

@@ -5,7 +5,7 @@
 //! so a release build has no way to script its window.
 //!
 //! Steps: `query:TEXT`, `chips:case,path,regex` (any of them, or none),
-//! `select:ROW`, `focus:results` or `focus:field`, `hover:ROW`,
+//! `select:ROW` or `select:FIRST-LAST`, `focus:results` or `focus:field`, `hover:ROW`,
 //! `sort:COLUMN` (a column identifier), `size:WIDTHxHEIGHT`,
 //! `appearance:dark` or `appearance:light` (the app's, as Settings sets
 //! it), `escape` (Escape in the search field, through its field editor),
@@ -35,9 +35,13 @@
 //! asks as the keyboard and VoiceOver do; `menu:ROW:ITEM` performs an item
 //! (`open`, `reveal`, `look`, `copy`, `path`, `share`, `terminal`) as
 //! choosing it would; `menu:ROW:open-with` fills and logs the Open With
-//! submenu. `rclick:ROW:SECS` right-clicks the row with real events, which
+//! submenu; `menu:ROW:other` chooses its Other…, logs the panel it opens
+//! and closes it after 2 seconds without choosing. `rclick:ROW:SECS` right-clicks the row with real events, which
 //! shows the menu on screen, and closes it after SECS seconds (for
-//! screenshots); `menukey:SECS` does the same with Control-Return.
+//! screenshots); `menukey:SECS` does the same with Control-Return, and
+//! `showmenu:SECS` with the table's `showContextMenuForSelection:`, as
+//! VoiceOver's Show Menu does. `origin:X,Y` moves the window's top left
+//! corner there, in the screens' coordinates from the top left.
 //! `pasteboard` logs the types and files on the pasteboard copies go to
 //! (in these checks a named one, `NE_DEBUG_PASTEBOARD`, never the user's
 //! clipboard). `key:cmd-c`, `key:option-cmd-c`, `key:shift-cmd-c` and
@@ -63,6 +67,7 @@ pub(crate) enum Step {
     Query(String),
     Chips { case: bool, path: bool, regex: bool },
     Select(usize),
+    SelectRange(usize, usize),
     FocusResults,
     FocusField,
     Hover(usize),
@@ -84,6 +89,8 @@ pub(crate) enum Step {
     Menu(MenuAt, MenuStep),
     RightClick(usize, f64),
     MenuKey(f64),
+    ShowMenu(f64),
+    Origin(f64, f64),
     Pasteboard,
     Chord(Chord),
     Status,
@@ -109,6 +116,8 @@ pub(crate) enum MenuStep {
     Perform(ContextItem),
     /// Fills and logs the Open With submenu.
     OpenWith,
+    /// Chooses Open With > Other…, logs the panel and closes it.
+    Other,
 }
 
 /// A key chord with C for [`Step::Chord`], sent through the application.
@@ -146,6 +155,7 @@ fn menu_step(arg: &str) -> Option<Step> {
     let step = match parts.next() {
         None => MenuStep::Log,
         Some("open-with") => MenuStep::OpenWith,
+        Some("other") => MenuStep::Other,
         Some(name) => MenuStep::Perform(
             ContextItem::ALL
                 .iter()
@@ -239,7 +249,10 @@ fn parse(text: &str) -> Vec<Step> {
                     path: arg.contains("path"),
                     regex: arg.contains("regex"),
                 }),
-                "select" => arg.trim().parse().ok().map(Step::Select),
+                "select" => match arg.trim().split_once('-') {
+                    Some((a, b)) => Some(Step::SelectRange(a.parse().ok()?, b.parse().ok()?)),
+                    None => arg.trim().parse().ok().map(Step::Select),
+                },
                 "focus" if arg.trim() == "results" => Some(Step::FocusResults),
                 "focus" => Some(Step::FocusField),
                 "hover" => arg.trim().parse().ok().map(Step::Hover),
@@ -272,6 +285,11 @@ fn parse(text: &str) -> Vec<Step> {
                     Some(Step::RightClick(row.parse().ok()?, secs.parse().ok()?))
                 }
                 "menukey" => arg.trim().parse().ok().map(Step::MenuKey),
+                "showmenu" => arg.trim().parse().ok().map(Step::ShowMenu),
+                "origin" => {
+                    let (x, y) = arg.split_once(',')?;
+                    Some(Step::Origin(x.trim().parse().ok()?, y.trim().parse().ok()?))
+                }
                 "pasteboard" => Some(Step::Pasteboard),
                 "status" => Some(Step::Status),
                 "type" => Some(Step::Type(arg.to_owned())),
@@ -297,7 +315,7 @@ mod tests {
         assert_eq!(
             parse(
                 "menu:3;menu:empty;menu:keyboard;menu:2:copy;menu:0:look;menu:4:open-with;\
-                 rclick:1:4.5;menukey:3;pasteboard;key:cmd-c;key:option-cmd-c;\
+                 rclick:1:4.5;menukey:3;showmenu:2;origin:100,334;pasteboard;key:cmd-c;key:option-cmd-c;\
                  key:shift-cmd-c;key:control-cmd-c;status"
             ),
             vec![
@@ -309,6 +327,8 @@ mod tests {
                 Step::Menu(MenuAt::Row(4), MenuStep::OpenWith),
                 Step::RightClick(1, 4.5),
                 Step::MenuKey(3.0),
+                Step::ShowMenu(2.0),
+                Step::Origin(100.0, 334.0),
                 Step::Pasteboard,
                 Step::Chord(Chord::CmdC),
                 Step::Chord(Chord::OptionCmdC),
@@ -316,6 +336,11 @@ mod tests {
                 Step::Chord(Chord::ControlCmdC),
                 Step::Status,
             ]
+        );
+        assert_eq!(parse("select:2-5"), vec![Step::SelectRange(2, 5)]);
+        assert_eq!(
+            parse("menu:1:other"),
+            vec![Step::Menu(MenuAt::Row(1), MenuStep::Other)]
         );
         for item in ["open", "reveal", "path", "share", "terminal"] {
             assert!(

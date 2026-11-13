@@ -16,8 +16,10 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, ProtocolObject, Sel};
-use objc2::{AnyThread, ClassType, Encode, Encoding, MainThreadMarker, MainThreadOnly, msg_send};
+use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::{
+    AnyThread, ClassType, Encode, Encoding, MainThreadMarker, MainThreadOnly, msg_send, sel,
+};
 use objc2_app_kit::{
     NSEventModifierFlags, NSImage, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPasteboard,
     NSPasteboardWriting, NSSharingServicePicker, NSView, NSWorkspace, NSWorkspaceOpenConfiguration,
@@ -142,6 +144,23 @@ fn symbol(name: &str) -> Option<Retained<NSImage>> {
     Some(image)
 }
 
+/// `NSMenuItemImageVisibilityVisible` (macOS 27's `NSMenuItem.h`).
+const IMAGE_VISIBLE: isize = 1;
+
+/// Shows `image` on `item`. From macOS 27 AppKit hides menu item images
+/// unless asked to show them (`preferredImageVisibility`); the boards give
+/// every item its glyph, so they are asked for. Earlier systems always
+/// show them.
+fn set_image(item: &NSMenuItem, image: Option<&NSImage>) {
+    item.setImage(image);
+    if image.is_some() && item.respondsToSelector(sel!(setPreferredImageVisibility:)) {
+        // SAFETY: `setPreferredImageVisibility:` (macOS 27) takes an
+        // NSInteger, here `NSMenuItemImageVisibilityVisible`; the check
+        // above keeps it from older systems.
+        let _: () = unsafe { msg_send![item, setPreferredImageVisibility: IMAGE_VISIBLE] };
+    }
+}
+
 /// A menu item titled `title` that sends `action` to `target`.
 fn menu_item(
     mtm: MainThreadMarker,
@@ -186,7 +205,7 @@ pub(super) fn context_item(
         }
         entry.setKeyEquivalentModifierMask(mask);
     }
-    entry.setImage(symbol(item.symbol()).as_deref());
+    set_image(&entry, symbol(item.symbol()).as_deref());
     entry
 }
 
@@ -205,7 +224,7 @@ pub(super) fn open_with_item(
             let path = NSString::from_str(path);
             let icon = NSWorkspace::sharedWorkspace().iconForFile(&path);
             icon.setSize(NSSize::new(APP_ICON_SIZE, APP_ICON_SIZE));
-            item.setImage(Some(&icon));
+            set_image(&item, Some(&icon));
             // SAFETY: the represented object is an NSString, which the
             // action reads back as one.
             unsafe { item.setRepresentedObject(Some(&path)) };
@@ -294,12 +313,19 @@ unsafe impl Encode for NoCompletion {
 /// Opens the files at `paths` with the app at `app`, once (no "Always Open
 /// With", which would change a system setting).
 pub(super) fn open_with(paths: &[String], app: &NSURL) {
+    open_with_prompting(paths, app, true);
+}
+
+/// [`open_with`], letting macOS ask the user (a first launch of a
+/// downloaded app, say) only when `prompt` is set.
+fn open_with_prompting(paths: &[String], app: &NSURL, prompt: bool) {
     if paths.is_empty() {
         return;
     }
     let workspace = NSWorkspace::sharedWorkspace();
     let urls = file_urls(paths);
     let configuration = NSWorkspaceOpenConfiguration::configuration();
+    configuration.setPromptsUserIfNeeded(prompt);
     // SAFETY: `openURLs:withApplicationAtURL:configuration:completionHandler:`
     // takes an array of file URLs, an app URL, a configuration and a
     // nullable block, here nil; it returns void.
@@ -480,6 +506,27 @@ mod tests {
             target_kind(&workspace, &path(&dir.join("gone"))),
             TargetKind::File
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// New Terminal at Folder and App Store… find their apps by bundle
+    /// identifier.
+    #[test]
+    fn terminal_and_the_app_store_are_found() {
+        assert!(app_with_id(TERMINAL).is_some(), "{TERMINAL}");
+        assert!(app_with_id(APP_STORE).is_some(), "{APP_STORE}");
+    }
+
+    /// Open With passes a nil completion block: the call goes through
+    /// (debug builds check every argument's type), and an app that isn't
+    /// there opens nothing.
+    #[test]
+    fn open_with_a_missing_app_opens_nothing() {
+        let dir = scratch("open-with");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"x").expect("a file");
+        let missing = file_url(&path(&dir.join("No Such App.app")));
+        open_with_prompting(&[path(&file)], &missing, false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

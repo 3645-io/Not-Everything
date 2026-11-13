@@ -427,19 +427,21 @@ fn debug_key(window: &SearchWindow, ch: char, code: u16, flags: NSEventModifierF
     }
 }
 
-/// A debug script's key press of `ch` (key code `code`) with `flags`, sent
-/// through the application as the hardware's are, so the main menu's key
-/// equivalents (Edit > Copy's Cmd+C) and the context-menu key fire before
-/// the window's own handling.
+/// A debug script's key press (key code `code`) with `flags`, typing
+/// `chars` (`ignoring` without the modifiers but Shift), sent through the
+/// application as the hardware's are, so the main menu's key equivalents
+/// (Edit > Copy's Cmd+C) and the context-menu key fire before the window's
+/// own handling.
 #[cfg(debug_assertions)]
 fn debug_app_key(
     mtm: MainThreadMarker,
     window: &SearchWindow,
-    ch: char,
+    [chars, ignoring]: [&str; 2],
     code: u16,
     flags: NSEventModifierFlags,
 ) {
-    let text = NSString::from_str(&ch.to_string());
+    let text = NSString::from_str(chars);
+    let ignoring = NSString::from_str(ignoring);
     for kind in [NSEventType::KeyDown, NSEventType::KeyUp] {
         let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
             kind,
@@ -449,7 +451,7 @@ fn debug_app_key(
             window.windowNumber(),
             None,
             &text,
-            &text,
+            &ignoring,
             false,
             code,
         );
@@ -963,6 +965,47 @@ define_class!(
             }
         }
 
+        /// A debug script's Other… panel has been open long enough: log
+        /// what it offers and close it without choosing.
+        #[cfg(debug_assertions)]
+        #[unsafe(method(debugEndModal:))]
+        fn debug_end_modal(&self, _timer: &NSTimer) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            if let Some(panel) = app.modalWindow() {
+                // SAFETY: an open panel answers `message`,
+                // `directoryURL` and `allowedContentTypes` (macOS 11) with
+                // a string, a URL and an array, or nil.
+                let message: Option<Retained<NSString>> = unsafe { msg_send![&*panel, message] };
+                // SAFETY: as above.
+                let folder: Option<Retained<NSURL>> = unsafe { msg_send![&*panel, directoryURL] };
+                // SAFETY: as above.
+                let types: Option<Retained<NSArray>> =
+                    unsafe { msg_send![&*panel, allowedContentTypes] };
+                let types: Vec<String> = types
+                    .map(|a| {
+                        a.iter()
+                            .map(|t| {
+                                // SAFETY: a UTType answers `identifier`
+                                // with a string.
+                                let id: Retained<NSString> =
+                                    unsafe { msg_send![&*t, identifier] };
+                                id.to_string()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "debug other: {:?} open, message {:?}, folder {:?}, types {types:?}",
+                    panel.class().name(),
+                    message.map(|m| m.to_string()),
+                    folder.and_then(|f| f.path()).map(|p| p.to_string()),
+                );
+            } else {
+                eprintln!("debug other: no panel open");
+            }
+            app.abortModal();
+        }
+
         /// Action of the search field: run the new query.
         #[unsafe(method(search:))]
         fn search_action(&self, _sender: Option<&AnyObject>) {
@@ -1244,8 +1287,11 @@ impl WinController {
     pub(crate) fn set_ui(&self, ui: WinUi) {
         views::set_scale(ui.window.backingScaleFactor());
         // The right-click menu is the table's, so AppKit and VoiceOver find
-        // it; it is filled each time it opens.
+        // it; it is filled each time it opens, with only the items that
+        // apply, so none is greyed out (Open With would be, its submenu
+        // being empty until it opens).
         let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), &NSString::from_str(""));
+        menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         // SAFETY: the menu is a plain NSMenu the table keeps; its delegate
         // is the controller, which lives until the app quits.
@@ -1445,6 +1491,13 @@ impl WinController {
                     false,
                 );
             }
+            Step::SelectRange(first, last) => {
+                let rows = NSIndexSet::indexSetWithIndexesInRange(NSRange::new(
+                    first,
+                    last.saturating_sub(first) + 1,
+                ));
+                ui.table.selectRowIndexes_byExtendingSelection(&rows, false);
+            }
             Step::FocusResults => {
                 ui.window.makeFirstResponder(Some(&ui.table));
             }
@@ -1561,6 +1614,7 @@ impl WinController {
                 let point = NSPoint::new(r.origin.x + 40.0, r.origin.y + r.size.height / 2.0);
                 let at = ui.table.convertPoint_toView(point, None);
                 self.debug_close_menu_after(secs);
+                eprintln!("debug rclick: showing the menu for {secs} s");
                 if let Some(down) = debug_mouse(&ui.window, NSEventType::RightMouseDown, at) {
                     // Shows the menu and tracks it until the timer closes it.
                     ui.window.sendEvent(&down);
@@ -1569,16 +1623,35 @@ impl WinController {
             }
             Step::MenuKey(secs) => {
                 self.debug_close_menu_after(secs);
+                self.ivars().menu_targets.set(None);
+                eprintln!("debug rclick: showing the menu for {secs} s, by Control-Return");
                 // Control-Return, the system's default key for the context
                 // menu, through the application as a real key press.
                 debug_app_key(
                     self.mtm(),
                     &ui.window,
-                    '\r',
+                    ["\r", "\r"],
                     36,
                     NSEventModifierFlags::Control,
                 );
                 eprintln!("debug menu closed; {}", self.debug_menu_state());
+            }
+            Step::ShowMenu(secs) => {
+                self.debug_close_menu_after(secs);
+                self.ivars().menu_targets.set(None);
+                eprintln!("debug rclick: showing the menu for {secs} s, as VoiceOver asks");
+                // SAFETY: `showContextMenuForSelection:` takes an optional
+                // sender; it shows the menu and returns once it closes.
+                let _: () = unsafe {
+                    msg_send![&*ui.table, showContextMenuForSelection: Option::<&AnyObject>::None]
+                };
+                eprintln!("debug menu closed; {}", self.debug_menu_state());
+            }
+            Step::Origin(x, y) => {
+                let top = objc2_app_kit::NSScreen::screens(self.mtm())
+                    .firstObject()
+                    .map_or(0.0, |s| s.frame().size.height);
+                ui.window.setFrameTopLeftPoint(NSPoint::new(x, top - y));
             }
             Step::Pasteboard => {
                 let pasteboard = menus::copy_pasteboard();
@@ -1594,16 +1667,35 @@ impl WinController {
             }
             Step::Chord(chord) => {
                 use super::debug_script::Chord;
-                let flags = NSEventModifierFlags::Command
-                    | match chord {
-                        Chord::CmdC => NSEventModifierFlags::empty(),
-                        Chord::OptionCmdC => NSEventModifierFlags::Option,
-                        Chord::ShiftCmdC => NSEventModifierFlags::Shift,
-                        Chord::ControlCmdC => NSEventModifierFlags::Control,
-                    };
-                debug_app_key(self.mtm(), &ui.window, 'c', 8, flags);
+                // What a US keyboard types with each chord.
+                let (flags, chars) = match chord {
+                    Chord::CmdC => (NSEventModifierFlags::empty(), ["c", "c"]),
+                    Chord::OptionCmdC => (NSEventModifierFlags::Option, ["\u{e7}", "c"]),
+                    Chord::ShiftCmdC => (NSEventModifierFlags::Shift, ["C", "C"]),
+                    Chord::ControlCmdC => (NSEventModifierFlags::Control, ["\u{3}", "c"]),
+                };
+                let flags = flags | NSEventModifierFlags::Command;
+                debug_app_key(self.mtm(), &ui.window, chars, 8, flags);
             }
-            Step::Status => eprintln!("debug status: {}", ui.status.debug_layout()),
+            Step::Status => {
+                // The window's number and frame from the screen's top left,
+                // as `screencapture -l` and `-R` take them.
+                let f = ui.window.frame();
+                // Global coordinates run down from the top of the first
+                // screen, the one with the menu bar.
+                let top = objc2_app_kit::NSScreen::screens(self.mtm())
+                    .firstObject()
+                    .map_or(0.0, |s| s.frame().size.height);
+                eprintln!(
+                    "debug status: window {} at {:.0},{:.0},{:.0},{:.0}; {}",
+                    ui.window.windowNumber(),
+                    f.origin.x,
+                    top - f.origin.y - f.size.height,
+                    f.size.width,
+                    f.size.height,
+                    ui.status.debug_layout()
+                );
+            }
             Step::Type(text) => {
                 // 80 ms apart, a fast typist, with the run loop turning in
                 // between as it does for real key presses.
@@ -1667,7 +1759,14 @@ impl WinController {
             }
             None => self.fill_menu(MenuRequest::Keyboard),
         };
-        eprintln!("debug menu {at:?}: {}", self.debug_menu_state());
+        eprintln!(
+            "debug menu {at:?}: {}, acts on {:?}",
+            self.debug_menu_state(),
+            self.menu_paths(ContextItem::Open)
+                .iter()
+                .map(|p| p.rsplit('/').next().unwrap_or(p))
+                .collect::<Vec<_>>(),
+        );
         let Some(menu) = menu else {
             eprintln!("debug menu {at:?}: no menu");
             return;
@@ -1689,6 +1788,35 @@ impl WinController {
                     }
                     None => eprintln!("debug open with: no Open With item"),
                 }
+            }
+            MenuStep::Other => {
+                let apps = self.ivars().open_with_menu.borrow().clone();
+                self.menu_closed(&menu);
+                let Some(apps) = apps else {
+                    eprintln!("debug other: no Open With item");
+                    return;
+                };
+                self.menu_will_show(&apps);
+                let target: &AnyObject = self.as_ref();
+                // SAFETY: `debugEndModal:` is implemented as
+                // `-(void)debugEndModal:(NSTimer *)timer`; the run loop
+                // retains the timer, which retains its target until it
+                // fires once, in the panel's modal run loop mode.
+                unsafe {
+                    let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                        2.0,
+                        target,
+                        sel!(debugEndModal:),
+                        None,
+                        false,
+                    );
+                    NSRunLoop::currentRunLoop()
+                        .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes);
+                }
+                let last = apps.numberOfItems() - 1;
+                apps.performActionForItemAtIndex(last);
+                eprintln!("debug other: closed without choosing");
+                return;
             }
             MenuStep::Perform(item) => {
                 self.menu_closed(&menu);
@@ -2290,6 +2418,7 @@ impl WinController {
                             NSMenu::alloc(mtm),
                             &NSString::from_str(item.title()),
                         );
+                        apps.setAutoenablesItems(false);
                         apps.setDelegate(Some(ProtocolObject::from_ref(self)));
                         entry.setSubmenu(Some(&apps));
                         // SAFETY: an item with a submenu sends no action.
