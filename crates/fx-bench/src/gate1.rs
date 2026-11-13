@@ -187,8 +187,8 @@ pub fn criteria() -> Vec<Criterion> {
         },
         Criterion {
             id: "first_run",
-            description: "First run: ~2M entries scanned in <=15 s warm, results shown \
-                          progressively",
+            description: "First run: ~2M entries scanned in <=15 s warm (results shown \
+                          progressively moved to Phase 2)",
             metric: "first_run_ms",
             rule: Rule::Worst {
                 max: 15_000.0,
