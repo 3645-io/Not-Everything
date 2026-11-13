@@ -207,6 +207,10 @@ pub struct Meta {
     pub cache: Option<String>,
     pub build: Option<String>,
     pub date: Option<String>,
+    /// The build and date of the `pr_baseline` values: the pr tier's own
+    /// conditions (file activity, shorter phases), shown in a pr report.
+    pub pr_build: Option<String>,
+    pub pr_date: Option<String>,
     /// The metric IDs of a release's summary table, in order
     /// (`fx-bench perf-release`); each one is a metric table of the file.
     pub summary: Vec<String>,
@@ -238,8 +242,12 @@ pub struct Metric {
     /// Below this scale the metric is NOT MEASURED at the pr and rc tiers.
     pub scale_min: Option<f64>,
     pub tiers: Vec<Tier>,
-    /// Baseline at gate scale (pr and rc tiers).
+    /// Baseline at gate scale: the rc tier's, and the pr tier's when the
+    /// metric has no `pr_baseline`.
     pub baseline: Option<f64>,
+    /// Baseline at the pr tier, for metrics whose pr-tier conditions differ
+    /// from the rc tier's (the background phases run under file activity).
+    pub pr_baseline: Option<f64>,
     /// Baseline at the quick tier's scale.
     pub quick_baseline: Option<f64>,
     /// `false`: reported as TRACKED, never fails.
@@ -272,6 +280,7 @@ pub const METRIC_KEYS: &[&str] = &[
     "scale_min",
     "tiers",
     "baseline",
+    "pr_baseline",
     "quick_baseline",
     "gated",
     "baseline_build",
@@ -281,7 +290,9 @@ pub const METRIC_KEYS: &[&str] = &[
 
 /// The keys the `[meta]` table may hold, all strings. `summary` lists
 /// metric IDs separated by spaces.
-pub const META_KEYS: &[&str] = &["machine", "cache", "build", "date", "summary"];
+pub const META_KEYS: &[&str] = &[
+    "machine", "cache", "build", "date", "pr_build", "pr_date", "summary",
+];
 
 /// The reserved table name of the header table.
 const META_TABLE: &str = "meta";
@@ -441,6 +452,8 @@ pub fn parse_baseline(text: &str, source: &str) -> Result<Baseline, ParseError> 
             "machine" => meta.machine = Some(s),
             "cache" => meta.cache = Some(s),
             "build" => meta.build = Some(s),
+            "pr_build" => meta.pr_build = Some(s),
+            "pr_date" => meta.pr_date = Some(s),
             "summary" => {
                 meta.summary = s.split_whitespace().map(str::to_string).collect();
                 summary_line = line;
@@ -574,6 +587,16 @@ fn build_metric(
         ));
     }
 
+    let pr_baseline = number("pr_baseline")?;
+    if let Some((_, line)) = &pr_baseline {
+        if !tiers.contains(&Tier::Pr) {
+            return Err(err(
+                *line,
+                format!("'pr_baseline' in [{id}] needs pr in its 'tiers'"),
+            ));
+        }
+    }
+
     let gated = match t.fields.get("gated") {
         None => true,
         Some((Value::Bool(b), _)) => *b,
@@ -605,6 +628,7 @@ fn build_metric(
         scale_min: scale_min.map(|(n, _)| n),
         tiers,
         baseline: number("baseline")?.map(|(n, _)| n),
+        pr_baseline: pr_baseline.map(|(n, _)| n),
         quick_baseline: number("quick_baseline")?.map(|(n, _)| n),
         gated,
         baseline_build: string("baseline_build")?.map(|(s, _)| s),
@@ -921,7 +945,8 @@ pub fn compare(baseline: &Baseline, samples: &Samples, tier: Tier, partial: bool
 fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
     let base = match tier {
         Tier::Quick => m.quick_baseline,
-        Tier::Pr | Tier::Rc => m.baseline,
+        Tier::Pr => m.pr_baseline.or(m.baseline),
+        Tier::Rc => m.baseline,
     };
     let target_checked = tier != Tier::Quick || m.better == Better::Equal;
     let pending = target_checked && target_pending(m, base);
@@ -1095,11 +1120,18 @@ pub fn gate_passes(rows: &[Row]) -> bool {
 /// table of verdicts, any exceptions, and the [`Counts::line`].
 pub fn render_markdown(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
     let mut out = format!("# Performance gate: {tier} tier\n\n");
+    let none = None;
+    let (pr_build, pr_date) = match tier {
+        Tier::Pr => (&meta.pr_build, &meta.pr_date),
+        _ => (&none, &none),
+    };
     for (label, value) in [
         ("Machine", &meta.machine),
         ("Cache", &meta.cache),
         ("Baseline build", &meta.build),
         ("Baseline date", &meta.date),
+        ("PR-tier baseline build", pr_build),
+        ("PR-tier baseline date", pr_date),
     ] {
         if let Some(v) = value {
             out.push_str(&format!("{label}: {}\n\n", md_cell(v)));
@@ -1201,14 +1233,16 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
         .collect();
     let c = Counts::of(rows);
     format!(
-        "{{\"tier\":{},\"meta\":{{\"machine\":{},\"cache\":{},\"build\":{},\"date\":{}}},\
-         \"metrics\":[{}],\"counts\":{{\"pass\":{},\"fail\":{},\"not_measured\":{},\
+        "{{\"tier\":{},\"meta\":{{\"machine\":{},\"cache\":{},\"build\":{},\"date\":{},\
+         \"pr_build\":{},\"pr_date\":{}}},\"metrics\":[{}],\"counts\":{{\"pass\":{},\"fail\":{},\"not_measured\":{},\
          \"no_baseline\":{},\"tracked\":{},\"skipped\":{}}},\"result\":{}}}",
         json_string(tier.as_str()),
         opt_str(meta.machine.as_deref()),
         opt_str(meta.cache.as_deref()),
         opt_str(meta.build.as_deref()),
         opt_str(meta.date.as_deref()),
+        opt_str(meta.pr_build.as_deref()),
+        opt_str(meta.pr_date.as_deref()),
         metrics.join(","),
         c.pass,
         c.fail,

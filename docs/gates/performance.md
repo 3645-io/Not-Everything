@@ -5,6 +5,7 @@ Every change that ships is measured before its pull request against the metrics 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
 - `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
 - The baseline is 0.4.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is 0.4.0 too, measured at the pr tier on 12 Nov 2026.
 
 ## Tiers
 
@@ -133,6 +134,6 @@ Each release's measured values are kept in `docs/gates/releases/<version>.txt` (
 
 ## Changing the baseline
 
-- **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date.
-- **By exception:** when the owner accepts a regression, the metric's table gets `exception = "<reason>, approved in #<PR>"` and the new value as its baseline. `perf-compare` refuses an exception without a pull request number.
+- **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date. Run `scripts/perf-check.sh --tier pr --step background` on the same commit too, and copy its B1 to B6, M1 and M2 into `pr_baseline`, with `[meta]` `pr_build` and `pr_date`.
+- **By exception:** when the owner accepts a regression, the metric's table gets `exception = "<reason>, approved in #<PR>"` and the new value as its baseline (as its `pr_baseline` too, when the regression shows at the pr tier). `perf-compare` refuses an exception without a pull request number.
 - **Never** to make a failing check pass.
