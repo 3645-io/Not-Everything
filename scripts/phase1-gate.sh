@@ -3,7 +3,9 @@
 #
 # Runs every Phase 1 gate benchmark one at a time, in release builds, for one
 # machine and one cache state. Each step's stdout and stderr go to
-# <out>/<name>.log. The script then turns the benchmark output into the
+# <out>/<name>.log, except the app's launches, whose output goes to logs in
+# <out>/gate_probe/ beside their reports. The script then turns the
+# benchmark output into the
 # `metric=value` lines fx-bench reads (<out>/gate-metrics.txt) and finishes
 # with `fx-bench phase1-summary`, which writes <out>/summary.md. The exit code
 # is phase1-summary's: 0 when every criterion is PASS, 1 when any is FAIL or
@@ -341,15 +343,28 @@ ui_probe() {
     fi
     mkdir -p "$app_data"
     mkdir "$OUT/gate_probe"
+    # The probe prints its launch_ms= line to standard output too, and
+    # phase1-summary reads every file in $OUT, so the launches' output goes
+    # to logs in gate_probe/, which it doesn't read: each launch counts once,
+    # from its report, and the warm-up launch, which builds the index when
+    # $app_data has none yet, not at all.
     if [ "$CACHE" = warm ]; then
-        run_step gate_probe_warmup "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/warmup.txt"
+        note "running gate_probe_warmup"
+        status=0
+        printf '# phase1-gate: warm-up launch\n' >>"$OUT/gate_probe/warmup.log"
+        "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/warmup.txt" >>"$OUT/gate_probe/warmup.log" 2>&1 || status=$?
+        if [ "$status" -eq 0 ]; then
+            check "gate_probe_warmup exit code" "PASS (exit 0)"
+        else
+            check "gate_probe_warmup exit code" "FAIL (exit $status, see gate_probe/warmup.log)"
+        fi
     fi
     ok=0
     i=1
     while [ "$i" -le "$LAUNCHES" ]; do
         status=0
-        printf '# phase1-gate: launch %s of %s\n' "$i" "$LAUNCHES" >>"$OUT/gate_probe.log"
-        "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/launch-$i.txt" >>"$OUT/gate_probe.log" 2>&1 || status=$?
+        printf '# phase1-gate: launch %s of %s\n' "$i" "$LAUNCHES" >>"$OUT/gate_probe/launches.log"
+        "$BIN/fx-ui-macos" --root "$SCAN_ROOT" --data-dir "$app_data" --gate-probe "$OUT/gate_probe/launch-$i.txt" >>"$OUT/gate_probe/launches.log" 2>&1 || status=$?
         if [ "$status" -eq 0 ] && [ -f "$OUT/gate_probe/launch-$i.txt" ]; then
             ok=$((ok + 1))
         fi
@@ -359,7 +374,7 @@ ui_probe() {
     if [ "$ok" -eq "$LAUNCHES" ]; then
         check "fx-ui-macos gate probe, $LAUNCHES launches" "PASS ($ok/$LAUNCHES, see gate_probe/)"
     else
-        check "fx-ui-macos gate probe, $LAUNCHES launches" "FAIL ($ok/$LAUNCHES wrote a report, see gate_probe.log)"
+        check "fx-ui-macos gate probe, $LAUNCHES launches" "FAIL ($ok/$LAUNCHES wrote a report, see gate_probe/launches.log)"
     fi
 }
 

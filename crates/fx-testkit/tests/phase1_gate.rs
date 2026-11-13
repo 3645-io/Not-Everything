@@ -448,6 +448,32 @@ fn every_app_launch_has_its_own_data_folder() {
     }
 }
 
+/// `fx-bench phase1-summary` reads every file in the results folder, and the
+/// gate probe prints its `launch_ms=` line to standard output as well as to
+/// its report. So each launch's output goes to a log in `gate_probe/`, which
+/// the summary doesn't read: a launch counts once, from its report through
+/// gate-metrics.txt, and the warm-up launch, which may first build the
+/// probe's index, not at all.
+#[test]
+fn app_launch_output_stays_out_of_the_summary_folder() {
+    let launches: Vec<String> = code_lines(&script_text())
+        .into_iter()
+        .filter(|l| l.contains("/fx-ui-macos\""))
+        .collect();
+    assert!(!launches.is_empty(), "{SCRIPT} must launch fx-ui-macos");
+    for line in &launches {
+        let line = line.trim();
+        assert!(
+            !line.starts_with("run_step "),
+            "{SCRIPT} must not launch fx-ui-macos through run_step, whose log the summary reads: {line}"
+        );
+        assert!(
+            line.contains(">>\"$OUT/gate_probe/"),
+            "{SCRIPT} must send every fx-ui-macos launch's output to a log in gate_probe/: {line}"
+        );
+    }
+}
+
 #[test]
 fn script_never_deletes_moves_or_purges() {
     let forbidden = ["rm", "rmdir", "unlink", "mv", "purge", "-delete", "srm"];
