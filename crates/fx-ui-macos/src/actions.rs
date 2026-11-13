@@ -2,16 +2,23 @@
 //! search field, what Escape does, the clipboard text and the drag-out
 //! operation mask.
 //!
-//! The MVP is read-only, so [`Action`] has exactly four variants: open,
-//! reveal in Finder, copy the full path and Quick Look. There is
-//! deliberately no delete, rename, move or trash action, and the delete keys
-//! map to nothing. Escape ([`escape_action`]) only clears the search or
+//! The MVP is read-only, so [`Action`] has exactly five variants: open,
+//! reveal in Finder, copy the files, copy the full path and Quick Look.
+//! There is deliberately no delete, rename, move or trash action, and the
+//! delete keys map to nothing. The right-click menu
+//! ([`crate::context_menu`]) adds Open With, Share… and New Terminal at
+//! Folder, which change no file either. Escape ([`escape_action`]) only clears the search or
 //! hides the window, or closes the Quick Look panel
 //! ([`crate::quick_look::preview_command`]); it never acts on a file.
 
 #![forbid(unsafe_code)]
 
 use crate::FixedList;
+
+/// Most items Open, Reveal in Finder, Open With and New Terminal at Folder
+/// act on at once (the first ones in row order), so a large selection can't
+/// open thousands of windows or applications.
+pub const MAX_OPEN: usize = 20;
 
 /// A user action on the selected results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -20,6 +27,9 @@ pub enum Action {
     Open,
     /// Reveal the selected items in Finder.
     RevealInFinder,
+    /// Copy the selected items themselves to the clipboard, as Finder's
+    /// Copy does: pasting in Finder copies them, and the originals stay.
+    Copy,
     /// Copy the full paths of the selected items to the clipboard.
     CopyPath,
     /// Show the selected items in the system Quick Look panel, as Finder's
@@ -29,9 +39,10 @@ pub enum Action {
 
 impl Action {
     /// Every action.
-    pub const ALL: FixedList<Action, 4> = FixedList([
+    pub const ALL: FixedList<Action, 5> = FixedList([
         Action::Open,
         Action::RevealInFinder,
+        Action::Copy,
         Action::CopyPath,
         Action::QuickLook,
     ]);
@@ -75,14 +86,16 @@ pub struct Modifiers {
 ///
 /// - Return or Enter: [`Action::Open`].
 /// - Cmd+Return or Cmd+Enter: [`Action::RevealInFinder`].
+/// - Cmd+C: [`Action::Copy`], the files themselves, as Finder's Copy (the
+///   owner's decision of 9 Nov 2026). Edit > Copy does the same while the
+///   results have the focus; this mapping serves the keys the Quick Look
+///   panel hands to the results.
 /// - Option+Cmd+C: [`Action::CopyPath`], Finder's shortcut for copying a
 ///   pathname.
 /// - Space: [`Action::QuickLook`], as in Finder.
 ///
 /// Everything else, the delete keys with any modifiers included, gives
-/// `None`. Cmd+C alone copies nothing in the results: it is kept for
-/// copying the files themselves, as in Finder, which is not built yet, so
-/// the table doesn't answer Edit > Copy either.
+/// `None`.
 pub fn action_for_key(key: Key, mods: Modifiers) -> Option<Action> {
     let plain = !mods.command && !mods.shift && !mods.option && !mods.control;
     let cmd_only = mods.command && !mods.shift && !mods.option && !mods.control;
@@ -90,6 +103,7 @@ pub fn action_for_key(key: Key, mods: Modifiers) -> Option<Action> {
     match key {
         Key::Return | Key::Enter if plain => Some(Action::Open),
         Key::Return | Key::Enter if cmd_only => Some(Action::RevealInFinder),
+        Key::Char(c) if cmd_only && c.eq_ignore_ascii_case(&'c') => Some(Action::Copy),
         Key::Char(c) if option_cmd && c.eq_ignore_ascii_case(&'c') => Some(Action::CopyPath),
         Key::Space if plain => Some(Action::QuickLook),
         _ => None,

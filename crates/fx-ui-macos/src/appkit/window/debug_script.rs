@@ -28,12 +28,31 @@
 //! `divider:I:key:shift-left` and so on (an arrow key handed to the
 //! divider), and `scrollx:X` (the rows scrolled X points sideways).
 //!
+//! The right-click menu (run 2.12): `menu:ROW` fills the menu as a
+//! right-click on that row would, without showing it, and logs what it
+//! acts on and each item (title, hidden, enabled, shortcut, image,
+//! submenu); `menu:empty` right-clicks below the rows and `menu:keyboard`
+//! asks as the keyboard and VoiceOver do; `menu:ROW:ITEM` performs an item
+//! (`open`, `reveal`, `look`, `copy`, `path`, `share`, `terminal`) as
+//! choosing it would; `menu:ROW:open-with` fills and logs the Open With
+//! submenu. `rclick:ROW:SECS` right-clicks the row with real events, which
+//! shows the menu on screen, and closes it after SECS seconds (for
+//! screenshots); `menukey:SECS` does the same with Control-Return.
+//! `pasteboard` logs the types and files on the pasteboard copies go to
+//! (in these checks a named one, `NE_DEBUG_PASTEBOARD`, never the user's
+//! clipboard). `key:cmd-c`, `key:option-cmd-c`, `key:shift-cmd-c` and
+//! `key:control-cmd-c` press those keys through the application, so the
+//! main menu's key equivalents fire as for real keys. `status` logs where
+//! the status bar's parts are.
+//!
 //! What VoiceOver reads is best seen from outside the app, through the
 //! Accessibility API (`AXUIElementCopyAttributeValue`), as VoiceOver
 //! sees it: asked from inside, AppKit doesn't report every label a control
 //! carries.
 
 use objc2::msg_send;
+
+use crate::context_menu::ContextItem;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_foundation::{NSArray, NSString};
@@ -62,6 +81,79 @@ pub(crate) enum Step {
     Activate,
     Announce,
     Ax,
+    Menu(MenuAt, MenuStep),
+    RightClick(usize, f64),
+    MenuKey(f64),
+    Pasteboard,
+    Chord(Chord),
+    Status,
+}
+
+/// Where a [`Step::Menu`] right-click lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MenuAt {
+    /// On this row.
+    Row(usize),
+    /// Below the last row in view.
+    Empty,
+    /// Nowhere: the keyboard or VoiceOver asks.
+    Keyboard,
+}
+
+/// What a [`Step::Menu`] does with the menu it filled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MenuStep {
+    /// Logs it.
+    Log,
+    /// Performs the item.
+    Perform(ContextItem),
+    /// Fills and logs the Open With submenu.
+    OpenWith,
+}
+
+/// A key chord with C for [`Step::Chord`], sent through the application.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Chord {
+    CmdC,
+    OptionCmdC,
+    ShiftCmdC,
+    ControlCmdC,
+}
+
+/// The short name of a [`ContextItem`] in a `menu:ROW:ITEM` step.
+fn item_name(item: ContextItem) -> &'static str {
+    match item {
+        ContextItem::Open => "open",
+        ContextItem::OpenWith => "open-with",
+        ContextItem::RevealInFinder => "reveal",
+        ContextItem::QuickLook => "look",
+        ContextItem::Copy => "copy",
+        ContextItem::CopyPath => "path",
+        ContextItem::Share => "share",
+        ContextItem::NewTerminal => "terminal",
+    }
+}
+
+/// A `menu:` step's argument: `ROW`, `empty` or `keyboard`, then
+/// optionally `:ITEM` or `:open-with`.
+fn menu_step(arg: &str) -> Option<Step> {
+    let mut parts = arg.trim().splitn(2, ':');
+    let at = match parts.next()? {
+        "empty" => MenuAt::Empty,
+        "keyboard" => MenuAt::Keyboard,
+        row => MenuAt::Row(row.parse().ok()?),
+    };
+    let step = match parts.next() {
+        None => MenuStep::Log,
+        Some("open-with") => MenuStep::OpenWith,
+        Some(name) => MenuStep::Perform(
+            ContextItem::ALL
+                .iter()
+                .copied()
+                .find(|&i| i != ContextItem::OpenWith && item_name(i) == name)?,
+        ),
+    };
+    Some(Step::Menu(at, step))
 }
 
 /// What [`Step::Divider`] does to a column divider.
@@ -168,8 +260,20 @@ fn parse(text: &str) -> Vec<Step> {
                     "up" => Some(Step::Arrow(Arrow::Up)),
                     "space" => Some(Step::Key(NamedKey::Space)),
                     "escape" => Some(Step::Key(NamedKey::Escape)),
+                    "cmd-c" => Some(Step::Chord(Chord::CmdC)),
+                    "option-cmd-c" => Some(Step::Chord(Chord::OptionCmdC)),
+                    "shift-cmd-c" => Some(Step::Chord(Chord::ShiftCmdC)),
+                    "control-cmd-c" => Some(Step::Chord(Chord::ControlCmdC)),
                     _ => None,
                 },
+                "menu" => menu_step(arg),
+                "rclick" => {
+                    let (row, secs) = arg.trim().split_once(':')?;
+                    Some(Step::RightClick(row.parse().ok()?, secs.parse().ok()?))
+                }
+                "menukey" => arg.trim().parse().ok().map(Step::MenuKey),
+                "pasteboard" => Some(Step::Pasteboard),
+                "status" => Some(Step::Status),
                 "type" => Some(Step::Type(arg.to_owned())),
                 "activate" => Some(Step::Activate),
                 "announce" => Some(Step::Announce),
@@ -183,6 +287,50 @@ fn parse(text: &str) -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The right-click menu is checked in the app: built and logged
+    /// without showing it, an item performed, the Open With submenu
+    /// filled, shown for real for a while, and the keys and pasteboard
+    /// behind Copy.
+    #[test]
+    fn right_click_menu_steps_parse() {
+        assert_eq!(
+            parse(
+                "menu:3;menu:empty;menu:keyboard;menu:2:copy;menu:0:look;menu:4:open-with;\
+                 rclick:1:4.5;menukey:3;pasteboard;key:cmd-c;key:option-cmd-c;\
+                 key:shift-cmd-c;key:control-cmd-c;status"
+            ),
+            vec![
+                Step::Menu(MenuAt::Row(3), MenuStep::Log),
+                Step::Menu(MenuAt::Empty, MenuStep::Log),
+                Step::Menu(MenuAt::Keyboard, MenuStep::Log),
+                Step::Menu(MenuAt::Row(2), MenuStep::Perform(ContextItem::Copy)),
+                Step::Menu(MenuAt::Row(0), MenuStep::Perform(ContextItem::QuickLook)),
+                Step::Menu(MenuAt::Row(4), MenuStep::OpenWith),
+                Step::RightClick(1, 4.5),
+                Step::MenuKey(3.0),
+                Step::Pasteboard,
+                Step::Chord(Chord::CmdC),
+                Step::Chord(Chord::OptionCmdC),
+                Step::Chord(Chord::ShiftCmdC),
+                Step::Chord(Chord::ControlCmdC),
+                Step::Status,
+            ]
+        );
+        for item in ["open", "reveal", "path", "share", "terminal"] {
+            assert!(
+                matches!(
+                    parse(&format!("menu:0:{item}"))[..],
+                    [Step::Menu(MenuAt::Row(0), MenuStep::Perform(_))]
+                ),
+                "{item}"
+            );
+        }
+        assert_eq!(
+            parse("menu:x;menu:0:trash;menu:0:rename;rclick:1;menukey:x"),
+            vec![]
+        );
+    }
 
     #[test]
     fn existing_steps_still_parse() {

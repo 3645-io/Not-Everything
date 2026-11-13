@@ -60,6 +60,7 @@ mod callout;
 mod card;
 mod chrome;
 mod classes;
+mod context_menu;
 #[cfg(debug_assertions)]
 mod debug_script;
 pub mod paint;
@@ -121,7 +122,7 @@ pub const AUTOSCROLL_FRAMES: u64 = 600;
 pub const AUTOSCROLL_ROWS_PER_FRAME: usize = crate::spike_args::DEFAULT_ROWS_PER_FRAME;
 /// Most items Enter opens at once, so a large selection can't launch
 /// thousands of applications.
-pub const MAX_OPEN: usize = 20;
+pub use crate::actions::MAX_OPEN;
 
 /// The app is a regular app: a Dock icon and its own menu bar, resident or
 /// not. An accessory app would have neither.

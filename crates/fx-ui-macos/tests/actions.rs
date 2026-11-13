@@ -13,7 +13,9 @@
 //! before (`hide_mode`).
 //!
 //! Space in the results is Quick Look (`Action::QuickLook`), as in Finder;
-//! in the search field it stays a space.
+//! in the search field it stays a space. Cmd+C in the results copies the
+//! files (`Action::Copy`), as in Finder; in the search field it copies the
+//! field's text.
 
 use fx_ui_macos::actions::{
     Action, DRAG_OPERATION_MASK, EscapeAction, Focus, HideMode, Key, Modifiers, SearchFieldKey,
@@ -67,14 +69,19 @@ fn option_cmd_c_copies_the_full_path() {
 }
 
 #[test]
-fn cmd_c_in_the_results_copies_nothing() {
-    // Cmd+C is kept for copying the files themselves, as in Finder, which
-    // is not built yet; until then only Option+Cmd+C copies, and only paths.
+fn cmd_c_in_the_results_copies_the_files() {
+    // As Finder's Copy: the files themselves go on the pasteboard (the
+    // owner's decision of 9 Nov 2026); Option+Cmd+C copies their paths.
+    // No other combination with C does anything.
     for mods in all_modifiers() {
-        if mods == option_cmd() {
-            continue;
-        }
-        assert_eq!(action_for_key(Key::Char('c'), mods), None, "{mods:?}");
+        let want = if mods == cmd() {
+            Some(Action::Copy)
+        } else if mods == option_cmd() {
+            Some(Action::CopyPath)
+        } else {
+            None
+        };
+        assert_eq!(action_for_key(Key::Char('c'), mods), want, "{mods:?}");
     }
 }
 
@@ -123,12 +130,13 @@ fn action_set_has_the_read_only_actions() {
     for wanted in [
         Action::Open,
         Action::RevealInFinder,
+        Action::Copy,
         Action::CopyPath,
         Action::QuickLook,
     ] {
         assert!(all.contains(&wanted), "Action::ALL lacks {wanted:?}");
     }
-    assert_eq!(all.len(), 4, "{all:?}");
+    assert_eq!(all.len(), 5, "{all:?}");
 }
 
 #[test]
