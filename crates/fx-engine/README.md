@@ -311,6 +311,42 @@ folding changes and what a folded copy of just those would take), then
 count that changes between runs, 2 for bad arguments. It writes only its
 store, in a temporary directory it removes at the end.
 
+## Day replay benchmark
+
+```text
+cargo run --release -p fx-engine --example day_replay_bench -- --hours 24 --cache warm
+```
+
+`examples/day_replay_bench.rs` (macOS only) measures the relaunch after a
+`kill -9` a day after the last save (run 2.15): the app saves its index
+once a day, so the next launch replays up to a day of FSEvents history
+from the saved cursor, against Phase 1's catch-up budget of 10 s. It
+indexes `--root` (default `/`, which needs Full Disk Access) into a store
+in a temporary folder, or copies a saved store (`--store PATH`), and sets
+the store's cursor `--hours` back (default 24; a copied store keeps its
+own cursor unless `--hours` is given). FSEvents' call for the last event
+ID before a time (`FSEventsGetLastEventIdForDeviceBeforeTime`) returns 0
+on macOS 27.2, so the ID is then estimated from the history: each
+reported path's last event ID against its status-change time. It then
+relaunches in a process of its own, as the app does, with the app's
+engine configuration (`--hidden` for the background batch window of a
+resident app with its window closed), and reports the start (`replay`,
+or a rescan when the history is gone), the changes and rescans replayed,
+`history_handed_out_ms`, `caught_up_ms` (until the engine has published
+the history), the peak memory footprint, and whether the index then
+equals a fresh scan, counting apart the differences on paths FSEvents
+reported during the comparison (`--no-compare` skips it). Last, untimed,
+it counts the history's raw events and the distinct paths created,
+removed, renamed and modified, and projects the compactions, and so the
+saves, a day of such changes brings (`fx_bench::saves`). Gate line: `day
+replay caught up and equal to a fresh scan <= 10 s`. `--prepare FOLDER`
+indexes the root into `FOLDER/index.fxdb` and stops, for a replay with
+`--store` a day later from the store's own day-old cursor and index. It
+prints numbers only, never a path. Exit codes: 0 after a run whose index
+equals the fresh scan, 1 on an error or a mismatch, 2 for bad arguments.
+It writes only its own temporary folder (and the `--prepare` folder) and
+reads the root.
+
 ## Soak
 
 ```text
