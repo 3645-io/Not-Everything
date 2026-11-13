@@ -263,8 +263,16 @@ hour. The daily save (`daily_save`) is checked every 5 minutes by the
 resident app: it is due 24 hours after the last save, once nobody has used
 the keyboard or mouse for a minute (`CGEventSourceSecondsSinceLastEventType`),
 and the engine's checkpoint thread writes it (`Engine::request_checkpoint`).
-The engine's own idle save is off, and its longest delay, 48 hours, is only
-a backstop. Every save marks the store to be left out of Time Machine
+The day counts from the store's last write, whatever made it: since 0.4.0
+the engine also saves after each compaction, and that save restarts the
+day, so a compaction never adds a daily save of its own. The engine's own
+idle save is off, and its longest delay, 48 hours, is only a backstop for a
+Mac never idle for a minute at a check; it counts awake time, so on a
+laptop that sleeps at night it can take three days or more.
+`tests/daily_save_day.rs` runs the decision (`daily_save_due_at`, which
+takes the clock as an argument) through simulated weeks: an office
+desktop, a laptop asleep at night, a Mac never idle at a check, and
+compactions at random times. Every save marks the store to be left out of Time Machine
 backups: the index is rebuilt from the disk when lost. A crash loses
 nothing: `Engine::open` replays the changes made since the saved cursor.
 

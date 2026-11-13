@@ -54,6 +54,8 @@ B7 adds the index saves a phase is too short to see. After each compaction the a
 
 The projection counts only the scripted activity: the rc tier's phases, with none, project no saves, though a Mac in daily use compacts too, and the daily save, which comes only after a day without one, is not projected either.
 
+The compaction saves add to the daily save, with an upper bound. The daily save comes 24 hours after the store's last write, whatever made it, so a compaction's save restarts the day: a day with a compaction often has no daily save, and a disk that compacts more than once a day makes no daily save at all. So "one save a day" means at most one daily save plus one save per compaction, plus one per quit (fx-ui-macos's `tests/daily_save_day.rs` simulates weeks of it). How often a whole disk in daily use compacts is still to be measured: fx-engine's `day_replay_bench` counts the files a day's FSEvents history created and deleted and projects the compactions a day with the same model (numbers to come). B7's target, and whether it gates, stay the owner's call once those numbers are in.
+
 ### Memory
 
 | ID | Metric | Key | Target | Allowance | Tiers |
