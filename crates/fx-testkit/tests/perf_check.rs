@@ -542,7 +542,10 @@ mod fakes {
             let log = self.log();
             self.tool(
                 "bin/cargo",
-                &format!("echo \"cargo $*\" >>'{}'\n{then}\nexit {code}", log.display()),
+                &format!(
+                    "echo \"cargo $*\" >>'{}'\n{then}\nexit {code}",
+                    log.display()
+                ),
             );
         }
 
@@ -578,7 +581,10 @@ EOF"#,
                 .args(args)
                 .arg("--out")
                 .arg(self.out())
-                .env("PATH", format!("{}:{path}", self.root.join("bin").display()))
+                .env(
+                    "PATH",
+                    format!("{}:{path}", self.root.join("bin").display()),
+                )
                 .env("TMPDIR", self.root.join("tmp"))
                 .env("CARGO_TARGET_DIR", self.root.join("target"));
             run_with_timeout(&mut cmd)
@@ -778,7 +784,11 @@ mod screen {
         ] {
             let res = fakes.run(path, &["--tier", "pr"]);
             assert_refused(&res, 2, "release build failed", why);
-            assert_eq!(fakes.run_txt_value("screen at the start"), "unknown", "{why}");
+            assert_eq!(
+                fakes.run_txt_value("screen at the start"),
+                "unknown",
+                "{why}"
+            );
             assert_eq!(fakes.run_txt_value("screen at the end"), "unknown", "{why}");
         }
     }
