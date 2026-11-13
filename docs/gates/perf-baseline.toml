@@ -256,10 +256,16 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 50.523
+# 0.4.0 read 50.52 ms at its RC-1. On 12 and 13 Nov 2026 the measuring Mac
+# read 41 to 79 ms for 0.5.0, and in runs of the benchmark that alternated
+# the two builds 0.4.0 read 50 to 71 ms and 0.5.0 38 to 78 ms, so the rise
+# is the machine's state, not the code. The baseline is the full rc run at
+# 5ed0ff4 of 13 Nov, the first of its two failing readings.
+baseline = 78.522
 quick_baseline = 6.798
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0-RC-1"
+baseline_date = "2026-11-13"
+exception = "41 to 79 ms on the measuring Mac on 12 and 13 Nov 2026, with 0.4.0 as slow in alternating runs, so the machine's state, not the code; accepted by the owner for 0.5.0, approved in #42"
 
 [S4]
 name = "Full-path search, 2M files (p95)"
@@ -349,10 +355,17 @@ aggregate = "median"
 scale_key = "freshness_ops"
 scale_min = 1000
 tiers = "quick pr rc"
-baseline = 187.089
+# 0.4.0 read 187.09 ms at its RC-1. On 13 Nov 2026 the measuring Mac read
+# either about 188 ms or about 263 ms for 0.5.0, switching between the two
+# with no change of code, and 0.4.0 read 263 ms in runs that alternated the
+# two builds, so the rise is the machine's state, not the code. The
+# baseline is the full rc run at 5ed0ff4 of 13 Nov, the first of its two
+# failing readings.
+baseline = 263.453
 quick_baseline = 187.083
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0-RC-1"
+baseline_date = "2026-11-13"
+exception = "about 188 or 263 ms on the measuring Mac on 13 Nov 2026, switching with no change of code, with 0.4.0 at 263 ms in alternating runs, so the machine's state, not the code; accepted by the owner for 0.5.0, approved in #42"
 
 [F2]
 name = "Launch to first result"
