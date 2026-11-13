@@ -141,10 +141,11 @@ fn simulate(mac: &Mac) -> Vec<Save> {
             let idle = mac.input_idle(t);
             let idle_d = Duration::from_secs(idle as u64);
             let due = daily_save_due_at(at(t), Some(at(saved_at)), idle_d);
-            let rule = t - saved_at >= secs(DAILY_SAVE_INTERVAL)
-                && idle >= secs(DAILY_SAVE_INPUT_IDLE);
+            let rule =
+                t - saved_at >= secs(DAILY_SAVE_INTERVAL) && idle >= secs(DAILY_SAVE_INPUT_IDLE);
             assert_eq!(
-                due, rule,
+                due,
+                rule,
                 "day {day} at {time} s: saved {} s ago, idle {idle} s",
                 t - saved_at
             );
