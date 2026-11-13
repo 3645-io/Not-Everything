@@ -487,8 +487,10 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
     }
 
     /// How many times the estimate reads the history, each from 4 times
-    /// further back than the last.
-    const ESTIMATE_ROUNDS: u32 = 3;
+    /// further back than the last: up to 256 times its first guess, which
+    /// takes the event IDs of a second at the time of the run and so falls
+    /// short at night of a day's IDs (more than 13.8M on a Mac in daily use).
+    const ESTIMATE_ROUNDS: u32 = 5;
 
     /// Estimates the root's volume's last event ID before `target` (Unix
     /// seconds) from its history, read from further back each round until
@@ -565,6 +567,14 @@ Gate: caught up and equal to a fresh scan <= 10 s.";
             metric("cursor_estimate_paths", points.len());
             metric("cursor_estimate_slices", medians.len());
             metric("cursor_estimate_slices_before", before);
+            // How far back the history read reaches: its first slice's
+            // median time.
+            if let (Some(&(_, first)), Ok(now)) = (medians.first(), unix_now()) {
+                metric(
+                    "cursor_estimate_reaches_hours_back",
+                    format!("{:.1}", (now - first) / 3600.0),
+                );
+            }
             return Ok(match before {
                 0 => (from, false),
                 n => (medians[n - 1].0, true),
