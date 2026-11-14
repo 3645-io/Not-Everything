@@ -4,8 +4,8 @@ Every change that ships is measured before its pull request against the metrics 
 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
 - `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
-- The baseline is 0.4.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
-- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is 0.4.0 too, measured at the pr tier on 12 Nov 2026.
+- The baseline is 0.5.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is 0.5.0 too, measured at the pr tier on 14 Nov 2026.
 
 ## Tiers
 
@@ -22,7 +22,7 @@ Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a lo
 
 ## Allowances
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.4.0's CPU showing a search, B2, and its first results during the first scan, F5), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
+A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.5.0's first results during the first scan, F5, tracked until the first scan shows results as it goes), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
 
 | Class | Metrics | Allowance |
 | --- | --- | --- |
