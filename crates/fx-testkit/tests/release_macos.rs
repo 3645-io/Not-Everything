@@ -1151,13 +1151,20 @@ fn script_tags_and_publishes_only_with_publish() {
 fn script_documents_its_modes() {
     let text = script_text();
     for usage in [
-        "scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--publish] NEW_OUT_DIR",
-        "scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--publish]",
+        "scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--targets-only] [--publish] NEW_OUT_DIR",
+        "scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--targets-only] [--publish]",
     ] {
         assert!(text.contains(usage), "{SCRIPT} usage must show {usage:?}");
     }
     let code = code_lines(&text).join("\n");
-    for option in ["--resume", "--rc", "--beta", "--publish", "--perf"] {
+    for option in [
+        "--resume",
+        "--rc",
+        "--beta",
+        "--publish",
+        "--perf",
+        "--targets-only",
+    ] {
         assert!(
             code.contains(option),
             "{SCRIPT} must handle the `{option}` option"
@@ -1172,6 +1179,7 @@ fn script_documents_its_modes() {
         "--perf PERF_DIR",
         "perf-check.sh --tier rc",
         "docs/gates/releases/",
+        "--targets-only",
     ] {
         assert!(
             header.contains(needle),
@@ -2807,6 +2815,247 @@ esac"#;
         repo.commit_all("other code");
         let out = plan(&repo, &["--rc", "--perf", &perf]);
         assert_refused(&out, 1, "its code differs", "a run of other code");
+    }
+
+    /// What the script says when the commit being built differs from the
+    /// measured one only in files no build compiles.
+    const SAME_CODE: &str = "differs from it only in documents, scripts and tests";
+
+    /// A run of a commit that differs from the one being built only in
+    /// documents (top-level `*.md` but THIRD-PARTY-NOTICES.md, which the app
+    /// and the command embed; crates' READMEs; `docs/`), scripts, CI, agent
+    /// rules and tests (`crates/*/tests/`) measured the same app, command and
+    /// benchmarks, so it passes: a change to the release tooling or to the
+    /// gate's baseline needs no second run. A change to anything else is
+    /// refused.
+    #[test]
+    fn perf_accepts_a_run_whose_commit_differs_only_in_docs_scripts_and_tests() {
+        let (repo, measured) = rc_with_previous_release("perf-docs-only");
+        let perf = perf_run(&repo, "perf-docs", &measured);
+        for (path, text) in [
+            ("docs/gates/perf-baseline.toml", "# moved\n"),
+            ("scripts/tool.sh", "#!/bin/sh\n"),
+            (".github/workflows/tool.yml", "name: tool\n"),
+            (".agents/rules/tool.md", "# Tool\n"),
+            ("crates/fx-tool/tests/tool.rs", "// a test\n"),
+            ("crates/fx-tool/README.md", "# fx-tool\n"),
+            ("TOOL.md", "# Tool\n"),
+        ] {
+            repo.write(path, text);
+        }
+        repo.commit_all("documents, scripts and tests");
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(SAME_CODE),
+            "the script must say why it takes the run\n{}",
+            describe(&out)
+        );
+
+        for (path, what) in [
+            ("crates/fx-tool/src/lib.rs", "a crate's code"),
+            ("crates/fx-tool/examples/bench.rs", "a benchmark"),
+            ("crates/fx-tool/Cargo.toml", "a crate's manifest"),
+            ("crates/fx-tool/assets/icon.svg", "an asset"),
+            ("crates/fx-tool/src/notes.md", "a document a crate embeds"),
+            ("THIRD-PARTY-NOTICES.md", "the notices the app embeds"),
+            ("Cargo.lock", "the lock file"),
+        ] {
+            repo.write(path, "changed\n");
+            repo.commit_all(what);
+            let out = plan(&repo, &["--rc", "--perf", &perf]);
+            assert_refused(&out, 1, "its code differs", &format!("a change to {what}"));
+            repo.git(&["reset", "--quiet", "--hard", "HEAD~1"]);
+        }
+    }
+
+    // -- On targets only (--targets-only). ---------------------------------
+
+    /// What the script says when, on targets only, a metric misses its
+    /// target.
+    const MISSES_TARGET: &str = "misses its target";
+    /// What it says when the failing metrics can't be told from the report.
+    const CANNOT_TELL: &str = "cannot tell which metrics failed";
+    /// The table's header in perf-compare's report.
+    const TABLE_HEAD: &str = "| ID | Metric | Baseline | Measured | Change | Target | Verdict |\n\
+                              | --- | --- | --- | --- | --- | --- | --- |\n";
+
+    /// A finished rc-tier run of `git` in `repo`'s `target/name` whose
+    /// `summary.md` holds `rows` (perf-compare's table) and `last`.
+    fn table_run(repo: &Sandbox, name: &str, git: &str, rows: &str, last: &str) -> String {
+        let dir = repo.dir.join("target").join(name);
+        let perf = write_perf_run(&dir, git, last);
+        fs::write(
+            dir.join("summary.md"),
+            format!("# Performance gate: rc tier\n\n{TABLE_HEAD}{rows}\n{last}\n"),
+        )
+        .unwrap();
+        perf
+    }
+
+    /// Rows of perf-compare's table: one passing metric, two that failed
+    /// only their regression check, a tracked one that would fail both, and
+    /// the DMG size, which is measured after the build.
+    const REGRESSED_ROWS: &str = "\
+| S1 | Search, 2M files (p95) | 7.136 ms | 7.279 ms | +2.0% | <= 16 ms | PASS |
+| S7 | Scroll frame time (p95) | 1.12 ms | 2.78 ms | +148.2% | <= 8.3 ms | FAIL (regression) |
+| F6 | Catch-up after a relaunch | 503.312 ms | 564.545 ms | +12.2% | <= 10000 ms | FAIL (regression) |
+| F5 | First results during the first scan | 12514 ms | 12755 ms | +1.9% | <= 2000 ms | TRACKED (would be FAIL: target, regression) |
+| O1 | DMG size | 4334877 bytes | - | - | - | NOT MEASURED (no dmg_bytes samples) |
+";
+    /// The count line under [`REGRESSED_ROWS`].
+    const REGRESSED_LINE: &str =
+        "perf-compare: 1 pass, 2 fail, 1 not measured, 0 no baseline, 1 tracked, 0 skipped";
+
+    /// `--targets-only` judges `--perf`'s run, so it needs `--perf` (which a
+    /// beta never takes), and comes once.
+    #[test]
+    fn targets_only_needs_perf_and_comes_once() {
+        let repo = release_repo("targets-usage", "0.2.0");
+        for args in [
+            &["--rc", "--targets-only", "x"][..],
+            &["--targets-only", "x"],
+            &["--beta", "--targets-only", "x"],
+            &[
+                "--rc",
+                "--perf",
+                "a",
+                "--targets-only",
+                "--targets-only",
+                "x",
+            ],
+            &["--resume", "x", "--targets-only"],
+        ] {
+            let out = repo.run(SCRIPT, args);
+            assert_refused(&out, 2, "usage:", &format!("{args:?} is a usage error"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("[--targets-only]"), "{}", describe(&out));
+        }
+    }
+
+    /// With `--targets-only`, a run whose failing metrics failed only their
+    /// regression check (each still meets its target) passes, and the Plan
+    /// names them; without it, the same run is refused. A tracked metric
+    /// that would miss its target doesn't count, as without the option.
+    #[test]
+    fn targets_only_passes_regressions_that_meet_their_targets() {
+        let (repo, head) = rc_with_previous_release("targets-pass");
+        let perf = table_run(
+            &repo,
+            "perf-regressed",
+            &head,
+            REGRESSED_ROWS,
+            REGRESSED_LINE,
+        );
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, DID_NOT_PASS, "regressions without --targets-only");
+
+        for args in [
+            &["--rc", "--perf", &perf, "--targets-only"][..],
+            &["--rc", "--targets-only", "--perf", &perf],
+        ] {
+            let out = plan(&repo, args);
+            assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("judged on targets only")
+                    && stdout.contains("beyond their allowance: S7 F6"),
+                "the Plan must say the run is judged on targets and name S7 and F6\n{}",
+                describe(&out)
+            );
+        }
+
+        // A passing run says it is judged on targets, with nothing beyond.
+        let perf = perf_run(&repo, "perf-passing", &head);
+        let out = plan(&repo, &["--rc", "--perf", &perf, "--targets-only"]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("judged on targets only") && !stdout.contains("beyond"),
+            "{}",
+            describe(&out)
+        );
+    }
+
+    /// With `--targets-only`, a metric that misses its target is refused,
+    /// naming it, and so is a run whose failing metrics the report doesn't
+    /// show (a count of failures with fewer FAIL rows).
+    #[test]
+    fn targets_only_refuses_a_missed_target_or_an_unclear_report() {
+        let (repo, head) = rc_with_previous_release("targets-refuse");
+        let missed = "\
+| S3 | Regex search, 2M files (p95) | 53.756 ms | 101.2 ms | +88.3% | <= 100 ms | FAIL (target, regression) |
+| S7 | Scroll frame time (p95) | 1.12 ms | 2.78 ms | +148.2% | <= 8.3 ms | FAIL (regression) |
+";
+        let target_only = "\
+| M1 | Memory, window hidden | 210 MB | 210 MB | +0.0% | <= 200 MB | FAIL (target) |
+";
+        let line = |fail: u32| {
+            format!(
+                "perf-compare: 20 pass, {fail} fail, 1 not measured, 0 no baseline, 2 tracked, 0 skipped"
+            )
+        };
+        for (i, (rows, last, phrase, id)) in [
+            (missed, line(2), MISSES_TARGET, "S3"),
+            (target_only, line(1), MISSES_TARGET, "M1"),
+            ("", line(10), CANNOT_TELL, ""),
+            (REGRESSED_ROWS, line(3), CANNOT_TELL, ""),
+            ("", "No verdicts.".to_owned(), DID_NOT_PASS, ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let perf = table_run(&repo, &format!("perf-refused-{i}"), &head, rows, &last);
+            let out = plan(&repo, &["--rc", "--perf", &perf, "--targets-only"]);
+            assert_refused(&out, 1, phrase, &format!("case {i}"));
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(id),
+                "the refusal must name {id}\n{}",
+                describe(&out)
+            );
+        }
+    }
+
+    /// `check_targets` reads perf-compare's report: it prints the IDs of the
+    /// metrics that failed only their regression check, refuses a missed
+    /// target, and, asked for `all`, an unmeasured gated metric (the DMG
+    /// size is measured by then). Only the last section counts.
+    #[test]
+    fn check_targets_reads_the_last_section_of_the_report() {
+        let dir = temp_path("check-targets");
+        fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.md");
+        let run = |text: &str, which: &str| {
+            fs::write(&report, text).unwrap();
+            let body = format!("check_targets '{}' {which}", report.display());
+            run_functions(&["check_targets"], &body, &[])
+        };
+        let regressed = format!("{TABLE_HEAD}{REGRESSED_ROWS}\n{REGRESSED_LINE}\n");
+        let out = run(&regressed, "before");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+        let out = run(&regressed, "all");
+        assert_refused(&out, 1, "not measured", "an unmeasured metric with all");
+
+        let measured = regressed
+            .replace(
+                "| - | - | - | NOT MEASURED (no dmg_bytes samples) |",
+                "| 4400000 bytes | +1.5% | - | PASS |",
+            )
+            .replace("1 not measured", "0 not measured");
+        let out = run(&measured, "all");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+
+        // An earlier section's failures don't count; the last one's do.
+        let passing =
+            "perf-compare: 30 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped";
+        let out = run(&format!("{regressed}\n{TABLE_HEAD}\n{passing}\n"), "all");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+        let out = run(&format!("{TABLE_HEAD}\n{passing}\n\n{regressed}"), "before");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The table compares with the previous release, the highest

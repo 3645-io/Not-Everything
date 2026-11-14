@@ -91,15 +91,29 @@
 # Before fetching or building anything, the script refuses a PERF_DIR
 # without metrics.txt, summary.md or run.txt, one of another tier, one whose
 # run.txt git: line says (uncommitted changes) or names a commit whose code
-# (its tree) differs from the commit being built (for --resume, the build's
-# recorded one), and one whose last perf-compare: line in summary.md has a
-# failing metric (a regression the owner approved is an exception in
-# docs/gates/perf-baseline.toml, so it passes). A release built from the
-# merged release PR can use its release candidate's run: same tree, same
-# code. The run comes before the build, so it has no DMG size yet: once the
-# disk image is built, its size is added and the whole rc tier is judged
-# again (fx-bench perf-compare), so a failing or unmeasured metric stops the
+# differs from the commit being built (for --resume, the build's recorded
+# one), and one whose last perf-compare: line in summary.md has a failing
+# metric (a regression the owner approved is an exception in
+# docs/gates/perf-baseline.toml, so it passes). The code is the same when
+# the trees are, so a release built from the merged release PR can use its
+# release candidate's run, and when the commits differ only in files no
+# build compiles: documents (top-level *.md but THIRD-PARTY-NOTICES.md,
+# which the app and the command embed; crates' READMEs; docs/), scripts,
+# CI (.github/), agent rules (.agents/) and tests (crates/*/tests/), so a
+# change to the release tooling or the gate's baseline needs no second run.
+# The run comes before the build, so it has no DMG size yet: once the disk
+# image is built, its size is added and the whole rc tier is judged again
+# (fx-bench perf-compare), so a failing or unmeasured metric stops the
 # release then.
+# --targets-only (with --perf) judges the run on targets only: a gated
+# metric that failed only its regression check (slower than its baseline by
+# more than its allowance, but within its target) doesn't stop the release,
+# and the Plan and the notes name it; a missed target, an unmeasured metric
+# once the DMG size is added, or a report whose FAIL rows don't add up to
+# its count still stops it. It is for the owner's call to release on the
+# targets when the regression checks trip on the measuring Mac's state
+# rather than the code's. The notes it adds go in $OUT/perf-notes.md, with
+# PERF_DIR's notes.md first.
 # The table compares with the previous release, the highest release/vX.Y.Z
 # tag below the version (release candidates' tags don't count), so the
 # script also refuses, before building, a version with no earlier release or
@@ -172,8 +186,8 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--publish] NEW_OUT_DIR
-       scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--publish]
+usage: scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--targets-only] [--publish] NEW_OUT_DIR
+       scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--targets-only] [--publish]
 EOF
     exit 2
 }
@@ -252,6 +266,7 @@ MODE=release
 RESUME=0
 PUBLISH=0
 PERF_DIR=
+TARGETS_ONLY=0
 DIR=
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -270,6 +285,10 @@ while [ "$#" -gt 0 ]; do
         PERF_DIR=$2
         shift
         ;;
+    --targets-only)
+        [ "$TARGETS_ONLY" -eq 0 ] || usage
+        TARGETS_ONLY=1
+        ;;
     --publish) PUBLISH=1 ;;
     -*) usage ;;
     *)
@@ -282,6 +301,12 @@ done
 [ -n "$DIR" ] || usage
 # A beta has no GitHub page, so no performance table.
 [ "$MODE" != beta ] || [ -z "$PERF_DIR" ] || usage
+# --targets-only judges --perf's run.
+[ "$TARGETS_ONLY" -eq 0 ] || [ -n "$PERF_DIR" ] || usage
+# The metrics that failed only their regression check (--targets-only), and
+# how the Plan says the run is judged.
+REGRESSED=
+JUDGED=
 
 IDENTITY=${NE_SIGN_IDENTITY:-}
 PROFILE=${NE_NOTARY_PROFILE:-not-everything-notary}
@@ -441,16 +466,74 @@ check_perf() {
     esac
     if [ "$perf_git" != "$1" ]; then
         # The same code under another commit, such as the release PR's
-        # merge of the release candidate, needs no second run.
+        # merge of the release candidate, needs no second run; nor does a
+        # commit that changed only files no build compiles.
         perf_tree=$(git -C "$ROOT" rev-parse -q --verify "${perf_git:-none}^{tree}" 2>/dev/null) || perf_tree=
-        [ -n "$perf_tree" ] && [ "$perf_tree" = "$(git -C "$ROOT" rev-parse "$1^{tree}")" ] ||
-            fail "the performance run in $PERF_DIR measured commit ${perf_git:-unknown}, not $1, the commit being built, and its code differs; run scripts/perf-check.sh --tier rc on it"
+        if [ -z "$perf_tree" ] || [ "$perf_tree" != "$(git -C "$ROOT" rev-parse "$1^{tree}")" ]; then
+            if [ -z "$perf_tree" ] || ! same_code "$perf_git" "$1"; then
+                fail "the performance run in $PERF_DIR measured commit ${perf_git:-unknown}, not $1, the commit being built, and its code differs; run scripts/perf-check.sh --tier rc on it"
+            fi
+            echo "The performance run in $PERF_DIR measured $perf_git; $1 differs from it only in documents, scripts and tests."
+        fi
     fi
     perf_line=$(grep '^perf-compare: ' "$PERF_DIR/summary.md" | tail -n 1)
     case $perf_line in
     *", 0 fail,"*) ;;
-    *) fail "the performance run in $PERF_DIR did not pass every metric (${perf_line:-summary.md has no perf-compare: line}); fix the failures and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml" ;;
+    *)
+        [ "$TARGETS_ONLY" -eq 1 ] && [ -n "$perf_line" ] ||
+            fail "the performance run in $PERF_DIR did not pass every metric (${perf_line:-summary.md has no perf-compare: line}); fix the failures and measure again, record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml, or, with the owner's approval, judge it on targets only (--targets-only)"
+        REGRESSED=$(check_targets "$PERF_DIR/summary.md" before) || exit 1
+        ;;
     esac
+    [ "$TARGETS_ONLY" -eq 0 ] ||
+        JUDGED=", judged on targets only${REGRESSED:+ (beyond their allowance: $REGRESSED)}"
+}
+
+# Whether commits $1 and $2 differ only in files no build compiles:
+# top-level documents but THIRD-PARTY-NOTICES.md (the app and the command
+# embed it), crates' READMEs, docs/, scripts/, .github/, .agents/ and
+# crates' tests. The app, the command and the benchmarks are then the same,
+# so a performance run of one measured the other. Renames count as a
+# deletion and an addition, so a file moved out of the code counts.
+same_code() {
+    sc_changed=$(git -C "$ROOT" diff --no-renames --name-only "$1" "$2") || return 1
+    sc_other=$(printf '%s\n' "$sc_changed" | grep -v -E \
+        '^(docs/|scripts/|\.github/|\.agents/|crates/[^/]+/tests/|crates/[^/]+/README\.md$|[^/]+\.md$)' |
+        grep -v -x -e '' || true)
+    [ -z "$sc_other" ] && ! printf '%s\n' "$sc_changed" | grep -q -x 'THIRD-PARTY-NOTICES.md'
+}
+
+# On targets only (--targets-only): reads perf-compare's report $1, its
+# table and its count line (only the last section counts), and prints the
+# IDs of the gated metrics that failed only their regression check. Stops
+# if one missed its target, if the report's FAIL rows don't add up to its
+# count of failures, or, with $2 = all (once the DMG size is measured), if
+# a gated metric was not measured.
+check_targets() {
+    tg_line=$(grep '^perf-compare: ' "$1" | tail -n 1)
+    tg_fail=$(printf '%s\n' "$tg_line" | sed -n 's/.*, \([0-9][0-9]*\) fail,.*/\1/p')
+    tg_unmeasured=$(printf '%s\n' "$tg_line" | sed -n 's/.*, \([0-9][0-9]*\) not measured,.*/\1/p')
+    [ -n "$tg_fail" ] && [ -n "$tg_unmeasured" ] ||
+        fail "$1 has no perf-compare: line, so it is not perf-compare's report"
+    tg_rows=$(awk -F'|' '
+        /^perf-compare: / { section = rows; rows = ""; next }
+        /^\|/ && NF > 3 {
+            v = $(NF - 1); gsub(/^ +| +$/, "", v)
+            if (v !~ /^FAIL \(/) next
+            id = $2; gsub(/^ +| +$/, "", id)
+            rows = rows (v ~ /target/ ? "target " : "regression ") id "\n"
+        }
+        END { printf "%s", section }
+    ' "$1")
+    tg_count=$(printf '%s' "$tg_rows" | grep -c . || true)
+    [ "$tg_count" -eq "$tg_fail" ] ||
+        fail "cannot tell which metrics failed in $1: its count line says $tg_fail, its table shows $tg_count"
+    tg_missed=$(printf '%s\n' "$tg_rows" | sed -n 's/^target //p' | tr '\n' ' ' | sed 's/ $//')
+    [ -z "$tg_missed" ] ||
+        fail "on targets only, the performance run still fails: a metric misses its target ($tg_missed; see $1)"
+    [ "$2" != all ] || [ "$tg_unmeasured" -eq 0 ] ||
+        fail "on targets only, the performance run still fails: $tg_unmeasured gated metrics were not measured (see $1)"
+    printf '%s\n' "$tg_rows" | sed -n 's/^regression //p' | tr '\n' ' ' | sed 's/ $//'
 }
 
 # Sets PREV to the previous release, the highest release/vX.Y.Z tag below
@@ -682,12 +765,30 @@ perf_section() {
         echo "dmg_bytes=$dmg_bytes"
     } >"$OUT/perf-metrics.txt"
     # The whole rc tier again, now with the disk image's size (O1): a
-    # failing or unmeasured metric stops the release here.
+    # failing or unmeasured metric stops the release here (on targets only,
+    # a missed target or an unmeasured metric).
+    gate=0
     "$TARGET/release/fx-bench" perf-compare --baseline "$ROOT/docs/gates/perf-baseline.toml" \
-        --tier rc "$OUT/perf-metrics.txt" >"$OUT/perf-gate.md" ||
-        fail "with the disk image's size added, the release's metrics don't pass the gate (see $OUT/perf-gate.md); fix them and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml"
+        --tier rc "$OUT/perf-metrics.txt" >"$OUT/perf-gate.md" || gate=$?
+    REGRESSED=
+    if [ "$gate" -ne 0 ]; then
+        [ "$gate" -eq 1 ] && [ "$TARGETS_ONLY" -eq 1 ] ||
+            fail "with the disk image's size added, the release's metrics don't pass the gate (see $OUT/perf-gate.md); fix them and measure again, or record the owner's approval of a regression as its exception in docs/gates/perf-baseline.toml"
+        REGRESSED=$(check_targets "$OUT/perf-gate.md" all) || exit 1
+    fi
     set --
     [ ! -f "$PERF_DIR/notes.md" ] || set -- --notes "$PERF_DIR/notes.md"
+    if [ "$TARGETS_ONLY" -eq 1 ]; then
+        {
+            [ ! -f "$PERF_DIR/notes.md" ] || { cat "$PERF_DIR/notes.md"; echo; }
+            if [ -n "$REGRESSED" ]; then
+                echo "Judged on targets: every metric the gate checks meets its target. Beyond the allowance against the gate's baseline: $(printf '%s' "$REGRESSED" | sed 's/ /, /g')."
+            else
+                echo "Judged on targets: every metric the gate checks meets its target."
+            fi
+        } >"$OUT/perf-notes.md"
+        set -- --notes "$OUT/perf-notes.md"
+    fi
     "$TARGET/release/fx-bench" perf-release --baseline "$ROOT/docs/gates/perf-baseline.toml" \
         --previous "$ROOT/docs/gates/releases/$PREV.txt" --previous-label "$PREV" \
         --label "$LABEL" "$@" "$OUT/perf-metrics.txt" >"$OUT/performance.md" ||
@@ -840,7 +941,7 @@ else
     [ "$CHANNEL" != release ] || echo "Release candidate: $RC_TAG"
     echo "Tag:     $TAG"
     echo "Disk image: $APP_DMG (volume \"$VOLUME\")"
-    [ -z "$PERF_DIR" ] || echo "Performance: $PERF_DIR, compared with $PREV"
+    [ -z "$PERF_DIR" ] || echo "Performance: $PERF_DIR, compared with $PREV$JUDGED"
 
     [ ! -e "$DIR" ] || fail "$DIR already exists; pick a new folder"
     command -v cargo >/dev/null || fail "cargo is not on PATH"
