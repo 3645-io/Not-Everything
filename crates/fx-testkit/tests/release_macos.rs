@@ -15,11 +15,12 @@
 //!   Before each staple it checks that Apple's ticket covers the signed
 //!   items (their CDHash in the `notarytool log`);
 //! - it makes a drag-to-install disk image (the app and a shortcut to
-//!   /Applications, laid out by Finder or plain if Finder can't be
-//!   scripted, read-only UDZO, signed with the Developer ID) in a fresh
-//!   folder, and checks a quarantined copy of it (`hdiutil verify`,
-//!   `spctl --assess --type open`, `stapler validate`, the app inside with
-//!   `syspolicy_check distribution`) before writing the files; it detaches
+//!   /Applications, laid out by Finder, which it waits for; only a beta may
+//!   keep the plain layout; read-only UDZO, signed with the Developer ID)
+//!   in a fresh folder, and checks a quarantined copy of it (`hdiutil
+//!   verify`, `spctl --assess --type open`, `stapler validate`, the layout
+//!   with `has_layout`, the app inside with `syspolicy_check
+//!   distribution`) before writing the files; it detaches
 //!   every image it attaches, and its `mount_point` helper reads `hdiutil
 //!   attach`'s output;
 //! - the disk image is written, summed and published next to the zip;
@@ -764,32 +765,100 @@ fn script_makes_and_signs_the_disk_image_from_the_app() {
 }
 
 /// Finder lays out the window (fixed size, icon positions) on a read-write
-/// image; if Finder can't be scripted or macOS denies it, the image keeps
-/// the plain layout and the script says so instead of stopping.
+/// image. Finder lists a new disk about a second after it mounts, so its
+/// script waits for the disk, up to 10 s, instead of failing at once: on
+/// 14 Nov 2026 the 0.5.0 release and 0.6.0-RC-1 shipped Finder's plain
+/// window because it asked too soon. Without the layout, a release or an RC
+/// stops (`--resume` carries on once Finder can be scripted); only a beta
+/// keeps the plain layout and says so.
 #[test]
-fn script_lays_out_the_window_with_finder_or_says_it_could_not() {
+fn script_lays_out_the_window_with_finder_and_waits_for_the_disk() {
     let text = script_text();
     for needle in [
         r#"tell application "Finder""#,
+        "repeat 40 times",
+        "delay 0.25",
+        "if theDisk is not missing value then exit repeat",
         "set bounds of theWindow to",
         "set arrangement of viewOptions to not arranged",
         "set icon size of viewOptions to",
         "set position of item appName",
         r#"set position of item "Applications""#,
-        "plain layout",
     ] {
         assert!(text.contains(needle), "{SCRIPT} must use {needle:?}");
     }
-    let code = code_lines(&text);
+    let make = shell_function(&text, "make_dmg")
+        .unwrap_or_else(|| panic!("{SCRIPT} must define make_dmg"));
+    let code = code_lines(&make);
     let (_, osascript) = line_with_all(&code, &["osascript"], "run Finder's script");
     assert!(
         osascript.trim_start().starts_with("if osascript"),
-        "a failed Finder script must not stop the release: {osascript:?}"
+        "a failed Finder script is judged by the layout it left: {osascript:?}"
     );
     line_with_all(
         &code,
         &["attach_image", "-readwrite"],
         "attach the layout image read-write",
+    );
+    // The layout decides, whatever osascript returned.
+    let (check, _) = line_with_all(
+        &code,
+        &["if has_layout", r#""$MOUNTED""#, r#""$APP_NAME.app""#],
+        "check the saved layout",
+    );
+    let (beta, _) = line_with_all(
+        &code,
+        &["elif", r#""$CHANNEL" = beta"#],
+        "let only a beta keep the plain layout",
+    );
+    let (refuse, line) = line_with_all(
+        &code,
+        &["fail", "Finder did not lay out"],
+        "stop a release or an RC without the layout",
+    );
+    assert!(
+        line.contains("--resume"),
+        "the refusal names --resume: {line}"
+    );
+    let (convert, _) = line_with_all(&code, &["hdiutil convert"], "convert the layout image");
+    assert!(
+        check < beta && beta < refuse && refuse < convert,
+        "make_dmg must check the layout, allow a beta's plain one and refuse the rest before converting"
+    );
+}
+
+/// The quarantined copy of a release's or an RC's disk image must carry the
+/// layout too, so a plain window can't ship even if `make_dmg` changes.
+#[test]
+fn script_checks_the_layout_of_the_quarantined_disk_image() {
+    let code = code_lines(&script_text());
+    let (mount, _) = line_with_all(
+        &code,
+        &["attach_image", r#""$CHECK_DMG""#, "-readonly"],
+        "mount the copy read-only",
+    );
+    // Only a beta may ship the plain layout.
+    let (check, line) = line_with_all(
+        &code,
+        &[
+            r#"[ "$CHANNEL" = beta ] || has_layout"#,
+            r#""$MOUNTED""#,
+            r#""$APP_NAME.app""#,
+        ],
+        "check the copy's layout",
+    );
+    assert!(
+        line.trim_end().ends_with("||") && code[check + 1].trim_start().starts_with("fail "),
+        "a copy without the layout must stop the release: {line}"
+    );
+    let (write, _) = line_with_all(
+        &code,
+        &[r#"cp "$DMG" "$OUT/$APP_DMG""#],
+        "write the disk image",
+    );
+    assert!(
+        mount < check && check < write,
+        "the copy's layout is checked once it is mounted and before the files are written"
     );
 }
 
@@ -3014,6 +3083,79 @@ esac"#;
                 describe(&out)
             );
         }
+    }
+
+    /// A `.DS_Store` holding a record of each `(file name, type)`, as Finder
+    /// writes them: the name's length in UTF-16 units (big-endian u32), the
+    /// name in UTF-16BE, the four-letter type, then a data type and value.
+    fn ds_store(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 1, b'B', b'u', b'd', b'1'];
+        for (name, kind) in records {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            bytes.extend_from_slice(&(units.len() as u32).to_be_bytes());
+            for u in units {
+                bytes.extend_from_slice(&u.to_be_bytes());
+            }
+            bytes.extend_from_slice(kind.as_bytes());
+            bytes.extend_from_slice(b"blob");
+            bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0x96, 0, 0xa0]);
+        }
+        bytes
+    }
+
+    /// `has_layout` passes a volume whose `.DS_Store` holds the window's
+    /// settings (`bwsp`), its icon view (`icvp`) and the positions (`Iloc`)
+    /// of the app and the Applications shortcut, as 0.5.0-RC-1's disk image
+    /// does, and fails one without the file (0.6.0-RC-1's) or missing any of
+    /// them.
+    #[test]
+    fn has_layout_needs_the_window_view_and_both_icon_positions() {
+        let dir = temp_path("has-layout");
+        fs::create_dir_all(&dir).unwrap();
+        let app = "Not-Everything Preview.app";
+        let full = [
+            (".", "bwsp"),
+            (".", "icvp"),
+            (".", "vSrn"),
+            ("Applications", "Iloc"),
+            (app, "Iloc"),
+        ];
+        let check = |records: Option<Vec<(&str, &str)>>| {
+            let store = dir.join(".DS_Store");
+            let _ = fs::remove_file(&store);
+            if let Some(records) = records {
+                fs::write(&store, ds_store(&records)).unwrap();
+            }
+            let body = format!(
+                "if has_layout '{}' '{app}'; then echo laid-out; else echo plain; fi",
+                dir.display()
+            );
+            let out = run_functions(&["has_layout"], &body, &[]);
+            assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(check(Some(full.to_vec())), "laid-out", "every record");
+        assert_eq!(check(None), "plain", "no .DS_Store");
+        assert_eq!(check(Some(Vec::new())), "plain", "an empty .DS_Store");
+        for missing in 0..full.len() {
+            let mut records = full.to_vec();
+            let (name, kind) = records.remove(missing);
+            if kind == "vSrn" {
+                // The view's version isn't part of the layout.
+                assert_eq!(check(Some(records)), "laid-out");
+                continue;
+            }
+            assert_eq!(
+                check(Some(records)),
+                "plain",
+                "without {name}'s {kind} record"
+            );
+        }
+        // Another app's position doesn't count for this one.
+        let mut other = full.to_vec();
+        other[4] = ("Not-Everything.app", "Iloc");
+        assert_eq!(check(Some(other)), "plain", "another app's position");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `check_targets` reads perf-compare's report: it prints the IDs of the
