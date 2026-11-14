@@ -61,10 +61,12 @@
 //! left out of Time Machine backups, when the engine has been idle for
 //! [`EngineConfig::checkpoint_idle`] after the last change (off by default),
 //! at the latest [`EngineConfig::checkpoint_max_delay`] after the first
-//! unsaved change, right after a full rescan is published, on request
+//! unsaved change (48 h of awake time by default), right after a full
+//! rescan or a compaction is published, on request
 //! ([`Engine::checkpoint`], which returns at once when the store already
 //! holds the latest snapshot, or [`Engine::request_checkpoint`], which
-//! leaves the save to the checkpoint thread) and on an orderly
+//! leaves the save to the checkpoint thread and is dropped when the store
+//! already holds it) and on an orderly
 //! [`Engine::shutdown`], which alone sets the clean-shutdown flag. An app
 //! that quits calls [`Engine::checkpoint_for_quit`], which writes what the
 //! store lacks. The writer thread and the checkpoint thread run at the

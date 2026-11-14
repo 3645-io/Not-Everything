@@ -3,19 +3,30 @@
 //!
 //! A checkpoint is always written from one published [`EngineSnapshot`], so
 //! the saved cursor is exactly the one covering the saved index and orders.
-//! Saves happen on a dedicated thread (so the writer keeps applying changes)
-//! when the engine has been idle for the configured delay after the last
-//! published change, at the latest the configured max delay after the first
-//! change not yet saved (a whole volume is rarely idle for long), and as
-//! soon as a full rescan has been published. They also happen on request
-//! (done at once when the store already holds the latest snapshot) and on
-//! an orderly shutdown (the only save that sets the clean-shutdown flag).
+//! Saves happen on a dedicated thread, so the writer keeps applying changes:
 //!
-//! When the app quits ([`QuitSave`]) nothing is written if the
-//! store holds a resume cursor: the next launch loads it and replays the
-//! changes made since, as after a crash. Only a store without one (a first
-//! scan whose save has not started) is written, and a save already in
-//! flight is waited for instead of being followed by another.
+//! - as soon as a first scan, a full rescan or a compaction is published;
+//! - on request ([`Engine::request_checkpoint`](crate::Engine::request_checkpoint),
+//!   the app's daily save). A request made while the store holds the
+//!   latest snapshot writes nothing and is dropped, so it never saves a
+//!   later change by itself;
+//! - at the latest the configured max delay (48 h by default) after the
+//!   first change not yet saved, a backstop for a Mac whose app never
+//!   finds an idle moment for its daily save. The delay is counted in
+//!   [`Instant`]s, which on macOS stop while the Mac sleeps, so it is 48 h
+//!   of awake time;
+//! - with an idle delay configured (none by default), once the engine has
+//!   been idle that long after the last published change.
+//!
+//! [`Engine::checkpoint`](crate::Engine::checkpoint) saves at once, and an
+//! orderly shutdown saves too: the only save that sets the clean-shutdown
+//! flag.
+//!
+//! When the app quits ([`QuitSave`]), the latest snapshot is written if the
+//! store lacks it, since the store is otherwise saved only once a day and
+//! the next launch would replay up to a day of changes. A save already in
+//! flight is waited for instead of being followed by another; the next
+//! launch replays what came after it.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -349,7 +360,8 @@ impl Checkpoints {
 
     /// Asks the checkpoint thread to save the latest published snapshot
     /// now, without waiting for the idle delay. Called by the writer after
-    /// publishing a full rescan.
+    /// publishing a full rescan, and by the app's daily save. The thread
+    /// drops a request the store already meets.
     pub(crate) fn request(&self) {
         if self.enabled() {
             lock(&self.state).requested = true;
@@ -512,6 +524,10 @@ impl Checkpoints {
             }
             let generation = current.load().generation;
             if st.saved == Some(generation) {
+                // A request is met: the store holds the latest snapshot.
+                // Kept, it would save the next change at once, whenever
+                // that comes, instead of at the app's next daily save.
+                st.requested = false;
                 st = self
                     .wake
                     .wait(st)

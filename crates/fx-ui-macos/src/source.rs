@@ -652,9 +652,10 @@ impl ResultsSource for Engine {
         }
     }
 
-    /// The store's age, from its modification time.
+    /// The store's age, from its modification time
+    /// ([`crate::daily_save::saved_ago`] at the current time).
     fn saved_ago(&self) -> Option<std::time::Duration> {
-        self.saved_at()?.elapsed().ok()
+        crate::daily_save::saved_ago(std::time::SystemTime::now(), self.saved_at())
     }
 
     /// [`Engine::request_checkpoint`]: the checkpoint thread saves.
