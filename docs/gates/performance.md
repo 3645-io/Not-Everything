@@ -4,7 +4,8 @@ Every change that ships is measured before its pull request against the metrics 
 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
 - `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
-- The baseline is 0.4.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The baseline is 0.5.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is 0.5.0 too, measured at the pr tier on 14 Nov 2026.
 
 ## Tiers
 
@@ -17,9 +18,11 @@ Every change that ships is measured before its pull request against the metrics 
 
 GitHub's shared macOS runners vary more between runs than the allowances, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
 
+Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a locked screen the app's window can't come forward, so every probe that summons it times out: on 13 Nov 2026 the screen locked two minutes into an rc run, and all 50 shortcut presses of F3 timed out at 5 s. `perf-check.sh` refuses to start on a locked screen (exit 2, nothing changed), and checks again once it holds the lock. `run.txt` records the screen at the start and at the end, and notes each step after which it was locked.
+
 ## Allowances
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.4.0's CPU showing a search, B2, and its first results during the first scan, F5), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
+A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.5.0's first results during the first scan, F5, tracked until the first scan shows results as it goes), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
 
 | Class | Metrics | Allowance |
 | --- | --- | --- |
@@ -53,6 +56,8 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 B7 adds the index saves a phase is too short to see. After each compaction the app saves its whole index to the store file, about 150 MB for a whole-disk index of 2M entries. The writer compacts when the files created since the last compaction, or the files deleted since then, pass 10% of the index's entries (at least 1,024): about every 200,000 at that scale, where a 10-minute phase at 20 operations a second creates about 6,000. So after each phase `perf-check.sh` runs `fx-bench saves`. It takes the store file the run's app saved (its size, and its entry count from `not-everything -get-result-count`) and the files `fx-bench churn` created and deleted in the phase, scales the larger of the two counts to a day, and projects one save of the store's size for every 10% of the entries in it. B7 is the measured writes plus that projection. At the pr tier's 20 operations a second, about half of them creates, that comes to about 4.3 saves a day: about 650 MB on the 2M-entry index. The summary shows the parts by phase, and fx-engine's `tests/compaction_saves.rs` checks the model against the real writer.
 
 The projection counts only the scripted activity: the rc tier's phases, with none, project no saves, though a Mac in daily use compacts too, and the daily save, which comes only after a day without one, is not projected either.
+
+The compaction saves add to the daily save, with an upper bound. The daily save comes 24 hours after the store's last write, whatever made it, so a compaction's save restarts the day: a day with a compaction often has no daily save, and a disk that compacts more than once a day makes no daily save at all. So "one save a day" means at most one daily save plus one save per compaction, plus one per quit (fx-ui-macos's `tests/daily_save_day.rs` simulates weeks of it). How often a whole disk in daily use compacts is still to be measured: fx-engine's `day_replay_bench` counts the files a day's FSEvents history created and deleted and projects the compactions a day with the same model (numbers to come). B7's target, and whether it gates, stay the owner's call once those numbers are in.
 
 ### Memory
 
@@ -122,7 +127,7 @@ scripts/perf-check.sh --tier rc --step soak --out <new dir>
 
 ## In release notes
 
-Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes. The script refuses to publish a release candidate or a release without an rc-tier run of the same code (the same commit, or one with the same tree, so a release can use its candidate's run) that has no failing metric. Once it has built the DMG, it adds the DMG's size (O1) and judges the whole rc tier again, so a failing or unmeasured metric stops the release then.
+Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes. The script refuses to publish a release candidate or a release without an rc-tier run of the same code that has no failing metric. The code is the same for the same commit, one with the same tree (so a release can use its candidate's run), or one that differs only in files no build compiles: documents (but `THIRD-PARTY-NOTICES.md`, which the app and the command embed), `docs/`, `scripts/`, `.github/`, `.agents/` and crates' tests. Once it has built the DMG, it adds the DMG's size (O1) and judges the whole rc tier again, so a failing or unmeasured metric stops the release then. With the owner's approval, `--targets-only` judges the run on targets only: a metric that failed only its regression check (beyond its allowance, within its target) doesn't stop the release, and the notes name it; a missed target or an unmeasured metric still does.
 
 GitHub strips text colour from release notes, so each row carries a dot next to its words:
 
@@ -133,6 +138,6 @@ Each release's measured values are kept in `docs/gates/releases/<version>.txt` (
 
 ## Changing the baseline
 
-- **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date.
-- **By exception:** when the owner accepts a regression, the metric's table gets `exception = "<reason>, approved in #<PR>"` and the new value as its baseline. `perf-compare` refuses an exception without a pull request number.
+- **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date. Run `scripts/perf-check.sh --tier pr --step background` on the same commit too, and copy its B1 to B6, M1 and M2 into `pr_baseline`, with `[meta]` `pr_build` and `pr_date`.
+- **By exception:** when the owner accepts a regression, the metric's table gets `exception = "<reason>, approved in #<PR>"` and the new value as its baseline (as its `pr_baseline` too, when the regression shows at the pr tier). `perf-compare` refuses an exception without a pull request number.
 - **Never** to make a failing check pass.

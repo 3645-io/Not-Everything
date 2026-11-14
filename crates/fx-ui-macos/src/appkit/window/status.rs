@@ -234,6 +234,31 @@ impl StatusBar {
 
     /// Shows `status` in a bar `width` points wide at `y` in the window;
     /// returns whether its height changed.
+    /// A debug build's log of where the bar's parts are: its width and
+    /// height, the counts, the hints (their width and frame, and whether
+    /// they show) and the index, in the bar's coordinates.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_layout(&self) -> String {
+        let frame = |v: &NSView| {
+            let f = v.frame();
+            format!(
+                "x {:.0} y {:.0} w {:.0} h {:.0}",
+                f.origin.x, f.origin.y, f.size.width, f.size.height
+            )
+        };
+        let bar = self.view.frame().size;
+        format!(
+            "bar {:.0} x {:.0}; counts {}; hints {} (width {:.1}, shown {}); index {}",
+            bar.width,
+            bar.height,
+            frame(&self.counts),
+            frame(&self.hints),
+            self.hints_width.get(),
+            !self.hints.isHidden(),
+            frame(&self.index),
+        )
+    }
+
     pub(crate) fn update(&self, status: &StatusView, width: f64, y: f64) -> bool {
         let unchanged = self.shown.borrow().as_ref() == Some(status)
             && (self.view.frame().size.width - width).abs() < 0.5;

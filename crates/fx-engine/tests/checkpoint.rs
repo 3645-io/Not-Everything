@@ -8,11 +8,21 @@
 //!   `EngineConfig::with_checkpoint_idle(Duration)` sets how long after the
 //!   last published change an idle checkpoint is written;
 //!   `EngineConfig::checkpoint_idle()` reads it, default
-//!   `fx_engine::DEFAULT_CHECKPOINT_IDLE` (30 s).
+//!   `fx_engine::DEFAULT_CHECKPOINT_IDLE` (none: no idle checkpoint), and
+//!   `EngineConfig::checkpoint_max_delay()` the longest delay after the
+//!   first unsaved change, default `fx_engine::DEFAULT_CHECKPOINT_MAX_DELAY`
+//!   (48 h). Most tests here set an hour's idle delay, which never comes
+//!   due within a test; the daily save's tests use the default policy.
 //! - `Engine::checkpoint(&self) -> Result<_, E: Debug>` saves on request and
 //!   returns once the file holds the latest published snapshot: its index,
 //!   its sort orders and the volume's resume cursor, written atomically by
 //!   `fx_store::write_checkpoint` with the clean-shutdown flag cleared.
+//! - `Engine::request_checkpoint(&self)` asks the checkpoint thread for
+//!   the same save and returns at once; nothing is written, then or later,
+//!   when the store already holds the latest snapshot.
+//!   `Engine::saved_at(&self) -> Option<SystemTime>` is the store file's
+//!   modification time, which the app's daily save counts from.
+//! - `Engine::checkpoint_for_quit(&self)` writes what the store lacks.
 //! - `Engine::shutdown(self)` (orderly shutdown) stops the writer and, when a
 //!   store path is configured, saves a final checkpoint with the
 //!   clean-shutdown flag set.
@@ -797,6 +807,162 @@ fn quit_without_a_store_path_is_an_error() {
         Err(CheckpointError::NoStorePath)
     ));
     engine.shutdown();
+}
+
+// ------------------------------------------- the daily save's engine half
+//
+// Run 2.15: the app asks for a save once a day (`request_checkpoint`) and
+// reads the store's age from `saved_at`; the engine itself saves only after
+// a first scan or a full rescan, after a compaction, when the app quits and
+// after the 48 h backstop. These tests use the default policy throughout.
+
+/// How long a test gives the checkpoint thread to write a save that must
+/// not come. Saving the sample tree takes a few milliseconds.
+const SETTLE: Duration = Duration::from_millis(300);
+
+/// The default save policy (no idle save, the 48 h backstop) with a store.
+fn default_policy(path: &Path) -> EngineConfig {
+    config().with_store_path(path)
+}
+
+/// Opens an engine with the default policy over a missing store, and waits
+/// until the first scan is saved and its base is served from the store,
+/// which happens once that save is done.
+fn first_scan_saved(tree: &FakeTree, source: &FakeSource, store: &Path) -> Engine {
+    let engine = open(tree, source, default_policy(store));
+    wait_for_tree(&engine, tree, "first full scan");
+    let scanned = tree.entries();
+    wait_for_store(store, "the first full scan to be saved", |e| *e == scanned);
+    wait_for(
+        &engine,
+        "the first base served from the store",
+        whole_base_mapped,
+    );
+    engine
+}
+
+/// The store file's modification time, which `Engine::saved_at` reports.
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+#[test]
+fn steady_changes_under_the_default_policy_write_no_save() {
+    // A whole disk changes all day long: without a request, a compaction,
+    // a quit or the 48 h backstop, nothing writes the store.
+    let dir = TempDir::new("default-steady");
+    let store = dir.store();
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = first_scan_saved(&tree, &source, &store);
+    let saved = written(&store);
+    let saved_at = engine.saved_at();
+    assert!(saved_at.is_some(), "the first scan's save has a time");
+
+    for n in 0..40 {
+        let path = format!("/vol/b/steady-{n}.txt");
+        tree.touch(&path, n);
+        source.push(vec![check(&path)]);
+        thread::sleep(Duration::from_millis(20));
+    }
+    wait_for_tree(&engine, &tree, "the steady changes");
+    thread::sleep(SETTLE);
+    assert_eq!(written(&store), saved, "a change was saved unasked");
+    assert_eq!(engine.saved_at(), saved_at, "the daily clock moved");
+    drop(engine);
+}
+
+#[test]
+fn a_requested_save_is_written_once() {
+    let dir = TempDir::new("requested");
+    let store = dir.store();
+    let tree = sample_tree();
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = first_scan_saved(&tree, &source, &store);
+
+    // A change, then the daily save's request: the checkpoint thread
+    // writes it.
+    tree.touch("/vol/a/day-1.txt", 1);
+    source.push(vec![check("/vol/a/day-1.txt")]);
+    wait_for_tree(&engine, &tree, "the first change");
+    let before = written(&store);
+    engine.request_checkpoint();
+    let want = tree.entries();
+    wait_for_store(&store, "the requested save", |e| *e == want);
+    let first = written(&store);
+    assert_ne!(first, before, "the request wrote the change");
+    assert_eq!(engine.saved_at(), modified(&store));
+
+    // The store holds the latest snapshot: a repeat writes nothing, now or
+    // when the next change comes; that change waits for its own request.
+    engine.request_checkpoint();
+    thread::sleep(SETTLE);
+    assert_eq!(written(&store), first, "a repeated request wrote again");
+    tree.touch("/vol/a/day-2.txt", 2);
+    source.push(vec![check("/vol/a/day-2.txt")]);
+    wait_for_tree(&engine, &tree, "the second change");
+    thread::sleep(SETTLE);
+    assert_eq!(
+        written(&store),
+        first,
+        "a request made with nothing to save saved the next change at once"
+    );
+
+    // A request for that change writes it, once.
+    engine.request_checkpoint();
+    let want = tree.entries();
+    wait_for_store(&store, "the second requested save", |e| *e == want);
+    let second = written(&store);
+    assert_ne!(second, first, "the second request wrote the change");
+    engine.request_checkpoint();
+    thread::sleep(SETTLE);
+    assert_eq!(written(&store), second, "the change was written twice");
+    drop(engine);
+}
+
+#[test]
+fn a_compaction_save_restarts_the_daily_clock() {
+    let dir = TempDir::new("compaction-clock");
+    let store = dir.store();
+    let tree = sample_tree();
+
+    // An index started without a scan has no save, so no saved time.
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let cfg = default_policy(&store).with_resume_from(source.current_cursor());
+    let unsaved = start(&tree, &source, tree.build_index(), cfg);
+    wait_for_tree(&unsaved, &tree, "started index");
+    assert_eq!(unsaved.saved_at(), None, "a saved time without a save");
+    drop(unsaved);
+    assert!(!store.exists(), "dropping the engine saved");
+
+    let source = FakeSource::new(StartOutcome::Resumed);
+    let engine = first_scan_saved(&tree, &source, &store);
+    let scan_saved_at = engine.saved_at().expect("the first scan's save");
+    assert_eq!(Some(scan_saved_at), modified(&store));
+    // Far enough apart for the file system's clock to tell the saves apart.
+    thread::sleep(Duration::from_millis(20));
+
+    // More new entries than the compaction limit (1,024 rows at this size).
+    tree.add_files("/vol/b", "many", 1_500);
+    let changes = (0..1_500)
+        .map(|n| check(&format!("/vol/b/many{n}.dat")))
+        .collect();
+    source.push(changes);
+    wait_for_tree(&engine, &tree, "the compacted index");
+    let want = tree.entries();
+    wait_for_store(&store, "the compaction's save", |e| *e == want);
+    let compaction_saved_at = engine.saved_at().expect("the compaction's save");
+    assert!(
+        compaction_saved_at > scan_saved_at,
+        "the compaction's save did not move the saved time, which the daily save counts from"
+    );
+    assert_eq!(Some(compaction_saved_at), modified(&store));
+
+    // That save is the only one.
+    let after = written(&store);
+    thread::sleep(SETTLE);
+    assert_eq!(written(&store), after, "the compaction saved twice");
+    drop(engine);
 }
 
 // ------------------------------------------------------ full scan on grant

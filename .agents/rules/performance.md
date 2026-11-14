@@ -29,12 +29,13 @@ Speed, a small footprint and a quiet background are the product. Every change th
 2. Find the cause (a stack sample, `fx-bench sample`) and fix it.
 3. If the regression buys something the owner wants, stop and ask, with a before-and-after table. Go on only with their approval, quoted in the PR, recorded in the baseline file as the metric's `exception` (the reason and the PR), and with the baseline moved to the new value. A PR that goes without the check at all needs the line `Performance: skipped, approved by the owner (<reason>)` in its description.
 
-Never edit the baseline, a target or an allowance to make a check pass. The baseline moves only at a release (from the release candidate's run, with `fx-bench perf-compare --print-values`), or by an exception the owner approved.
+Never edit the baseline, a target or an allowance to make a check pass. The baseline moves only at a release (from the release candidate's run, with `fx-bench perf-compare --print-values`, and the background metrics' `pr_baseline` from a pr-tier run of the same commit), or by an exception the owner approved. The pr tier compares with `pr_baseline` where a metric has one: its background phases run under file activity, unlike the rc tier's.
 
 ## Every measurement
 
 - One benchmark at a time: `perf-check.sh` takes a lock in `$TMPDIR` before it builds, so agents working in parallel queue instead of overlapping. Don't run benchmarks outside it while it runs.
 - Release builds only; the script builds with the `measure` feature the probes need.
+- Keep the Mac unlocked and the display awake for the pr and rc tiers: on a locked screen the app's window can't come forward and its probes time out. `perf-check.sh` refuses to start on a locked screen, and `run.txt` records the screen at the start and the end, and each step after which it was locked.
 - The machine and the cache state go next to every number (`run.txt` records them, with the displays by size).
 - The script removes its scratch folder in `$TMPDIR` when it ends. A run killed with `kill -9` can't, and its folder (`not-everything-perf-<date>-<pid>`) grows every later run's index: remove it before the next run.
 - Background and memory metrics run on the whole-disk index with file activity (`fx-bench churn`), never on a small folder: 0.3.0's idle check used the /Applications index and missed 35% of a core.

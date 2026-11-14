@@ -7,10 +7,19 @@
 //! rescan. A crash loses nothing: the next launch replays the changes made
 //! since the saved cursor. The AppKit layer checks [`daily_save_due`] every
 //! [`DAILY_SAVE_CHECK`] and asks the engine for a save when it says so.
+//!
+//! The day counts from the store's last write, whatever wrote it: a save
+//! after a compaction, a full rescan or a quit restarts it too. The engine
+//! adds a backstop of its own, a save at the latest 48 hours of awake time
+//! after the first unsaved change (`fx_engine::DEFAULT_CHECKPOINT_MAX_DELAY`),
+//! for a Mac that is never idle for a minute at a check.
+//!
+//! The decision takes the clock as an argument ([`daily_save_due_at`]), so
+//! `tests/daily_save_day.rs` can run it through simulated days.
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// How long after the last save the next daily save is due.
 pub const DAILY_SAVE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
@@ -27,6 +36,24 @@ pub const DAILY_SAVE_CHECK: Duration = Duration::from_secs(5 * 60);
 /// itself), and nobody has used the keyboard or mouse for `input_idle`.
 pub fn daily_save_due(saved_ago: Option<Duration>, input_idle: Duration) -> bool {
     saved_ago.is_some_and(|age| age >= DAILY_SAVE_INTERVAL) && input_idle >= DAILY_SAVE_INPUT_IDLE
+}
+
+/// How long before `now` an index saved at `saved_at` was saved (the store
+/// file's modification time, `fx_engine::Engine::saved_at`). `None` without
+/// a saved index, and for a save dated after `now`: the clock was set back
+/// since, and the daily save waits until it has caught up.
+pub fn saved_ago(now: SystemTime, saved_at: Option<SystemTime>) -> Option<Duration> {
+    now.duration_since(saved_at?).ok()
+}
+
+/// [`daily_save_due`] at `now` for an index saved at `saved_at`: what the
+/// timer decides, with the clock passed in.
+pub fn daily_save_due_at(
+    now: SystemTime,
+    saved_at: Option<SystemTime>,
+    input_idle: Duration,
+) -> bool {
+    daily_save_due(saved_ago(now, saved_at), input_idle)
 }
 
 #[cfg(test)]
@@ -61,5 +88,29 @@ mod tests {
     fn not_due_without_a_store() {
         // The engine saves the first scan by itself.
         assert!(!daily_save_due(None, 5 * MINUTE));
+    }
+
+    #[test]
+    fn the_age_is_read_from_the_clock_passed_in() {
+        let saved = SystemTime::UNIX_EPOCH + 1_000 * HOUR;
+        assert_eq!(saved_ago(saved + 3 * HOUR, Some(saved)), Some(3 * HOUR));
+        assert_eq!(saved_ago(saved, Some(saved)), Some(Duration::ZERO));
+        assert_eq!(saved_ago(saved, None), None);
+        assert!(daily_save_due_at(saved + 24 * HOUR, Some(saved), MINUTE));
+        assert!(!daily_save_due_at(
+            saved + 24 * HOUR - Duration::from_secs(1),
+            Some(saved),
+            MINUTE
+        ));
+        assert!(!daily_save_due_at(saved + 48 * HOUR, None, MINUTE));
+    }
+
+    #[test]
+    fn a_save_dated_in_the_future_is_waited_out() {
+        // The clock was set back after the save: no age, so not due until
+        // the clock reaches the save's time and then a day more.
+        let saved = SystemTime::UNIX_EPOCH + 1_000 * HOUR;
+        assert_eq!(saved_ago(saved - HOUR, Some(saved)), None);
+        assert!(!daily_save_due_at(saved - HOUR, Some(saved), 10 * MINUTE));
     }
 }

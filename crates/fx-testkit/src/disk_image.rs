@@ -4,17 +4,35 @@
 //! [`DiskImage::attach_new`] creates an image of one [`ImageFs`] in a
 //! scratch folder and attaches it with `-nobrowse` (so the Finder never
 //! shows it and nothing else indexes it) at a mount point the test names.
-//! [`DiskImage::detach`] detaches it; dropping a still-attached image
-//! detaches it with `-force`, so a failing test never leaves a volume
-//! mounted.
+//! [`DiskImage::detach`] detaches it, and waits up to [`DETACH_PATIENCE`]
+//! while the volume is busy: on GitHub's runners a test's image was now and
+//! then still busy when the test detached it (12–13 Nov). Dropping a
+//! still-attached image detaches it with `-force`, so a failing test never
+//! leaves a volume mounted.
 //!
 //! Where `hdiutil` cannot make or attach images (a runner without disk
 //! image support, a sandbox), [`DiskImage::attach_new`] fails with a
 //! message, and the tests skip: [`skip`] prints why.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long [`DiskImage::detach`] keeps trying while the volume is busy.
+pub const DETACH_PATIENCE: Duration = Duration::from_secs(5);
+
+/// The first pause between two tries of a busy detach; each pause doubles,
+/// up to [`LONGEST_PAUSE`].
+const FIRST_PAUSE: Duration = Duration::from_millis(50);
+
+/// The longest pause between two tries of a busy detach.
+const LONGEST_PAUSE: Duration = Duration::from_millis(800);
+
+/// `hdiutil detach`'s exit status when a file is still open on the volume
+/// (EBUSY). With `-quiet` it prints nothing then; without, "Resource busy".
+const EBUSY: i32 = 16;
 
 /// The file systems the tests use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,11 +116,53 @@ fn run(cmd: &mut Command) -> io::Result<Output> {
     if out.status.success() {
         Ok(out)
     } else {
-        Err(io::Error::other(format!(
-            "{:?} failed: {}",
-            cmd.get_args().collect::<Vec<_>>(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
+        Err(failed(cmd, &out))
+    }
+}
+
+/// The error for a failed command: its arguments, exit status and message
+/// (empty for `hdiutil -quiet`).
+fn failed(cmd: &Command, out: &Output) -> io::Error {
+    io::Error::other(format!(
+        "{:?} failed ({}): {}",
+        cmd.get_args().collect::<Vec<_>>(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Whether a failed `hdiutil detach` found the volume busy.
+fn busy(out: &Output) -> bool {
+    out.status.code() == Some(EBUSY)
+        || String::from_utf8_lossy(&out.stderr).contains("Resource busy")
+}
+
+/// The processes of this user with a file open on the volume mounted at
+/// `mount_point`, as `command[pid]` (`lsof` sees only this user's), or why
+/// none are named.
+fn holders(mount_point: &Path) -> String {
+    let out = match Command::new("lsof")
+        .args(["-n", "-P", "-F", "pc", "+f", "--"])
+        .arg(mount_point)
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => return format!("lsof failed: {e}"),
+    };
+    let mut names = Vec::new();
+    let mut pid = "";
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p;
+        } else if let Some(command) = line.strip_prefix('c') {
+            names.push(format!("{command}[{pid}]"));
+        }
+    }
+    if names.is_empty() {
+        "none of this user's processes (a system service, or released since)".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -167,21 +227,71 @@ impl DiskImage {
         Ok(())
     }
 
-    /// Detaches the image (a no-op when it is not attached).
+    /// Detaches the image (a no-op when it is not attached). While the
+    /// volume is busy (a file is open on it) it tries again, after pauses
+    /// growing from 50 to 800 ms, for up to [`DETACH_PATIENCE`]; when it
+    /// detached only after a retry, it says so on stderr, even in a test
+    /// that passes, with what held the volume. It never forces the detach:
+    /// a volume that stays busy is a test (or an app) keeping a disk from
+    /// being ejected, and fails.
     ///
     /// # Errors
     ///
-    /// `hdiutil detach` failed (the image stays marked attached, so drop
-    /// retries with `-force`).
+    /// `hdiutil detach` failed for another reason than a busy volume, at
+    /// once, or the volume was still busy after [`DETACH_PATIENCE`]: the
+    /// error gives the last try's exit status and message and, for a busy
+    /// volume, this user's processes that held it. The image stays marked
+    /// attached, so dropping it detaches it with `-force`.
     pub fn detach(&mut self) -> io::Result<()> {
         if !self.attached {
             return Ok(());
         }
-        run(Command::new("hdiutil")
-            .args(["detach", "-quiet"])
-            .arg(&self.mount_point))?;
-        self.attached = false;
-        Ok(())
+        let started = Instant::now();
+        let end = started + DETACH_PATIENCE;
+        let mut pause = FIRST_PAUSE;
+        let mut held_by = None;
+        let mut tries = 0;
+        loop {
+            let mut cmd = Command::new("hdiutil");
+            cmd.args(["detach", "-quiet"]).arg(&self.mount_point);
+            let out = cmd.output()?;
+            tries += 1;
+            if out.status.success() {
+                self.attached = false;
+                if let Some(held_by) = held_by {
+                    // Written to stderr itself, past the test harness's
+                    // capture (which takes only `eprintln!`), so a CI log
+                    // shows it even when the test passes: whatever keeps a
+                    // volume busy is worth seeing.
+                    let _ = writeln!(
+                        io::stderr(),
+                        "{}: busy, detached at try {tries} after {:?}; held by {held_by}",
+                        self.mount_point.display(),
+                        started.elapsed()
+                    );
+                }
+                return Ok(());
+            }
+            if !busy(&out) {
+                return Err(failed(&cmd, &out));
+            }
+            // Who holds it, looked up at the first busy try and the last:
+            // whatever held it at first may be gone by then.
+            let now = Instant::now();
+            if held_by.is_none() || now >= end {
+                held_by = Some(holders(&self.mount_point));
+            }
+            if now >= end {
+                let err = failed(&cmd, &out);
+                return Err(io::Error::other(format!(
+                    "{err}; the volume was still busy after {tries} tries in {:?}, held by {}",
+                    started.elapsed(),
+                    held_by.unwrap_or_default()
+                )));
+            }
+            thread::sleep(pause.min(end - now));
+            pause = (pause * 2).min(LONGEST_PAUSE);
+        }
     }
 
     /// Where the image is mounted.

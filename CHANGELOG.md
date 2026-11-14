@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.6.0: a right-click menu (November 2026)
+
+Not-Everything now has a right-click menu on its results, and ⌘C copies the files themselves, as Finder does. Signed and notarized. Apple silicon only, macOS 13 or later.
+
+### Before you update
+
+- **Nothing to do.** Full Disk Access, Launch at Login, your hotkey, your settings and your index carry over from 0.5.0.
+
+### New
+
+- **A right-click menu.** Right-click or Control-click a result for Open, Open With, Reveal in Finder, Quick Look, Copy, Copy Full Path and Share…, in Finder's order; a folder offers New Terminal at Folder instead of Open With. Open With lists the file's default app first, then the other apps that open it, the App Store and Other…. The menu acts on the row you clicked, or on the whole selection when you click inside it.
+- **⌘C copies the files.** In the results, ⌘C (and Edit › Copy) copies the selected files, ready to paste into Finder or a message, as Finder's Copy does. ⌥⌘C still copies their full paths as text.
+
+### Fixed
+
+- **The disk image opens on its laid-out window again**: the app on the left and Applications on the right, with large icons. 0.5.0's and 0.6.0-RC-1's opened on Finder's plain window, because the release script asked Finder for the new disk before Finder had listed it. A release can no longer ship without the layout.
+- **An extra save of the index.** When the once-a-day save found the index already saved, the next file change was saved at once, whatever you were doing at that moment, instead of waiting for the next quiet moment a day later.
+
+### Known limits
+
+- **After a crash, catching up can take about a minute.** If the app stops without quitting a day after its last save, its next start reads macOS's record of that day's changes before it is up to date. On a disk that changes a lot (the test Mac, during a day of software builds) that took 69 s; an hour's changes took about 1 s. It shows what it had until then.
+- **An ejected drive's files are hidden** from the results until it is connected again; a marker for them is planned.
+- **With VoiceOver, an empty search listing every file may not read its rows.** Type a search first.
+
+### For testers
+
+Release candidates install as **Not-Everything Preview**, with its own settings, index, hotkey (Option-Shift-Space) and command (`not-everything-preview`). It runs next to your everyday Not-Everything without touching it.
+
+### Install
+
+Open `Not-Everything-0.6.0-macos-arm64.dmg` and drag Not-Everything to Applications, replacing the old copy. The zip, `Not-Everything-0.6.0-macos-arm64.zip`, holds the same signed app. `not-everything-cli-0.6.0-macos-arm64.tar.gz` holds the `not-everything` command, its manual (`cli.md`), the license and the third-party notices.
+
 ## v0.5.0: external drives, resizable columns, a faster start (November 2026)
 
 Not-Everything now indexes your external drives, lets you resize its columns, previews files with Quick Look, works with VoiceOver, and shows its first result in half the time. Signed and notarized. Apple silicon only, macOS 13 or later.

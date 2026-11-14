@@ -12,9 +12,11 @@
 //!   state machine for the query, sort, stale-result dropping, throttled
 //!   re-runs on new snapshot generations, cached row windows and the status
 //!   text.
-//! - [`actions`]: the read-only actions (open, reveal in Finder, copy path,
-//!   Quick Look), the key map and the drag-out operation mask (copy and
-//!   link only).
+//! - [`actions`]: the read-only actions (open, reveal in Finder, copy the
+//!   files, copy path, Quick Look), the key map and the drag-out operation
+//!   mask (copy and link only).
+//! - [`context_menu`]: the right-click menu on the results: what it acts
+//!   on, its items in Finder's order and the Open With submenu.
 //! - [`quick_look`]: what Space and Escape do to the Quick Look panel and
 //!   which selected files it shows.
 //! - [`app_args`]: command-line options of the `fx-ui-macos` app binary and
@@ -105,9 +107,10 @@
 //! binary runs over an engine, and with `measure` the Phase 0 spike window
 //! of the `table_spike` example.
 //!
-//! The UI is read-only: Enter opens, Cmd+Enter reveals in Finder,
-//! Option+Cmd+C copies full paths, Space shows Quick Look, and dragging a
-//! result out offers copy and link only.
+//! The UI is read-only: Enter opens, Cmd+Enter reveals in Finder, Cmd+C
+//! copies the files and Option+Cmd+C their full paths, Space shows Quick
+//! Look, the right-click menu adds Open With, Share… and New Terminal at
+//! Folder, and dragging a result out offers copy and link only.
 //! There is no delete, rename, move or trash action.
 
 pub mod accessibility;
@@ -122,6 +125,7 @@ pub mod bundle;
 pub mod chips;
 pub mod column_sizes;
 pub mod columns;
+pub mod context_menu;
 pub mod controller;
 pub mod daily_save;
 pub mod data_folder;
