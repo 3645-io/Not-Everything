@@ -143,7 +143,10 @@ fn a_disk_image_is_indexed_on_attach_offline_on_detach_and_back_on_reattach() {
             !idx.live_ids().any(|id| snap.is_offline(id)),
             "no offline entry is left"
         );
-        img.detach().expect("detach");
+        // Detached once the engine has stopped: the detach above is the one
+        // the engine watches. Detaching while the engine still watched the
+        // image once found it busy (GitHub's runners).
         engine.shutdown();
+        img.detach().expect("detach");
     }
 }
