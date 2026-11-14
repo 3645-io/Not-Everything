@@ -18,24 +18,25 @@
 [meta]
 machine = "Apple M4 Pro, 24 GB, macOS 27"
 cache = "warm"
-build = "0.4.0"
-date = "2026-11-10"
+build = "0.5.0"
+date = "2026-11-13"
 # The build and date of the `pr_baseline` values. The pr tier runs its
 # background phases for 10 minutes under 20 file operations a second (`fx-bench
 # churn`), the rc tier for 30 minutes without, so the background metrics
-# (B1 to B6, M1, M2) carry a pr-tier baseline too: 0.4.0 at 4e9be6e measured
-# with its own scripts/perf-check.sh --tier pr --step summon --step background
-# (macOS 27.2.1, AC power, warm cache, display on, 2.87M files on the disk,
-# 12 Nov 2026). B7 has none: 0.4.0's script didn't project the index's saves.
-pr_build = "0.4.0"
-pr_date = "2026-11-12"
+# (B1 to B6, M1, M2) carry a pr-tier baseline too: 0.5.0 at f1d1d5d measured
+# with its own scripts/perf-check.sh --tier pr --step background (macOS
+# 27.2.1, AC power, warm cache, display on, about 3.08M files on the disk,
+# 14 Nov 2026). B7 has none: it is tracked until its target is set (#29).
+pr_build = "0.5.0"
+pr_date = "2026-11-14"
 # The rows of the summary table in a release's notes (fx-bench perf-release).
 summary = "B1 B4 B7 B2 M1 S1 S5 F1 F6 F2"
-# `baseline` values: 0.4.0-RC-1's rc tier at 489a11e, the commit 0.4.0 was
-# built from (macOS 27.2.1, AC power, warm cache, 10 Nov 2026), with the
-# published 0.4.0 DMG's size (docs/gates/releases/0.4.0.txt). Metrics the rc
-# tier doesn't judge (O2) and every `quick_baseline` keep their 0.3.2 values,
-# measured on the run 2.18 branch at c2622ca.
+# `baseline` values: 0.5.0-RC-1's rc tier at f1d1d5d, the commit 0.5.0 was
+# built from (macOS 27.2.1, AC power, warm cache, 13 Nov 2026), with the
+# published 0.5.0 DMG's size (docs/gates/releases/0.5.0.txt). The exceptions
+# the owner accepted for 0.5.0 (S3, S4, F1, F3) held only until 0.5.0 and are
+# removed. Metrics the rc tier doesn't judge (O2) and every `quick_baseline`
+# keep their 0.3.2 values, measured on the run 2.18 branch at c2622ca.
 
 # --- Background cost --------------------------------------------------------
 
@@ -49,10 +50,10 @@ allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 0.397
-pr_baseline = 1.705
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 0.244
+pr_baseline = 1.314
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [B2]
 name = "CPU, window showing a search"
@@ -64,10 +65,10 @@ allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 6.705
-pr_baseline = 59.382
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 4.127
+pr_baseline = 39.398
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # The busiest interval varies a lot between runs, so its allowance is wide.
 [B3]
@@ -79,10 +80,10 @@ target = 100
 allow_pct = 25
 aggregate = "max"
 tiers = "pr rc"
-baseline = 27.066
-pr_baseline = 61.865
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 27.65
+pr_baseline = 40.953
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [B4]
 name = "CPU energy, window hidden"
@@ -94,10 +95,10 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 3.816
-pr_baseline = 12.105
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 1.079
+pr_baseline = 5.814
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [B5]
 name = "CPU energy, window showing a search"
@@ -109,10 +110,10 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 94.24
-pr_baseline = 765.581
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 48.698
+pr_baseline = 475.845
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [B6]
 name = "Wakeups a second, window hidden"
@@ -124,10 +125,10 @@ allow_pct = 10
 allow_floor = 0.5
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 1.504
-pr_baseline = 0.252
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 1.545
+pr_baseline = 0.217
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [B7]
 name = "Disk writes a day"
@@ -140,8 +141,8 @@ allow_floor = 10
 aggregate = "mean"
 tiers = "pr rc"
 baseline = 0
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 # Tracked, not gated: the owner's decision of 12 Nov 2026 (#29). With the
 # projected compaction saves, the pr tier's churn of 20 operations a second
 # reads about 660 MB a day, far above a real Mac's rate; B7 is gated again
@@ -162,10 +163,10 @@ allow_pct = 5
 allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 125
-pr_baseline = 133
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 91.9
+pr_baseline = 96.8
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [M2]
 name = "Memory, window showing a search"
@@ -179,10 +180,10 @@ allow_pct = 5
 allow_floor = 30
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 125.2
-pr_baseline = 176.6
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 134.2
+pr_baseline = 176.1
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [M3]
 name = "Memory peak, first scan"
@@ -193,9 +194,9 @@ target = 500
 allow_pct = 5
 aggregate = "max"
 tiers = "pr rc"
-baseline = 387.5
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 383.8
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [M4]
 name = "Index in memory, per file"
@@ -206,10 +207,10 @@ target = 100
 allow_pct = 5
 aggregate = "max"
 tiers = "quick pr rc"
-baseline = 88.39
+baseline = 87.81
 quick_baseline = 85.25
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [M5]
 name = "Saved index on disk, per file"
@@ -224,8 +225,8 @@ scale_min = 2000000
 tiers = "quick pr rc"
 baseline = 79.8
 quick_baseline = 79.8
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # --- Search speed -----------------------------------------------------------
 
@@ -241,10 +242,10 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 7.194
+baseline = 7.136
 quick_baseline = 0.987
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S2]
 name = "Search, 5M files (p95)"
@@ -258,9 +259,9 @@ aggregate = "median"
 scale_key = "engine_5m_entries"
 scale_min = 5000000
 tiers = "pr rc"
-baseline = 17.282
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 16.823
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S3]
 name = "Regex search, 2M files (p95)"
@@ -274,10 +275,10 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 50.523
+baseline = 53.756
 quick_baseline = 6.798
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S4]
 name = "Full-path search, 2M files (p95)"
@@ -291,10 +292,10 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
-baseline = 28.318
+baseline = 29.177
 quick_baseline = 2.627
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S5]
 name = "Keystroke to results (p95)"
@@ -308,10 +309,10 @@ aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 33.94
+baseline = 29.4
 quick_baseline = 24.96
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S6]
 name = "Re-sort a column (p95)"
@@ -325,10 +326,10 @@ aggregate = "median"
 scale_key = "sort_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 20.98
+baseline = 8.57
 quick_baseline = 8.47
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [S7]
 name = "Scroll frame time (p95)"
@@ -342,10 +343,10 @@ aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 1.96
+baseline = 1.12
 quick_baseline = 1.02
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # --- Freshness and start-up -------------------------------------------------
 
@@ -361,10 +362,10 @@ aggregate = "median"
 scale_key = "freshness_ops"
 scale_min = 1000
 tiers = "quick pr rc"
-baseline = 187.089
+baseline = 187.809
 quick_baseline = 187.083
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [F2]
 name = "Launch to first result"
@@ -377,10 +378,10 @@ aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 998.67
+baseline = 477.89
 quick_baseline = 190.93
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [F3]
 name = "Shortcut to window ready (p95)"
@@ -394,10 +395,10 @@ aggregate = "median"
 scale_key = "summon_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
-baseline = 10.97
+baseline = 11.72
 quick_baseline = 10.54
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [F4]
 name = "First scan of the disk"
@@ -410,9 +411,9 @@ aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
-baseline = 14449
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 12514
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # Tracked until the first scan shows results as it goes.
 [F5]
@@ -425,9 +426,9 @@ aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
-baseline = 14448.612
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 12514.145
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 gated = false
 
 [F6]
@@ -442,10 +443,10 @@ aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
-baseline = 559.534
+baseline = 503.312
 quick_baseline = 344.339
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 [F6u]
 name = "Search usable after a relaunch"
@@ -459,10 +460,10 @@ aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
-baseline = 9.536
+baseline = 4.937
 quick_baseline = 1.507
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # --- Correctness: no allowance ------------------------------------------------
 
@@ -510,9 +511,9 @@ better = "lower"
 allow_pct = 5
 aggregate = "last"
 tiers = "rc"
-baseline = 4244916
-baseline_build = "0.4.0"
-baseline_date = "2026-11-10"
+baseline = 4334877
+baseline_build = "0.5.0"
+baseline_date = "2026-11-13"
 
 # Tracked only.
 [O2]
