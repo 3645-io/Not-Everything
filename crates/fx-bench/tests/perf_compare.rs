@@ -169,7 +169,7 @@ fn report_has_header_table_and_summary_line() {
     assert!(cells[6].starts_with("FAIL"), "{cells:?}");
     assert_eq!(
         summary_line(&text),
-        "perf-compare: 0 pass, 1 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped"
+        "perf-compare: 0 pass, 1 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped, 0 known gaps"
     );
 }
 
@@ -211,11 +211,11 @@ fn a_target_miss_fails() {
     assert_eq!(row(&text, "S1")[5], "<= 16 ms");
 }
 
-/// While the baseline itself misses the target (0.3.1's memory at 1.5 GB
-/// against 200 MB), only the allowance holds the metric: the miss is shown,
-/// not failed, so every PR doesn't fail until the fix lands.
+/// At the pr and rc tiers a metric with a target is judged on it alone, so
+/// a baseline that misses the target no longer holds it: a miss fails
+/// unless the gate file records it as a known gap.
 #[test]
-fn a_target_the_baseline_misses_is_pending() {
+fn a_target_the_baseline_misses_still_fails() {
     let t = table(
         "M1",
         "footprint_mb",
@@ -223,48 +223,72 @@ fn a_target_the_baseline_misses_is_pending() {
         "pr rc",
         "target = 200\nbaseline = 1500\nallow_pct = 5\n",
     );
-    let out = compare(
-        "pr",
-        std::slice::from_ref(&t),
-        &["footprint_mb=1550\n"],
-        &[],
-    );
-    assert_exit(&out, 0);
-    let text = stdout(&out);
-    assert_eq!(verdict(&text, "M1"), "PASS (target not yet met)");
-    assert_eq!(
-        summary_line(&text),
-        "perf-compare: 1 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped"
-    );
-    // Past the allowance (1500 + 5% = 1575) it is still a regression.
-    let out = compare(
-        "pr",
-        std::slice::from_ref(&t),
-        &["footprint_mb=1600\n"],
-        &[],
-    );
-    assert_exit(&out, 1);
-    assert_eq!(verdict(&stdout(&out), "M1"), "FAIL (regression)");
-    // Meeting the target is a plain pass.
-    let out = compare("pr", &[t], &["footprint_mb=180\n"], &[]);
+    for tier in ["pr", "rc"] {
+        let out = compare(
+            tier,
+            std::slice::from_ref(&t),
+            &["footprint_mb=1550\n"],
+            &[],
+        );
+        assert_exit(&out, 1);
+        assert_eq!(verdict(&stdout(&out), "M1"), "FAIL (target)");
+    }
+    let out = compare("pr", &[t], &["footprint_mb=150\n"], &[]);
     assert_exit(&out, 0);
     assert_eq!(verdict(&stdout(&out), "M1"), "PASS");
 }
 
-/// Higher-is-better works the same way, and the JSON report says so.
+/// A known gap is a missed target the gate file names with the work that
+/// fixes it. It is reported and counted but doesn't fail the gate; once the
+/// target is met, the report says the gap can be removed, so it blocks again.
 #[test]
-fn a_pending_target_shows_in_json() {
+fn a_known_gap_misses_without_failing() {
+    let t = table(
+        "M1",
+        "footprint_mb",
+        "lower",
+        "pr rc",
+        "target = 200\nknown_gap = \"Lower memory\"\n",
+    );
+    let out = compare("rc", std::slice::from_ref(&t), &["footprint_mb=250\n"], &[]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert_eq!(verdict(&text, "M1"), "KNOWN GAP (Lower memory)");
+    assert_eq!(
+        summary_line(&text),
+        "perf-compare: 0 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped, 1 known gaps"
+    );
+    let out = compare("rc", &[t], &["footprint_mb=150\n"], &[]);
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert_eq!(verdict(&text, "M1"), "PASS (known gap met at this tier)");
+    assert!(
+        summary_line(&text).starts_with("perf-compare: 1 pass, 0 fail,"),
+        "{text}"
+    );
+}
+
+/// The JSON report names the known gap and counts it.
+#[test]
+fn a_known_gap_shows_in_json() {
     let t = table(
         "H1",
         "rate",
         "higher",
         "pr",
-        "target = 100\nbaseline = 50\nallow_pct = 10\n",
+        "target = 100\nknown_gap = \"Faster rate\"\n",
     );
     let out = compare("pr", &[t], &["rate=48\n"], &["--format", "json"]);
     assert_exit(&out, 0);
     let text = stdout(&out);
-    assert!(text.contains("\"target_pending\":true"), "{text}");
+    for want in [
+        "\"verdict\":\"KNOWN GAP\"",
+        "\"known_gap\":\"Faster rate\"",
+        "\"known_gaps\":1",
+        "\"result\":\"PASS\"",
+    ] {
+        assert!(text.contains(want), "json lacks {want}:\n{text}");
+    }
 }
 
 /// Without a baseline the target is the only check, so a miss fails.
@@ -276,19 +300,122 @@ fn a_target_miss_without_a_baseline_fails() {
     assert_eq!(verdict(&stdout(&out), "B3"), "FAIL (target)");
 }
 
+/// With a target, the pr and rc tiers judge the target alone: 17 ms is far
+/// worse than the 9.3 ms baseline but within 20 ms, so it passes, near the
+/// limit.
 #[test]
-fn a_target_and_regression_miss_names_both() {
+fn with_a_target_the_baseline_is_not_judged() {
     let t = table(
         "S1",
         "engine_2m_ms",
         "lower",
-        "pr",
-        "target = 16\nbaseline = 9.3\nallow_pct = 10\n",
+        "pr rc",
+        "target = 20\nbaseline = 9.3\nallow_pct = 10\n",
     );
-    let out = compare("pr", &[t], &["engine_2m_ms=17\n"], &[]);
+    for tier in ["pr", "rc"] {
+        let out = compare(tier, std::slice::from_ref(&t), &["engine_2m_ms=17\n"], &[]);
+        assert_exit(&out, 0);
+        assert_eq!(
+            verdict(&stdout(&out), "S1"),
+            "PASS (near limit: 85% of target)"
+        );
+    }
+}
+
+/// A pass at 80% of its target or more is flagged, so a slow drift shows
+/// before it fails; an `equal` target has no limit to be near.
+#[test]
+fn a_pass_at_80_percent_of_its_target_is_near_the_limit() {
+    let t = table("S5", "a_ms", "lower", "pr", "target = 10\n");
+    for (value, want) in [
+        ("7.9", "PASS"),
+        ("8", "PASS (near limit: 80% of target)"),
+        ("9.5", "PASS (near limit: 95% of target)"),
+        ("10", "PASS (near limit: 100% of target)"),
+    ] {
+        let out = compare(
+            "pr",
+            std::slice::from_ref(&t),
+            &[&format!("a_ms={value}\n")],
+            &[],
+        );
+        assert_exit(&out, 0);
+        assert_eq!(verdict(&stdout(&out), "S5"), want, "{value}");
+    }
+    let h = table("H1", "rate", "higher", "pr", "target = 1000\n");
+    for (value, want) in [
+        ("1100", "PASS (near limit: 91% of target)"),
+        ("1300", "PASS"),
+    ] {
+        let out = compare(
+            "pr",
+            std::slice::from_ref(&h),
+            &[&format!("rate={value}\n")],
+            &[],
+        );
+        assert_eq!(verdict(&stdout(&out), "H1"), want, "{value}");
+    }
+    let e = table("C1", "missed", "equal", "pr", "target = 0\n");
+    let out = compare("pr", &[e], &["missed=0\n"], &[]);
+    assert_eq!(verdict(&stdout(&out), "C1"), "PASS");
+    // Nor has a yes-or-no metric.
+    let b = table("C2", "equal_flag", "higher", "pr", "target = 1\n")
+        .replace("unit = \"ms\"", "unit = \"bool\"");
+    let out = compare("pr", &[b], &["equal_flag=true\n"], &[]);
+    assert_eq!(verdict(&stdout(&out), "C2"), "PASS");
+}
+
+/// `per_key` divides a metric by another key's median, scaled by
+/// `per_scale`: memory per million files, or one memory as a multiple of
+/// another. Without the other key's samples the metric is NOT MEASURED.
+#[test]
+fn per_key_divides_by_another_key() {
+    let t = table(
+        "M1",
+        "footprint_mb",
+        "lower",
+        "pr",
+        "target = 60\nper_key = \"index_entries\"\nper_scale = 1000000\n",
+    );
+    let out = compare(
+        "pr",
+        std::slice::from_ref(&t),
+        &["footprint_mb=96.5\nindex_entries=2077758\n"],
+        &[],
+    );
+    assert_exit(&out, 0);
+    let text = stdout(&out);
+    assert!(row(&text, "M1")[3].starts_with("46.44"), "{text}");
+    // 46.4 is 77% of the target: a plain pass.
+    assert_eq!(verdict(&text, "M1"), "PASS");
+
+    let out = compare("pr", &[t], &["footprint_mb=96.5\n"], &[]);
     assert_exit(&out, 1);
-    let v = verdict(&stdout(&out), "S1");
-    assert!(v.contains("target") && v.contains("regression"), "{v}");
+    assert_eq!(
+        verdict(&stdout(&out), "M1"),
+        "NOT MEASURED (no index_entries samples)"
+    );
+
+    let ratio = table(
+        "M3",
+        "peak_mb",
+        "lower",
+        "pr",
+        "target = 2\nper_key = \"hidden_mb\"\nper_scale = 1\n",
+    );
+    let out = compare("pr", &[ratio], &["peak_mb=388\nhidden_mb=96.5\n"], &[]);
+    assert_exit(&out, 1);
+    let text = stdout(&out);
+    assert!(row(&text, "M3")[3].starts_with("4.02"), "{text}");
+    assert_eq!(verdict(&text, "M3"), "FAIL (target)");
+}
+
+/// The M1 target, the slowest supported Mac's, is shown beside the gate's.
+#[test]
+fn the_m1_target_shows_beside_the_target() {
+    let t = table("S1", "a_ms", "lower", "pr", "target = 6\nm1_target = 16\n");
+    let out = compare("pr", &[t], &["a_ms=5\n"], &[]);
+    assert_eq!(row(&stdout(&out), "S1")[5], "<= 6 ms (M1: <= 16 ms)");
 }
 
 #[test]
@@ -339,7 +466,7 @@ fn without_allowance_any_worsening_fails() {
 
 #[test]
 fn higher_is_better() {
-    // Target: at least 1000. Baseline 1200 with 10%: at least 1080.
+    // Target: at least 1000. At the pr tier the target alone decides.
     let t = table(
         "B1",
         "rate_per_s",
@@ -347,18 +474,15 @@ fn higher_is_better() {
         "pr",
         "target = 1000\nbaseline = 1200\nallow_pct = 10\n",
     );
-    let ok = compare("pr", std::slice::from_ref(&t), &["rate_per_s=1100\n"], &[]);
+    let ok = compare("pr", std::slice::from_ref(&t), &["rate_per_s=1050\n"], &[]);
     assert_exit(&ok, 0);
-    assert_eq!(row(&stdout(&ok), "B1")[5], ">= 1000 ms");
+    let text = stdout(&ok);
+    assert_eq!(row(&text, "B1")[5], ">= 1000 ms");
+    assert_eq!(verdict(&text, "B1"), "PASS (near limit: 95% of target)");
 
-    let regressed = compare("pr", std::slice::from_ref(&t), &["rate_per_s=1050\n"], &[]);
-    assert_exit(&regressed, 1);
-    let v = verdict(&stdout(&regressed), "B1");
-    assert!(v.contains("regression") && !v.contains("target"), "{v}");
-
-    let both = compare("pr", &[t], &["rate_per_s=990\n"], &[]);
-    let v = verdict(&stdout(&both), "B1");
-    assert!(v.contains("regression") && v.contains("target"), "{v}");
+    let missed = compare("pr", &[t], &["rate_per_s=990\n"], &[]);
+    assert_exit(&missed, 1);
+    assert_eq!(verdict(&stdout(&missed), "B1"), "FAIL (target)");
 }
 
 #[test]
@@ -568,7 +692,7 @@ fn partial_skips_metrics_absent_from_every_file() {
     assert_eq!(verdict(&text, "S2"), "SKIPPED");
     assert_eq!(
         summary_line(&text),
-        "perf-compare: 1 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 1 skipped"
+        "perf-compare: 1 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 1 skipped, 0 known gaps"
     );
 }
 
@@ -661,19 +785,19 @@ fn only_metrics_of_the_tier_are_reported() {
 fn the_pr_tier_uses_pr_baseline_when_there_is_one() {
     // The pr tier measures the background under file activity and the rc
     // tier without it, so a background metric carries a baseline for each.
+    // Without a target, the baseline judges the metric.
     let t = table(
         "B2",
         "a_ms",
         "lower",
         "pr rc",
-        "target = 5\nbaseline = 10\npr_baseline = 60\nallow_pct = 10\n",
+        "baseline = 10\npr_baseline = 60\nallow_pct = 10\n",
     );
-    // 62 is within 60 + 10% at the pr tier, where the pr baseline misses the
-    // target, so the allowance alone holds it...
+    // 62 is within 60 + 10% at the pr tier...
     let pr = compare("pr", std::slice::from_ref(&t), &["a_ms=62\n"], &[]);
     assert_exit(&pr, 0);
     let text = stdout(&pr);
-    assert_eq!(verdict(&text, "B2"), "PASS (target not yet met)");
+    assert_eq!(verdict(&text, "B2"), "PASS");
     assert_eq!(row(&text, "B2")[2], "60 ms", "the pr baseline is shown");
     assert_eq!(row(&text, "B2")[4], "+3.3%");
 
@@ -956,6 +1080,8 @@ fn json_output_has_the_same_fields() {
         "\"verdict\":\"NOT MEASURED\"",
         "\"not_measured\":1",
         "\"skipped\":0",
+        "\"known_gaps\":0",
+        "\"known_gap\":null",
         "\"result\":\"FAIL\"",
     ] {
         assert!(text.contains(want), "json lacks {want}:\n{text}");

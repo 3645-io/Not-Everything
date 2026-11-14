@@ -1,41 +1,44 @@
 # Performance gate
 
-Every change that ships is measured before its pull request against the metrics below. A change that misses a target, or is worse than the baseline by more than its allowance, is held until it is fixed or the owner approves it. Agents follow `.agents/rules/performance.md`; this page holds the definitions.
+Every change that ships is measured before its pull request against the metrics below. A change that misses a target is held until it is fixed, or the owner records the miss as a known gap. Agents follow `.agents/rules/performance.md`; this page holds the definitions.
 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
-- `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
-- The baseline is 0.6.0, the latest release, from its release candidates' rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
-- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is still 0.5.0's, measured at the pr tier on 14 Nov 2026: 0.6.0 had no pr-tier run, since the gate moves to absolute targets in 0.7.0.
+- `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, its target on the measuring Mac and on the slowest supported Mac, any known gap, its tiers and its baseline.
+- The targets are the owner's of 14 Nov 2026: what makes the app feel instant and light on the slowest Mac it supports, from perception and resource research, set out in the owner's targets document.
+- The baseline is 0.6.0, the latest release, from its release candidates' rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache. It is shown beside every value, and judges only the quick tier and any metric without a target. It moves only at a release.
+- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, shown at the pr tier. It is still 0.5.0's, measured at the pr tier on 14 Nov 2026.
 
 ## Tiers
 
 | Tier | When | Where | Time | What runs | On a failure |
 | --- | --- | --- | --- | --- | --- |
 | `quick` | After each change to a crate on the hot path | The owner's Mac | 1–3 min | The crate's benchmarks at small scale (200,000 entries), against the quick baseline; targets are not checked at small scale | Fixed before the next change |
-| `pr` | When the checks in `.agents/rules/runs.md` pass, before pushing | The M4 Pro, plugged in, nothing heavy running | About 30 min | Every metric marked P below at gate scale; 10 min with the window hidden and 10 min showing a search, under 20 file operations a second (`fx-bench churn`) | Re-run the step alone; still failing → fix it, or ask the owner. The summary goes in the PR |
+| `pr` | When the checks in `.agents/rules/runs.md` pass, before pushing | The M4 Pro, plugged in; the Mac can be in use, but the window steps need the screen | About 30 min | Every metric marked P below at gate scale; 10 min with the window hidden and 10 min showing a search, under 20 file operations a second (`fx-bench churn`) | Re-run the step alone; still missing its target → fix it, or ask the owner to record a known gap. The summary goes in the PR |
 | CI | Every pull request | GitHub | Seconds | `scripts/check-perf-report.sh`: a PR that changes shipped code must carry a passing `pr` summary, or the owner's approval to skip | The PR can't merge |
-| `rc` | Each release candidate, before it is built | The M4 Pro, and the 8 GB Mac when there is one | About 1.5 h | As `pr`, with 20 launches, and 30 min hidden and 30 min showing a search on the whole-disk index of a Mac in daily use; plus `scripts/phase1-gate.sh` warm and cold. The release script adds the DMG size after its build | No release |
+| `rc` | Each release candidate, before it is built | The M4 Pro (there is no budget for a dedicated M1, the owner's decision of 14 Nov 2026) | About 1.5 h | As `pr`, with 20 launches, and 30 min hidden and 30 min showing a search on the whole-disk index of a Mac in daily use; plus `scripts/phase1-gate.sh` warm and cold. The release script adds the DMG size after its build | No release |
 
-GitHub's shared macOS runners vary more between runs than the allowances, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
+GitHub's shared macOS runners vary too much between runs to time anything, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
 
 Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a locked screen the app's window can't come forward, so every probe that summons it times out: on 13 Nov 2026 the screen locked two minutes into an rc run, and all 50 shortcut presses of F3 timed out at 5 s. `perf-check.sh` refuses to start on a locked screen (exit 2, nothing changed), and checks again once it holds the lock. `run.txt` records the screen at the start and at the end, and notes each step after which it was locked.
 
-## Allowances
+## How the gate judges
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.6.0's first results during the first scan, F5, tracked until the first scan shows results as it goes), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
+At the pr and rc tiers a metric with a target is judged on it alone: it fails only when it misses the target, whatever its baseline. The owner chose this on 14 Nov 2026, after two days in which the old check, worse than the baseline by more than an allowance, tripped on the measuring Mac's state rather than the code.
 
-| Class | Metrics | Allowance |
+- **Two targets per metric.** The M1 target is what the slowest supported Mac, a base M1 MacBook Air with 8 GB, must meet. The gate's target, on the M4 Pro, is 0.6 of it for work on one core and 0.4 for search spread over all cores, from public Geekbench 6 scores (approximately: M1 2,350 single-core and 8,600 multi-core, the 12-core M4 Pro 3,840 and 22,300). Sizes, counts, memory per file and correctness are the same on both.
+- **Known gaps.** A target the current build misses, which the owner accepted until the work that fixes it lands, carries `known_gap` with that work. It reads `KNOWN GAP (<work>)`, is counted on the summary line, and doesn't fail. A pass that meets a known gap's target reads `PASS (known gap met at this tier)`: once every tier meets it, the owner removes the gap and the target blocks again.
+- **Near the limit.** A pass at 80% of its target or more reads `PASS (near limit: N% of target)`, so a slow drift shows before it fails.
+- **Per file.** `per_key` and `per_scale` divide a metric by another key: memory and the first scan per million files of the index, or the first scan's memory peak as a multiple of the hidden memory.
+- **One re-run.** Small numbers vary between identical runs, so a failing step is re-run alone once, and only a second failure counts.
+
+The quick tier runs at a small scale where the targets don't apply, so it compares with `quick_baseline` within an allowance, as a developer's aid. A metric without a target would be compared with its baseline the same way; every gated metric has a target.
+
+| Class | Metrics | Allowance at the quick tier |
 | --- | --- | --- |
 | Correctness | C1–C3 | None |
-| Sizes and memory | M1–M5, B7, O1 | 5%; M1 and M2 at least 30 MB |
-| Timings | S1–S7, F1, F3–F6 | 10% of the median of the runs, and at least the floor below |
+| Sizes and memory | M4, M5 | 5% |
+| Timings | S1, S3–S7, F1, F3, F6, F6u | 10%, and at least the floor in the baseline file |
 | Launch | F2 | 10% of the median of the launches |
-| Background | B1, B2, B4–B6 | 10%, and at least 0.05 points of a core, 5 mW or 0.5 wakeups a second |
-| Busiest interval | B3 | 25% |
-
-Small numbers vary a lot between identical runs: in 0.3.0, idle CPU ranged from 0.24% to 0.42% across three runs of one build, and engine search at 2M took 16.7 ms p95 in one run and 7.5 ms in another. So a failing step is re-run alone once, and only a second failure counts.
-
-M1 and M2 vary as much as their allowance. On 10 Nov, two runs of one build an hour apart read 1,383 and 1,317 MB with the window hidden, and 1,421 and 1,337 MB showing a search: the app's footprint starts each launch at a different level, and can step by about 70 MB in the middle of a phase without any CPU or disk activity. A failing M1 or M2 gets the same single re-run. Since 0.4.0 cut the footprint to about 125 MB, 5% is about 6 MB, while identical builds read 125 to 169 MB, so M1 and M2 allow at least 30 MB (the owner's decision of 11 Nov 2026).
 
 ## Metrics
 
@@ -43,15 +46,15 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 
 ### Background cost
 
-| ID | Metric | Key | Target | Allowance | Tiers |
-| --- | --- | --- | --- | --- | --- |
-| B1 | CPU, window hidden, average % of one core | `hidden_cpu_pct` | ≤1% | 10%, ≥0.05 points | P R |
-| B2 | CPU, window showing a search | `search_cpu_pct` | ≤5% | 10%, ≥0.05 points | P R |
-| B3 | CPU, busiest 10 s interval | `cpu_max_interval_pct` | ≤100% | 25% (it varies a lot between runs) | P R |
-| B4 | CPU energy, window hidden | `hidden_energy_mw` | ≤50 mW | 10%, ≥5 mW | P R |
-| B5 | CPU energy, window showing a search | `search_energy_mw` | ≤250 mW | 10%, ≥5 mW | P R |
-| B6 | Wakeups a second, window hidden | `hidden_wakeups_per_s` | ≤2 | 10%, ≥0.5 | P R |
-| B7 | Disk writes a day: those measured, scaled to a day, plus the projected index saves (below; tracked until its target is set at a realistic change rate, the owner's decision of 12 Nov 2026) | `disk_written_per_day_mb` | ≤512 MB | tracked | P R |
+| ID | Metric | Key | Target (M4 Pro) | M1 target | Known gap | Tiers |
+| --- | --- | --- | --- | --- | --- | --- |
+| B1 | CPU, window hidden, average % of one core | `hidden_cpu_pct` | ≤0.06% | ≤0.1% | Quiet background (run 2.21) | P R |
+| B2 | CPU, window showing a search | `search_cpu_pct` | ≤0.6% | ≤1% | Quiet background (run 2.21) | P R |
+| B3 | CPU, busiest 10 s interval (tracked until the file-change storm metric replaces it) | `cpu_max_interval_pct` | ≤100% | – | – | P R |
+| B4 | CPU energy, window hidden (tracked: it follows B1) | `hidden_energy_mw` | ≤50 mW | – | – | P R |
+| B5 | CPU energy, window showing a search (tracked: it follows B2) | `search_energy_mw` | ≤250 mW | – | – | P R |
+| B6 | Wakeups a second, window hidden | `hidden_wakeups_per_s` | ≤1 | ≤1 | Quiet background (run 2.21) | P R |
+| B7 | Disk writes a day: those measured, scaled to a day, plus the projected index saves (below) | `disk_written_per_day_mb` | ≤250 MB | ≤250 MB | Incremental saves (run 2.22) | P R |
 
 B7 adds the index saves a phase is too short to see. After each compaction the app saves its whole index to the store file, about 150 MB for a whole-disk index of 2M entries. The writer compacts when the files created since the last compaction, or the files deleted since then, pass 10% of the index's entries (at least 1,024): about every 200,000 at that scale, where a 10-minute phase at 20 operations a second creates about 6,000. So after each phase `perf-check.sh` runs `fx-bench saves`. It takes the store file the run's app saved (its size, and its entry count from `not-everything -get-result-count`) and the files `fx-bench churn` created and deleted in the phase, scales the larger of the two counts to a day, and projects one save of the store's size for every 10% of the entries in it. B7 is the measured writes plus that projection. At the pr tier's 20 operations a second, about half of them creates, that comes to about 4.3 saves a day: about 650 MB on the 2M-entry index. The summary shows the parts by phase, and fx-engine's `tests/compaction_saves.rs` checks the model against the real writer.
 
@@ -61,37 +64,38 @@ The compaction saves add to the daily save, with an upper bound. The daily save 
 
 ### Memory
 
-| ID | Metric | Key | Target | Allowance | Tiers |
-| --- | --- | --- | --- | --- | --- |
-| M1 | Footprint at the end of the hidden phase | `hidden_footprint_mb` | ≤200 MB | 5% | P R |
-| M2 | Footprint at the end of the search phase | `search_footprint_mb` | ≤250 MB | 5% | P R |
-| M3 | Footprint peak during the app's first scan | `first_scan_footprint_max_mb` | ≤500 MB | 5% | P R |
-| M4 | Index columns per entry | `bytes_per_entry` | ≤100 B | 5% | Q P R |
-| M5 | Saved index on disk per entry | `store_bytes_per_entry` | ≤100 B | 5% | Q P R |
+| ID | Metric | Key | Target (M4 Pro) | M1 target | Known gap | Tiers |
+| --- | --- | --- | --- | --- | --- | --- |
+| M1 | Footprint at the end of the hidden phase, per million files of its index | `hidden_footprint_mb` ÷ `hidden_index_entries` | ≤60 MB | ≤60 MB | – | P R |
+| M2 | Footprint at the end of the search phase, per million files | `search_footprint_mb` ÷ `search_index_entries` | ≤80 MB | ≤80 MB | Quiet background, under file activity (run 2.21) | P R |
+| M3 | Footprint peak during the app's first scan, as a multiple of M1's footprint | `first_scan_footprint_max_mb` ÷ `hidden_footprint_mb` | ≤2× | ≤2× | Lower scan peak (run 2.25) | P R |
+| M4 | Index columns per entry (a diagnostic, tracked) | `bytes_per_entry` | ≤100 B | – | – | Q P R |
+| M5 | Saved index on disk per entry | `store_bytes_per_entry` | ≤45 B | ≤45 B | Smaller index file, a later target (run 2.26) | Q P R |
 
 ### Search speed
 
-| ID | Metric | Key | Target | Allowance | Tiers |
-| --- | --- | --- | --- | --- | --- |
-| S1 | Engine search p95 at 2M entries (worst query) | `engine_ms` | ≤16 ms | 10%, ≥1 ms | Q P R |
-| S2 | Engine search p95 at 5M entries | `engine_5m_ms` | ≤30 ms | 10%, ≥1 ms | P R |
-| S3 | Regex search p95 at 2M | `regex_ms` | ≤100 ms | 10%, ≥1 ms | Q P R |
-| S4 | Full-path search p95 at 2M | `fullpath_ms` | ≤100 ms | 10%, ≥1 ms | Q P R |
-| S5 | Keystroke to repaint p95 | `keystroke_p95_ms` | ≤50 ms | 10%, ≥1 ms | Q P R |
-| S6 | Re-sort to repaint p95 | `sort_p95_ms` | ≤50 ms | 10%, ≥1 ms | Q P R |
-| S7 | Scroll frame time p95 | `scroll_p95_ms` | ≤8.3 ms (one 120 Hz frame) | 10%, ≥1 ms | Q P R |
+| ID | Metric | Key | Target (M4 Pro) | M1 target | Known gap | Tiers |
+| --- | --- | --- | --- | --- | --- | --- |
+| S1 | Engine search p95 at 2M entries (worst query; all cores) | `engine_ms` | ≤6 ms | ≤16 ms | Faster engine search (run 2.27) | Q P R |
+| S3 | Regex search p95 at 2M; the next keystroke cancels it | `regex_ms` | ≤100 ms | ≤250 ms | – | Q P R |
+| S4 | Full-path search p95 at 2M | `fullpath_ms` | ≤100 ms | ≤250 ms | – | Q P R |
+| S5 | Keystroke to repaint p95 | `keystroke_p95_ms` | ≤30 ms | ≤50 ms | – | Q P R |
+| S6 | Re-sort to repaint p95 | `sort_p95_ms` | ≤20 ms | ≤50 ms | – | Q P R |
+| S7 | Scroll frame time p95 | `scroll_p95_ms` | ≤5 ms | ≤8.3 ms (one 120 Hz frame) | – | Q P R |
+
+S2, the engine search at 5M entries, is gone; the 10M stress set, a later PR, replaces it.
 
 ### Freshness and start-up
 
-| ID | Metric | Key | Target | Allowance | Tiers |
-| --- | --- | --- | --- | --- | --- |
-| F1 | Create, rename or delete shown in an open result list, p99 | `freshness_p99_ms` | ≤1 s | 10%, ≥10 ms | Q P R |
-| F2 | Launch to first result painted | `launch_ms` | ≤2 s | 10% of the median | Q P R |
-| F3 | Shortcut to window ready, p95 (timed from the app's hotkey handler) | `summon_p95_ms` | ≤100 ms | 10%, ≥2 ms | Q P R |
-| F4 | First scan of the whole disk | `first_run_ms` | ≤15 s | 10% | P R |
-| F5 | First results shown during the first scan (tracked until progressive results are built) | `first_result_ms` | ≤2 s | tracked | P R |
-| F6 | Catch-up after a relaunch: index equal to a fresh scan | `catchup_ms` | ≤10 s | 10%, ≥10 ms | Q P R |
-| F6u | Catch-up after a relaunch: search usable | `catchup_usable_ms` | ≤2 s | 10%, ≥10 ms | Q P R |
+| ID | Metric | Key | Target (M4 Pro) | M1 target | Known gap | Tiers |
+| --- | --- | --- | --- | --- | --- | --- |
+| F1 | Create, rename or delete shown in an open result list, p99 | `freshness_p99_ms` | ≤500 ms | ≤500 ms | – | Q P R |
+| F2 | Launch to first result painted | `launch_ms` | ≤600 ms | ≤1 s | – | Q P R |
+| F3 | Shortcut to window ready, p95 (timed from the app's hotkey handler) | `summon_p95_ms` | ≤30 ms | ≤50 ms | – | Q P R |
+| F4 | First scan of the whole disk, per million files | `first_run_ms` ÷ `first_run_entries` | ≤7.5 s | ≤15 s | – | P R |
+| F5 | First results shown during the first scan | `first_result_ms` | ≤1 s | ≤2 s | Progressive first scan (run 2.24) | P R |
+| F6 | Catch-up after a relaunch: index equal to a fresh scan (10,000 changes; it becomes catch-up after a crash once saves are incremental) | `catchup_ms` | ≤3 s | ≤5 s | – | Q P R |
+| F6u | Catch-up after a relaunch: search usable | `catchup_usable_ms` | ≤150 ms | ≤250 ms | – | Q P R |
 
 ### Correctness
 
@@ -103,10 +107,10 @@ The compaction saves add to the daily save, with an upper bound. The daily save 
 
 ### Optional
 
-| ID | Metric | Key | Target | Allowance | Tiers |
-| --- | --- | --- | --- | --- | --- |
-| O1 | DMG size | `dmg_bytes` | none | 5% | R |
-| O2 | `not-everything` query time over a 2M-entry saved index (tracked) | `cli_query_ms` | ≤100 ms | tracked | Q P |
+| ID | Metric | Key | Target (M4 Pro) | Tiers |
+| --- | --- | --- | --- | --- |
+| O1 | DMG size (tracked) | `dmg_bytes` | none | R |
+| O2 | `not-everything` query time over a 2M-entry saved index | `cli_query_ms` | ≤200 ms | Q P |
 
 ## The soak
 
@@ -132,12 +136,13 @@ Every release candidate and release has a Performance section in its GitHub rele
 GitHub strips text colour from release notes, so each row carries a dot next to its words:
 
 - Change: 🟢 better · ⚪ the same, within 1% · 🟡 worse but within the allowed regression · 🔴 worse than the allowed regression.
-- Target met: 🟢 met · 🟡 not yet · 🔴 missed, though the previous release met it. An ungated metric adds "(tracked)".
+- Target met: 🟢 met · 🟡 a known gap, or not yet · 🔴 missed, though the previous release met it. An ungated metric adds "(tracked)".
 
 Each release's measured values are kept in `docs/gates/releases/<version>.txt` (the release script writes them to its output folder as `metrics-<label>.txt`), so the next release has its "previous" column. Hand-written notes for the section go in `notes.md` in the perf-check folder.
 
-## Changing the baseline
+## Changing a target, a known gap or the baseline
 
-- **At a release:** run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date. Run `scripts/perf-check.sh --tier pr --step background` on the same commit too, and copy its B1 to B6, M1 and M2 into `pr_baseline`, with `[meta]` `pr_build` and `pr_date`.
-- **By exception:** when the owner accepts a regression, the metric's table gets `exception = "<reason>, approved in #<PR>"` and the new value as its baseline (as its `pr_baseline` too, when the regression shows at the pr tier). `perf-compare` refuses an exception without a pull request number.
+- **A target** changes only in a PR the owner approves, with the measurements behind it.
+- **A known gap** is added or removed only with the owner's approval, naming the work that fixes it. Remove it once every tier meets its target.
+- **The baseline**, at a release: run `scripts/perf-check.sh --tier rc` on the release candidate, then `fx-bench perf-compare --print-values` on its `metrics.txt`, and copy the values into `perf-baseline.toml` with the build and date. Per-file metrics print their per-file value.
 - **Never** to make a failing check pass.

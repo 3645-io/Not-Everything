@@ -11,8 +11,12 @@
 //! - Change: 🟢 better · ⚪ the same (within 1%) · 🟡 worse, but within the
 //!   metric's allowed regression · 🔴 worse than the allowed regression,
 //!   measured from the previous release's value.
-//! - Target met: 🟢 met · 🟡 not yet · 🔴 missed, though the previous
-//!   release met it. An ungated metric adds "(tracked)".
+//! - Target met: 🟢 met · 🟡 a known gap (the gate file names the work that
+//!   fixes it), or not yet · 🔴 missed, though the previous release met it.
+//!   An ungated metric adds "(tracked)".
+//!
+//! A metric with `per_key` is shown divided in both releases' columns, as
+//! the gate judges it.
 //!
 //! The words stay next to the dots, so the table reads the same without
 //! colour.
@@ -22,6 +26,7 @@ use std::fmt::Write as _;
 use crate::gate::md_cell;
 use crate::perf::{
     Baseline, Better, Metric, Samples, allowance, at_most, misses_target, nearly_equal,
+    value_of_metric,
 };
 
 /// What `perf-release` renders.
@@ -61,7 +66,7 @@ pub fn render(input: &ReleaseInput) -> String {
     let _ = writeln!(
         out,
         "🟢 better, or target met · ⚪ the same, within 1% · 🟡 worse but within the \
-         allowed regression, or target not yet met · 🔴 worse than the allowed \
+         allowed regression, a known gap, or target not yet met · 🔴 worse than the allowed \
          regression, or a target {} met is missed\n",
         md_cell(prev)
     );
@@ -123,8 +128,10 @@ fn group_of(id: &str) -> &'static str {
 
 /// Metric, Target, previous, current, Change and Target met.
 fn row_cells(m: &Metric, input: &ReleaseInput) -> [String; 6] {
-    let prev = m.aggregate.apply(input.previous.get(&m.key));
-    let cur = m.aggregate.apply(input.current.get(&m.key));
+    // A metric whose divisor is missing reads as not measured, as in the
+    // gate's own report.
+    let prev = value_of_metric(m, input.previous).ok().flatten();
+    let cur = value_of_metric(m, input.current).ok().flatten();
     let shown =
         |v: Option<f64>| v.map_or_else(|| "not measured".to_string(), |v| value(&m.unit, v));
     [
@@ -257,6 +264,8 @@ fn met_cell(m: &Metric, prev: Option<f64>, cur: Option<f64>) -> String {
     };
     let verdict = if !misses_target(m, c) {
         "🟢 Met"
+    } else if m.known_gap.is_some() {
+        "🟡 Known gap"
     } else if prev.is_some_and(|p| !misses_target(m, p)) {
         "🔴 Missed"
     } else {
