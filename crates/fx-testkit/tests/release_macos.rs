@@ -15,11 +15,12 @@
 //!   Before each staple it checks that Apple's ticket covers the signed
 //!   items (their CDHash in the `notarytool log`);
 //! - it makes a drag-to-install disk image (the app and a shortcut to
-//!   /Applications, laid out by Finder or plain if Finder can't be
-//!   scripted, read-only UDZO, signed with the Developer ID) in a fresh
-//!   folder, and checks a quarantined copy of it (`hdiutil verify`,
-//!   `spctl --assess --type open`, `stapler validate`, the app inside with
-//!   `syspolicy_check distribution`) before writing the files; it detaches
+//!   /Applications, laid out by Finder, which it waits for; only a beta may
+//!   keep the plain layout; read-only UDZO, signed with the Developer ID)
+//!   in a fresh folder, and checks a quarantined copy of it (`hdiutil
+//!   verify`, `spctl --assess --type open`, `stapler validate`, the layout
+//!   with `has_layout`, the app inside with `syspolicy_check
+//!   distribution`) before writing the files; it detaches
 //!   every image it attaches, and its `mount_point` helper reads `hdiutil
 //!   attach`'s output;
 //! - the disk image is written, summed and published next to the zip;
@@ -764,32 +765,100 @@ fn script_makes_and_signs_the_disk_image_from_the_app() {
 }
 
 /// Finder lays out the window (fixed size, icon positions) on a read-write
-/// image; if Finder can't be scripted or macOS denies it, the image keeps
-/// the plain layout and the script says so instead of stopping.
+/// image. Finder lists a new disk about a second after it mounts, so its
+/// script waits for the disk, up to 10 s, instead of failing at once: on
+/// 14 Nov 2026 the 0.5.0 release and 0.6.0-RC-1 shipped Finder's plain
+/// window because it asked too soon. Without the layout, a release or an RC
+/// stops (`--resume` carries on once Finder can be scripted); only a beta
+/// keeps the plain layout and says so.
 #[test]
-fn script_lays_out_the_window_with_finder_or_says_it_could_not() {
+fn script_lays_out_the_window_with_finder_and_waits_for_the_disk() {
     let text = script_text();
     for needle in [
         r#"tell application "Finder""#,
+        "repeat 40 times",
+        "delay 0.25",
+        "if theDisk is not missing value then exit repeat",
         "set bounds of theWindow to",
         "set arrangement of viewOptions to not arranged",
         "set icon size of viewOptions to",
         "set position of item appName",
         r#"set position of item "Applications""#,
-        "plain layout",
     ] {
         assert!(text.contains(needle), "{SCRIPT} must use {needle:?}");
     }
-    let code = code_lines(&text);
+    let make = shell_function(&text, "make_dmg")
+        .unwrap_or_else(|| panic!("{SCRIPT} must define make_dmg"));
+    let code = code_lines(&make);
     let (_, osascript) = line_with_all(&code, &["osascript"], "run Finder's script");
     assert!(
         osascript.trim_start().starts_with("if osascript"),
-        "a failed Finder script must not stop the release: {osascript:?}"
+        "a failed Finder script is judged by the layout it left: {osascript:?}"
     );
     line_with_all(
         &code,
         &["attach_image", "-readwrite"],
         "attach the layout image read-write",
+    );
+    // The layout decides, whatever osascript returned.
+    let (check, _) = line_with_all(
+        &code,
+        &["if has_layout", r#""$MOUNTED""#, r#""$APP_NAME.app""#],
+        "check the saved layout",
+    );
+    let (beta, _) = line_with_all(
+        &code,
+        &["elif", r#""$CHANNEL" = beta"#],
+        "let only a beta keep the plain layout",
+    );
+    let (refuse, line) = line_with_all(
+        &code,
+        &["fail", "Finder did not lay out"],
+        "stop a release or an RC without the layout",
+    );
+    assert!(
+        line.contains("--resume"),
+        "the refusal names --resume: {line}"
+    );
+    let (convert, _) = line_with_all(&code, &["hdiutil convert"], "convert the layout image");
+    assert!(
+        check < beta && beta < refuse && refuse < convert,
+        "make_dmg must check the layout, allow a beta's plain one and refuse the rest before converting"
+    );
+}
+
+/// The quarantined copy of a release's or an RC's disk image must carry the
+/// layout too, so a plain window can't ship even if `make_dmg` changes.
+#[test]
+fn script_checks_the_layout_of_the_quarantined_disk_image() {
+    let code = code_lines(&script_text());
+    let (mount, _) = line_with_all(
+        &code,
+        &["attach_image", r#""$CHECK_DMG""#, "-readonly"],
+        "mount the copy read-only",
+    );
+    // Only a beta may ship the plain layout.
+    let (check, line) = line_with_all(
+        &code,
+        &[
+            r#"[ "$CHANNEL" = beta ] || has_layout"#,
+            r#""$MOUNTED""#,
+            r#""$APP_NAME.app""#,
+        ],
+        "check the copy's layout",
+    );
+    assert!(
+        line.trim_end().ends_with("||") && code[check + 1].trim_start().starts_with("fail "),
+        "a copy without the layout must stop the release: {line}"
+    );
+    let (write, _) = line_with_all(
+        &code,
+        &[r#"cp "$DMG" "$OUT/$APP_DMG""#],
+        "write the disk image",
+    );
+    assert!(
+        mount < check && check < write,
+        "the copy's layout is checked once it is mounted and before the files are written"
     );
 }
 
@@ -1151,13 +1220,20 @@ fn script_tags_and_publishes_only_with_publish() {
 fn script_documents_its_modes() {
     let text = script_text();
     for usage in [
-        "scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--publish] NEW_OUT_DIR",
-        "scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--publish]",
+        "scripts/release-macos.sh [--rc | --beta] [--perf PERF_DIR] [--targets-only] [--publish] NEW_OUT_DIR",
+        "scripts/release-macos.sh --resume OUT_DIR [--perf PERF_DIR] [--targets-only] [--publish]",
     ] {
         assert!(text.contains(usage), "{SCRIPT} usage must show {usage:?}");
     }
     let code = code_lines(&text).join("\n");
-    for option in ["--resume", "--rc", "--beta", "--publish", "--perf"] {
+    for option in [
+        "--resume",
+        "--rc",
+        "--beta",
+        "--publish",
+        "--perf",
+        "--targets-only",
+    ] {
         assert!(
             code.contains(option),
             "{SCRIPT} must handle the `{option}` option"
@@ -1172,6 +1248,7 @@ fn script_documents_its_modes() {
         "--perf PERF_DIR",
         "perf-check.sh --tier rc",
         "docs/gates/releases/",
+        "--targets-only",
     ] {
         assert!(
             header.contains(needle),
@@ -2807,6 +2884,320 @@ esac"#;
         repo.commit_all("other code");
         let out = plan(&repo, &["--rc", "--perf", &perf]);
         assert_refused(&out, 1, "its code differs", "a run of other code");
+    }
+
+    /// What the script says when the commit being built differs from the
+    /// measured one only in files no build compiles.
+    const SAME_CODE: &str = "differs from it only in documents, scripts and tests";
+
+    /// A run of a commit that differs from the one being built only in
+    /// documents (top-level `*.md` but THIRD-PARTY-NOTICES.md, which the app
+    /// and the command embed; crates' READMEs; `docs/`), scripts, CI, agent
+    /// rules and tests (`crates/*/tests/`) measured the same app, command and
+    /// benchmarks, so it passes: a change to the release tooling or to the
+    /// gate's baseline needs no second run. A change to anything else is
+    /// refused.
+    #[test]
+    fn perf_accepts_a_run_whose_commit_differs_only_in_docs_scripts_and_tests() {
+        let (repo, measured) = rc_with_previous_release("perf-docs-only");
+        let perf = perf_run(&repo, "perf-docs", &measured);
+        for (path, text) in [
+            ("docs/gates/perf-baseline.toml", "# moved\n"),
+            ("scripts/tool.sh", "#!/bin/sh\n"),
+            (".github/workflows/tool.yml", "name: tool\n"),
+            (".agents/rules/tool.md", "# Tool\n"),
+            ("crates/fx-tool/tests/tool.rs", "// a test\n"),
+            ("crates/fx-tool/README.md", "# fx-tool\n"),
+            ("TOOL.md", "# Tool\n"),
+        ] {
+            repo.write(path, text);
+        }
+        repo.commit_all("documents, scripts and tests");
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(SAME_CODE),
+            "the script must say why it takes the run\n{}",
+            describe(&out)
+        );
+
+        for (path, what) in [
+            ("crates/fx-tool/src/lib.rs", "a crate's code"),
+            ("crates/fx-tool/examples/bench.rs", "a benchmark"),
+            ("crates/fx-tool/Cargo.toml", "a crate's manifest"),
+            ("crates/fx-tool/assets/icon.svg", "an asset"),
+            ("crates/fx-tool/src/notes.md", "a document a crate embeds"),
+            ("THIRD-PARTY-NOTICES.md", "the notices the app embeds"),
+            ("Cargo.lock", "the lock file"),
+        ] {
+            repo.write(path, "changed\n");
+            repo.commit_all(what);
+            let out = plan(&repo, &["--rc", "--perf", &perf]);
+            assert_refused(&out, 1, "its code differs", &format!("a change to {what}"));
+            repo.git(&["reset", "--quiet", "--hard", "HEAD~1"]);
+        }
+    }
+
+    // -- On targets only (--targets-only). ---------------------------------
+
+    /// What the script says when, on targets only, a metric misses its
+    /// target.
+    const MISSES_TARGET: &str = "misses its target";
+    /// What it says when the failing metrics can't be told from the report.
+    const CANNOT_TELL: &str = "cannot tell which metrics failed";
+    /// The table's header in perf-compare's report.
+    const TABLE_HEAD: &str = "| ID | Metric | Baseline | Measured | Change | Target | Verdict |\n\
+                              | --- | --- | --- | --- | --- | --- | --- |\n";
+
+    /// A finished rc-tier run of `git` in `repo`'s `target/name` whose
+    /// `summary.md` holds `rows` (perf-compare's table) and `last`.
+    fn table_run(repo: &Sandbox, name: &str, git: &str, rows: &str, last: &str) -> String {
+        let dir = repo.dir.join("target").join(name);
+        let perf = write_perf_run(&dir, git, last);
+        fs::write(
+            dir.join("summary.md"),
+            format!("# Performance gate: rc tier\n\n{TABLE_HEAD}{rows}\n{last}\n"),
+        )
+        .unwrap();
+        perf
+    }
+
+    /// Rows of perf-compare's table: one passing metric, two that failed
+    /// only their regression check, a tracked one that would fail both, and
+    /// the DMG size, which is measured after the build.
+    const REGRESSED_ROWS: &str = "\
+| S1 | Search, 2M files (p95) | 7.136 ms | 7.279 ms | +2.0% | <= 16 ms | PASS |
+| S7 | Scroll frame time (p95) | 1.12 ms | 2.78 ms | +148.2% | <= 8.3 ms | FAIL (regression) |
+| F6 | Catch-up after a relaunch | 503.312 ms | 564.545 ms | +12.2% | <= 10000 ms | FAIL (regression) |
+| F5 | First results during the first scan | 12514 ms | 12755 ms | +1.9% | <= 2000 ms | TRACKED (would be FAIL: target, regression) |
+| O1 | DMG size | 4334877 bytes | - | - | - | NOT MEASURED (no dmg_bytes samples) |
+";
+    /// The count line under [`REGRESSED_ROWS`].
+    const REGRESSED_LINE: &str =
+        "perf-compare: 1 pass, 2 fail, 1 not measured, 0 no baseline, 1 tracked, 0 skipped";
+
+    /// `--targets-only` judges `--perf`'s run, so it needs `--perf` (which a
+    /// beta never takes), and comes once.
+    #[test]
+    fn targets_only_needs_perf_and_comes_once() {
+        let repo = release_repo("targets-usage", "0.2.0");
+        for args in [
+            &["--rc", "--targets-only", "x"][..],
+            &["--targets-only", "x"],
+            &["--beta", "--targets-only", "x"],
+            &[
+                "--rc",
+                "--perf",
+                "a",
+                "--targets-only",
+                "--targets-only",
+                "x",
+            ],
+            &["--resume", "x", "--targets-only"],
+        ] {
+            let out = repo.run(SCRIPT, args);
+            assert_refused(&out, 2, "usage:", &format!("{args:?} is a usage error"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("[--targets-only]"), "{}", describe(&out));
+        }
+    }
+
+    /// With `--targets-only`, a run whose failing metrics failed only their
+    /// regression check (each still meets its target) passes, and the Plan
+    /// names them; without it, the same run is refused. A tracked metric
+    /// that would miss its target doesn't count, as without the option.
+    #[test]
+    fn targets_only_passes_regressions_that_meet_their_targets() {
+        let (repo, head) = rc_with_previous_release("targets-pass");
+        let perf = table_run(
+            &repo,
+            "perf-regressed",
+            &head,
+            REGRESSED_ROWS,
+            REGRESSED_LINE,
+        );
+        let out = plan(&repo, &["--rc", "--perf", &perf]);
+        assert_refused(&out, 1, DID_NOT_PASS, "regressions without --targets-only");
+
+        for args in [
+            &["--rc", "--perf", &perf, "--targets-only"][..],
+            &["--rc", "--targets-only", "--perf", &perf],
+        ] {
+            let out = plan(&repo, args);
+            assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("judged on targets only")
+                    && stdout.contains("beyond their allowance: S7 F6"),
+                "the Plan must say the run is judged on targets and name S7 and F6\n{}",
+                describe(&out)
+            );
+        }
+
+        // A passing run says it is judged on targets, with nothing beyond.
+        let perf = perf_run(&repo, "perf-passing", &head);
+        let out = plan(&repo, &["--rc", "--perf", &perf, "--targets-only"]);
+        assert_planned_with_perf(&out, "release/v0.2.0-RC-1", "0.2.0-RC-1", "0.1.3");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("judged on targets only") && !stdout.contains("beyond"),
+            "{}",
+            describe(&out)
+        );
+    }
+
+    /// With `--targets-only`, a metric that misses its target is refused,
+    /// naming it, and so is a run whose failing metrics the report doesn't
+    /// show (a count of failures with fewer FAIL rows).
+    #[test]
+    fn targets_only_refuses_a_missed_target_or_an_unclear_report() {
+        let (repo, head) = rc_with_previous_release("targets-refuse");
+        let missed = "\
+| S3 | Regex search, 2M files (p95) | 53.756 ms | 101.2 ms | +88.3% | <= 100 ms | FAIL (target, regression) |
+| S7 | Scroll frame time (p95) | 1.12 ms | 2.78 ms | +148.2% | <= 8.3 ms | FAIL (regression) |
+";
+        let target_only = "\
+| M1 | Memory, window hidden | 210 MB | 210 MB | +0.0% | <= 200 MB | FAIL (target) |
+";
+        let line = |fail: u32| {
+            format!(
+                "perf-compare: 20 pass, {fail} fail, 1 not measured, 0 no baseline, 2 tracked, 0 skipped"
+            )
+        };
+        for (i, (rows, last, phrase, id)) in [
+            (missed, line(2), MISSES_TARGET, "S3"),
+            (target_only, line(1), MISSES_TARGET, "M1"),
+            ("", line(10), CANNOT_TELL, ""),
+            (REGRESSED_ROWS, line(3), CANNOT_TELL, ""),
+            ("", "No verdicts.".to_owned(), DID_NOT_PASS, ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let perf = table_run(&repo, &format!("perf-refused-{i}"), &head, rows, &last);
+            let out = plan(&repo, &["--rc", "--perf", &perf, "--targets-only"]);
+            assert_refused(&out, 1, phrase, &format!("case {i}"));
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(id),
+                "the refusal must name {id}\n{}",
+                describe(&out)
+            );
+        }
+    }
+
+    /// A `.DS_Store` holding a record of each `(file name, type)`, as Finder
+    /// writes them: the name's length in UTF-16 units (big-endian u32), the
+    /// name in UTF-16BE, the four-letter type, then a data type and value.
+    fn ds_store(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 1, b'B', b'u', b'd', b'1'];
+        for (name, kind) in records {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            bytes.extend_from_slice(&(units.len() as u32).to_be_bytes());
+            for u in units {
+                bytes.extend_from_slice(&u.to_be_bytes());
+            }
+            bytes.extend_from_slice(kind.as_bytes());
+            bytes.extend_from_slice(b"blob");
+            bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0x96, 0, 0xa0]);
+        }
+        bytes
+    }
+
+    /// `has_layout` passes a volume whose `.DS_Store` holds the window's
+    /// settings (`bwsp`), its icon view (`icvp`) and the positions (`Iloc`)
+    /// of the app and the Applications shortcut, as 0.5.0-RC-1's disk image
+    /// does, and fails one without the file (0.6.0-RC-1's) or missing any of
+    /// them.
+    #[test]
+    fn has_layout_needs_the_window_view_and_both_icon_positions() {
+        let dir = temp_path("has-layout");
+        fs::create_dir_all(&dir).unwrap();
+        let app = "Not-Everything Preview.app";
+        let full = [
+            (".", "bwsp"),
+            (".", "icvp"),
+            (".", "vSrn"),
+            ("Applications", "Iloc"),
+            (app, "Iloc"),
+        ];
+        let check = |records: Option<Vec<(&str, &str)>>| {
+            let store = dir.join(".DS_Store");
+            let _ = fs::remove_file(&store);
+            if let Some(records) = records {
+                fs::write(&store, ds_store(&records)).unwrap();
+            }
+            let body = format!(
+                "if has_layout '{}' '{app}'; then echo laid-out; else echo plain; fi",
+                dir.display()
+            );
+            let out = run_functions(&["has_layout"], &body, &[]);
+            assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(check(Some(full.to_vec())), "laid-out", "every record");
+        assert_eq!(check(None), "plain", "no .DS_Store");
+        assert_eq!(check(Some(Vec::new())), "plain", "an empty .DS_Store");
+        for missing in 0..full.len() {
+            let mut records = full.to_vec();
+            let (name, kind) = records.remove(missing);
+            if kind == "vSrn" {
+                // The view's version isn't part of the layout.
+                assert_eq!(check(Some(records)), "laid-out");
+                continue;
+            }
+            assert_eq!(
+                check(Some(records)),
+                "plain",
+                "without {name}'s {kind} record"
+            );
+        }
+        // Another app's position doesn't count for this one.
+        let mut other = full.to_vec();
+        other[4] = ("Not-Everything.app", "Iloc");
+        assert_eq!(check(Some(other)), "plain", "another app's position");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `check_targets` reads perf-compare's report: it prints the IDs of the
+    /// metrics that failed only their regression check, refuses a missed
+    /// target, and, asked for `all`, an unmeasured gated metric (the DMG
+    /// size is measured by then). Only the last section counts.
+    #[test]
+    fn check_targets_reads_the_last_section_of_the_report() {
+        let dir = temp_path("check-targets");
+        fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.md");
+        let run = |text: &str, which: &str| {
+            fs::write(&report, text).unwrap();
+            let body = format!("check_targets '{}' {which}", report.display());
+            run_functions(&["check_targets"], &body, &[])
+        };
+        let regressed = format!("{TABLE_HEAD}{REGRESSED_ROWS}\n{REGRESSED_LINE}\n");
+        let out = run(&regressed, "before");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+        let out = run(&regressed, "all");
+        assert_refused(&out, 1, "not measured", "an unmeasured metric with all");
+
+        let measured = regressed
+            .replace(
+                "| - | - | - | NOT MEASURED (no dmg_bytes samples) |",
+                "| 4400000 bytes | +1.5% | - | PASS |",
+            )
+            .replace("1 not measured", "0 not measured");
+        let out = run(&measured, "all");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+
+        // An earlier section's failures don't count; the last one's do.
+        let passing =
+            "perf-compare: 30 pass, 0 fail, 0 not measured, 0 no baseline, 0 tracked, 0 skipped";
+        let out = run(&format!("{regressed}\n{TABLE_HEAD}\n{passing}\n"), "all");
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+        let out = run(&format!("{TABLE_HEAD}\n{passing}\n\n{regressed}"), "before");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "S7 F6");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The table compares with the previous release, the highest

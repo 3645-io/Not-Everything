@@ -15,6 +15,7 @@ Not-Everything now has a right-click menu on its results, and ⌘C copies the fi
 
 ### Fixed
 
+- **The disk image opens on its laid-out window again**: the app on the left and Applications on the right, with large icons. 0.5.0's and 0.6.0-RC-1's opened on Finder's plain window, because the release script asked Finder for the new disk before Finder had listed it. A release can no longer ship without the layout.
 - **An extra save of the index.** When the once-a-day save found the index already saved, the next file change was saved at once, whatever you were doing at that moment, instead of waiting for the next quiet moment a day later.
 
 ### Known limits
