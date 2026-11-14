@@ -364,6 +364,41 @@ fn target_met_is_green_yellow_or_red() {
     assert_eq!(detail_row(&text, "O1")[6], "–");
 }
 
+/// A missed target the gate file records as a known gap reads as such,
+/// whether or not the previous release met it.
+#[test]
+fn a_known_gap_reads_as_one() {
+    for id in ["B1", "F6"] {
+        let baseline = BASELINE.replace(
+            &format!("[{id}]\n"),
+            &format!("[{id}]\nknown_gap = \"The work that fixes it\"\n"),
+        );
+        let out = release(&baseline, PREVIOUS, CURRENT, &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+        assert_eq!(detail_row(&stdout(&out), id)[6], "🟡 Known gap", "{id}");
+    }
+}
+
+/// A metric divided by another key (`per_key`, `per_scale`) is shown
+/// divided in both releases' columns.
+#[test]
+fn a_per_key_metric_is_divided_in_both_releases() {
+    let baseline = BASELINE.replace(
+        "[M1]\n",
+        "[M1]\nper_key = \"entries\"\nper_scale = 1000000\n",
+    );
+    let previous = format!("{PREVIOUS}entries=2000000\n");
+    let current = format!("{CURRENT}entries=2000000\n");
+    let out = release(&baseline, &previous, &current, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let row = detail_row(&stdout(&out), "M1").join(" | ");
+    // 1318.4 and 1350 MB over 2 million files, shown to three figures.
+    assert!(
+        row.contains("| 659 MB |") && row.contains("| 675 MB |"),
+        "{row}"
+    );
+}
+
 #[test]
 fn a_metric_without_a_value_says_not_measured() {
     let text = section();

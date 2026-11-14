@@ -31,20 +31,32 @@
 //!    reported while `scale_min` is set): NOT MEASURED, because a number
 //!    measured at a smaller scale says nothing about the gate's scale.
 //! 3. The value is the `aggregate` of every sample of the key.
-//! 4. The target is checked at the pr and rc tiers; the quick tier runs at
-//!    a small scale where the targets don't apply. An `equal` target is the
-//!    exception: it is checked at every tier, because it states correctness
-//!    (a count or a flag), not speed, and `equal` metrics have no other
-//!    check.
-//! 5. The regression check compares with `quick_baseline` at the quick tier
-//!    and `baseline` otherwise, allowing max(baseline × `allow_pct` / 100,
-//!    `allow_floor`). No baseline for the tier gives NO BASELINE, which is
-//!    not a failure: the first run sets the baseline.
+//!    With `per_key`, it is divided by the median of that key's samples
+//!    over `per_scale` (1000000: per million files; 1: a multiple of
+//!    another metric); without samples of `per_key` the metric is NOT
+//!    MEASURED.
+//! 4. At the pr and rc tiers a metric with a target is judged on the target
+//!    alone: the owner chose on 14 Nov 2026 that a build fails only when it
+//!    misses a target users can feel, not when it is slower than a stored
+//!    baseline on a measuring Mac whose state varies. A missed target the
+//!    gate file records as a `known_gap` (the work that fixes it) is KNOWN
+//!    GAP and doesn't fail; a pass says when it meets a known gap's target,
+//!    so the gap can be removed once every tier meets it, and the target
+//!    blocks again. A pass at 80% of its target or more is flagged as near
+//!    the limit, except for a yes-or-no (`bool`) metric. The quick tier runs at a
+//!    small scale where the targets don't apply; an `equal` target is
+//!    checked at every tier, because it states correctness (a count or a
+//!    flag), not speed.
+//! 5. The regression check, against `quick_baseline` at the quick tier and
+//!    `baseline` otherwise, allowing max(baseline × `allow_pct` / 100,
+//!    `allow_floor`), applies at the quick tier and to a metric without a
+//!    target. No baseline for the tier gives NO BASELINE, which is not a
+//!    failure: the first run sets the baseline.
 //! 6. An ungated metric (`gated = false`) is TRACKED and shows what its
 //!    verdict would have been; it never fails the gate.
 //!
 //! The gate passes when no gated metric is FAIL or NOT MEASURED
-//! ([`gate_passes`]).
+//! ([`gate_passes`]); a KNOWN GAP is reported and counted, but passes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -256,6 +268,16 @@ pub struct Metric {
     pub baseline_date: Option<String>,
     /// Why the baseline moved unusually, naming the PR as `#<number>`.
     pub exception: Option<String>,
+    /// The slowest supported Mac's target (a base M1 with 8 GB), shown
+    /// beside `target`, which is the measuring Mac's gate.
+    pub m1_target: Option<f64>,
+    /// A missed target the owner accepted until the named work lands:
+    /// KNOWN GAP instead of FAIL.
+    pub known_gap: Option<String>,
+    /// Divides the value by the median of this key over `per_scale`.
+    pub per_key: Option<String>,
+    /// 1000000 for a value per million of `per_key`, 1 for a multiple of it.
+    pub per_scale: Option<f64>,
 }
 
 /// A parsed baseline file.
@@ -286,6 +308,10 @@ pub const METRIC_KEYS: &[&str] = &[
     "baseline_build",
     "baseline_date",
     "exception",
+    "m1_target",
+    "known_gap",
+    "per_key",
+    "per_scale",
 ];
 
 /// The keys the `[meta]` table may hold, all strings. `summary` lists
@@ -613,6 +639,49 @@ fn build_metric(
         }
     }
 
+    let known_gap = string("known_gap")?;
+    if let Some((text, line)) = &known_gap {
+        if text.trim().is_empty() {
+            return Err(err(
+                *line,
+                format!("'known_gap' in [{id}] must not be empty: name the work that fixes it"),
+            ));
+        }
+    }
+    let per_key = string("per_key")?;
+    if let Some((k, line)) = &per_key {
+        if !valid_metric_key(k) {
+            return Err(err(
+                *line,
+                format!("'per_key' in [{id}] must be made of a-z, 0-9 and '_', got '{k}'"),
+            ));
+        }
+    }
+    let per_scale = number("per_scale")?;
+    match (&per_key, &per_scale) {
+        (Some((_, line)), None) => {
+            return Err(err(
+                *line,
+                format!(
+                    "'per_key' in [{id}] needs a 'per_scale' (1000000 for per million, 1 for a multiple)"
+                ),
+            ));
+        }
+        (None, Some((_, line))) => {
+            return Err(err(
+                *line,
+                format!("'per_scale' in [{id}] needs a 'per_key' to divide by"),
+            ));
+        }
+        (Some(_), Some((scale, line))) if *scale <= 0.0 => {
+            return Err(err(
+                *line,
+                format!("'per_scale' in [{id}] must be positive"),
+            ));
+        }
+        _ => {}
+    }
+
     Ok(Metric {
         id: t.id.clone(),
         line: t.line,
@@ -634,6 +703,10 @@ fn build_metric(
         baseline_build: string("baseline_build")?.map(|(s, _)| s),
         baseline_date: string("baseline_date")?.map(|(s, _)| s),
         exception: exception.map(|(s, _)| s),
+        m1_target: number("m1_target")?.map(|(n, _)| n),
+        known_gap: known_gap.map(|(s, _)| s),
+        per_key: per_key.map(|(s, _)| s),
+        per_scale: per_scale.map(|(n, _)| n),
     })
 }
 
@@ -650,8 +723,13 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A field name: a lowercase letter, then lowercase letters, digits and
+/// `_` (`m1_target`).
 fn valid_bare_key(key: &str) -> bool {
-    !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    key.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Metric keys as the benchmarks print them.
@@ -793,6 +871,9 @@ pub enum Verdict {
     NotMeasured(String),
     /// No baseline for the tier; not a failure.
     NoBaseline,
+    /// A missed target the gate file accepts until the named work lands;
+    /// not a failure.
+    KnownGap(String),
     /// An ungated metric, with the verdict it would have had.
     Tracked(Box<Verdict>),
     /// Absent from every metrics file in a partial run.
@@ -808,6 +889,7 @@ impl Verdict {
             Verdict::Fail { .. } => "FAIL",
             Verdict::NotMeasured(_) => "NOT MEASURED",
             Verdict::NoBaseline => "NO BASELINE",
+            Verdict::KnownGap(_) => "KNOWN GAP",
             Verdict::Tracked(_) => "TRACKED",
             Verdict::Skipped => "SKIPPED",
         }
@@ -850,6 +932,7 @@ impl Verdict {
         match self {
             Verdict::Fail { .. } => format!("FAIL ({})", self.failed_checks().join(", ")),
             Verdict::NotMeasured(r) => format!("NOT MEASURED ({r})"),
+            Verdict::KnownGap(work) => format!("KNOWN GAP ({work})"),
             Verdict::Tracked(inner) => format!("TRACKED (would be {})", inner.nested_text()),
             v => v.label().to_string(),
         }
@@ -860,6 +943,7 @@ impl Verdict {
         match self {
             Verdict::Fail { .. } => format!("FAIL: {}", self.failed_checks().join(", ")),
             Verdict::NotMeasured(r) => format!("NOT MEASURED: {r}"),
+            Verdict::KnownGap(work) => format!("KNOWN GAP: {work}"),
             v => v.text(),
         }
     }
@@ -888,9 +972,13 @@ pub struct Row {
     pub target: Option<f64>,
     /// Whether the target was checked at this tier.
     pub target_checked: bool,
-    /// The baseline itself misses the target and so does the value: only
-    /// the allowance holds the metric until a change meets the target.
-    pub target_pending: bool,
+    /// The slowest supported Mac's target, shown beside `target`.
+    pub m1_target: Option<f64>,
+    /// The work that fixes a known gap, when the gate file names one.
+    pub known_gap: Option<String>,
+    /// A pass at 80% of the target or more: the value's share of it, in
+    /// percent.
+    pub near_limit_pct: Option<f64>,
     pub verdict: Verdict,
     pub gated: bool,
     pub exception: Option<String>,
@@ -910,13 +998,16 @@ impl Row {
         (base != 0.0).then(|| (now - base) * 100.0 / base.abs())
     }
 
-    /// The Verdict column: [`Verdict::text`], with a pending target noted
-    /// on a pass.
+    /// The Verdict column: [`Verdict::text`], with a pass noted when it
+    /// meets a known gap's target (the gap can be removed) or comes near
+    /// the target.
     pub fn verdict_text(&self) -> String {
-        if self.target_pending && self.verdict == Verdict::Pass {
-            "PASS (target not yet met)".to_string()
-        } else {
-            self.verdict.text()
+        match (&self.verdict, &self.known_gap, self.near_limit_pct) {
+            (Verdict::Pass, Some(_), _) if self.target_checked && self.target.is_some() => {
+                "PASS (known gap met at this tier)".to_string()
+            }
+            (Verdict::Pass, _, Some(pct)) => format!("PASS (near limit: {pct:.0}% of target)"),
+            (v, _, _) => v.text(),
         }
     }
 
@@ -942,6 +1033,29 @@ pub fn compare(baseline: &Baseline, samples: &Samples, tier: Tier, partial: bool
         .collect()
 }
 
+/// The metric's value: the aggregate of its key's samples, divided by the
+/// median of `per_key`'s samples over `per_scale` when it has one. `Ok(None)`
+/// when its key has no samples; an error, the reason it is not measured,
+/// when `per_key` has none or reads 0.
+pub(crate) fn value_of_metric(m: &Metric, samples: &Samples) -> Result<Option<f64>, String> {
+    let Some(value) = m.aggregate.apply(samples.get(&m.key)) else {
+        return Ok(None);
+    };
+    let (Some(per), Some(scale)) = (&m.per_key, m.per_scale) else {
+        return Ok(Some(value));
+    };
+    let Some(divisor) = Aggregate::Median.apply(samples.get(per)) else {
+        return Err(format!("no {per} samples"));
+    };
+    if divisor == 0.0 {
+        return Err(format!("{per} is 0"));
+    }
+    Ok(Some(value / (divisor / scale)))
+}
+
+/// A pass at 80% of its target or more is near the limit.
+const NEAR_LIMIT: f64 = 0.8;
+
 fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
     let base = match tier {
         Tier::Quick => m.quick_baseline,
@@ -949,15 +1063,26 @@ fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
         Tier::Rc => m.baseline,
     };
     let target_checked = tier != Tier::Quick || m.better == Better::Equal;
-    let pending = target_checked && target_pending(m, base);
-    let value = m.aggregate.apply(samples.get(&m.key));
-    let verdict = match value {
-        None if partial => Verdict::Skipped,
-        None => gated(m, Verdict::NotMeasured(format!("no {} samples", m.key))),
-        Some(v) => gated(
-            m,
-            check(m, samples, tier, v, base, target_checked && !pending),
+    let (value, verdict) = match value_of_metric(m, samples) {
+        Ok(None) if partial => (None, Verdict::Skipped),
+        Ok(None) => (
+            None,
+            gated(m, Verdict::NotMeasured(format!("no {} samples", m.key))),
         ),
+        Err(why) => (None, gated(m, Verdict::NotMeasured(why))),
+        Ok(Some(v)) => (
+            Some(v),
+            gated(m, check(m, samples, tier, v, base, target_checked)),
+        ),
+    };
+    // A yes-or-no metric has no limit to be near.
+    let near_limit_pct = match (value, m.target, &verdict) {
+        (Some(v), Some(t), Verdict::Pass) if target_checked && m.unit != "bool" => {
+            share_of_target(m.better, v, t)
+                .filter(|share| *share >= NEAR_LIMIT - 1e-9)
+                .map(|share| share * 100.0)
+        }
+        _ => None,
     };
     Row {
         id: m.id.clone(),
@@ -969,21 +1094,23 @@ fn judge(m: &Metric, samples: &Samples, tier: Tier, partial: bool) -> Row {
         value,
         target: m.target,
         target_checked,
-        // Noted only while the value still misses the target too.
-        target_pending: pending && value.is_some_and(|v| misses_target(m, v)),
+        m1_target: m.m1_target,
+        known_gap: m.known_gap.clone(),
+        near_limit_pct,
         verdict,
         gated: m.gated,
         exception: m.exception.clone(),
     }
 }
 
-/// Whether the baseline itself misses a `lower` or `higher` target. Until a
-/// change meets the target (0.3.1's memory, for example, at 1.5 GB against
-/// 200 MB), only the allowance holds the metric, so it can't get worse while
-/// its fix is pending, and pull requests don't all fail in the meantime. An
-/// `equal` target has no allowance to fall back on, so it is always checked.
-fn target_pending(m: &Metric, base: Option<f64>) -> bool {
-    m.better != Better::Equal && base.is_some_and(|b| misses_target(m, b))
+/// How much of its target a value uses: value / target for a ceiling,
+/// target / value for a floor; none for an exact target.
+fn share_of_target(better: Better, value: f64, target: f64) -> Option<f64> {
+    match better {
+        Better::Lower if target > 0.0 => Some(value / target),
+        Better::Higher if value > 0.0 => Some(target / value),
+        _ => None,
+    }
 }
 
 /// Whether `value` misses the metric's target; false without one.
@@ -1033,19 +1160,27 @@ fn check(
         }
     }
     let target = target_checked && misses_target(m, value);
-    let regression = base.is_some_and(|b| {
-        let allow = allowance(m, b);
-        match m.better {
-            Better::Lower => !at_most(value, b + allow),
-            Better::Higher => !at_most(b - allow, value),
-            // An exact value has no allowance to compare; the target is
-            // its check.
-            Better::Equal => false,
+    // At the pr and rc tiers a target decides alone (module docs, 4).
+    let target_only = tier != Tier::Quick && m.target.is_some();
+    let regression = !target_only
+        && base.is_some_and(|b| {
+            let allow = allowance(m, b);
+            match m.better {
+                Better::Lower => !at_most(value, b + allow),
+                Better::Higher => !at_most(b - allow, value),
+                // An exact value has no allowance to compare; the target is
+                // its check.
+                Better::Equal => false,
+            }
+        });
+    if target && !regression {
+        if let Some(work) = &m.known_gap {
+            return Verdict::KnownGap(work.clone());
         }
-    });
+    }
     if target || regression {
         Verdict::Fail { target, regression }
-    } else if base.is_none() {
+    } else if base.is_none() && !target_only {
         Verdict::NoBaseline
     } else {
         Verdict::Pass
@@ -1081,6 +1216,7 @@ pub struct Counts {
     pub no_baseline: usize,
     pub tracked: usize,
     pub skipped: usize,
+    pub known_gaps: usize,
 }
 
 impl Counts {
@@ -1095,18 +1231,26 @@ impl Counts {
                 Verdict::NoBaseline => c.no_baseline += 1,
                 Verdict::Tracked(_) => c.tracked += 1,
                 Verdict::Skipped => c.skipped += 1,
+                Verdict::KnownGap(_) => c.known_gaps += 1,
             }
         }
         c
     }
 
     /// `perf-compare: <p> pass, <f> fail, <n> not measured, <b> no
-    /// baseline, <t> tracked, <s> skipped`.
+    /// baseline, <t> tracked, <s> skipped, <k> known gaps`. The known gaps
+    /// come last, so readers of the earlier fields keep working.
     pub fn line(&self) -> String {
         format!(
             "perf-compare: {} pass, {} fail, {} not measured, {} no baseline, {} tracked, \
-             {} skipped",
-            self.pass, self.fail, self.not_measured, self.no_baseline, self.tracked, self.skipped
+             {} skipped, {} known gaps",
+            self.pass,
+            self.fail,
+            self.not_measured,
+            self.no_baseline,
+            self.tracked,
+            self.skipped,
+            self.known_gaps
         )
     }
 }
@@ -1149,7 +1293,14 @@ pub fn render_markdown(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
         let target = r.target.map_or_else(
             || "-".to_string(),
             |t| {
-                let t = format!("{} {}", r.better.sign(), with_unit(t, &r.unit));
+                let mut t = format!("{} {}", r.better.sign(), with_unit(t, &r.unit));
+                if let Some(m1) = r.m1_target {
+                    t.push_str(&format!(
+                        " (M1: {} {})",
+                        r.better.sign(),
+                        with_unit(m1, &r.unit)
+                    ));
+                }
                 if r.target_checked {
                     t
                 } else {
@@ -1209,8 +1360,8 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
             format!(
                 "{{\"id\":{},\"name\":{},\"key\":{},\"unit\":{},\"better\":{},\"gated\":{},\
                  \"baseline\":{},\"now\":{},\"change_pct\":{},\"target\":{},\
-                 \"target_checked\":{},\"target_pending\":{},\"verdict\":{},\"failed\":[{}],\
-                 \"reason\":{},\"would_be\":{},\"exception\":{}}}",
+                 \"target_checked\":{},\"m1_target\":{},\"known_gap\":{},\"near_limit_pct\":{},\
+                 \"verdict\":{},\"failed\":[{}],\"reason\":{},\"would_be\":{},\"exception\":{}}}",
                 json_string(&r.id),
                 json_string(&r.name),
                 json_string(&r.key),
@@ -1222,7 +1373,9 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
                 opt_num(r.change_pct()),
                 opt_num(r.target),
                 r.target_checked,
-                r.target_pending,
+                opt_num(r.m1_target),
+                opt_str(r.known_gap.as_deref()),
+                opt_num(r.near_limit_pct),
                 json_string(r.verdict.label()),
                 failed.join(","),
                 opt_str(r.verdict.reason()),
@@ -1235,7 +1388,7 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
     format!(
         "{{\"tier\":{},\"meta\":{{\"machine\":{},\"cache\":{},\"build\":{},\"date\":{},\
          \"pr_build\":{},\"pr_date\":{}}},\"metrics\":[{}],\"counts\":{{\"pass\":{},\"fail\":{},\"not_measured\":{},\
-         \"no_baseline\":{},\"tracked\":{},\"skipped\":{}}},\"result\":{}}}",
+         \"no_baseline\":{},\"tracked\":{},\"skipped\":{},\"known_gaps\":{}}},\"result\":{}}}",
         json_string(tier.as_str()),
         opt_str(meta.machine.as_deref()),
         opt_str(meta.cache.as_deref()),
@@ -1250,6 +1403,7 @@ pub fn render_json(meta: &Meta, tier: Tier, rows: &[Row]) -> String {
         c.no_baseline,
         c.tracked,
         c.skipped,
+        c.known_gaps,
         json_string(if gate_passes(rows) { "PASS" } else { "FAIL" }),
     )
 }
@@ -1462,6 +1616,13 @@ tiers = "pr"
             ("exception = \"\"\n", 8, "#<number>"),
             ("exception = \"approved\"\n", 8, "#<number>"),
             ("exception = \"see # 12\"\n", 8, "#<number>"),
+            ("known_gap = \"\"\n", 8, "empty"),
+            ("known_gap = 3\n", 8, "quoted string"),
+            ("m1_target = \"16\"\n", 8, "must be a number"),
+            ("per_key = \"Bad Key\"\nper_scale = 1\n", 8, "per_key"),
+            ("per_key = \"entries\"\n", 8, "needs a 'per_scale'"),
+            ("per_scale = 1000\n", 8, "needs a 'per_key'"),
+            ("per_key = \"entries\"\nper_scale = 0\n", 9, "positive"),
         ];
         for &(extra, line, needle) in cases {
             let (got_line, message) = err_line(&metric_with(extra));
@@ -1593,6 +1754,31 @@ tiers = "pr"
         compare(&b, &s, tier, false).remove(0).verdict
     }
 
+    /// At the pr and rc tiers a target decides alone; the quick tier, and a
+    /// metric without a target, still compare with the baseline.
+    #[test]
+    fn a_target_replaces_the_regression_check_at_pr_and_rc() {
+        let m = one("target = 20\nbaseline = 5\nquick_baseline = 5\nallow_pct = 10\n");
+        for tier in [Tier::Pr, Tier::Rc] {
+            assert_eq!(verdict_of(&m, tier, "k=15"), Verdict::Pass, "{tier}");
+            assert_eq!(
+                verdict_of(&m, tier, "k=21"),
+                Verdict::Fail {
+                    target: true,
+                    regression: false
+                },
+                "{tier}"
+            );
+        }
+        assert_eq!(
+            verdict_of(&m, Tier::Quick, "k=15"),
+            Verdict::Fail {
+                target: false,
+                regression: true
+            }
+        );
+    }
+
     #[test]
     fn allowance_takes_the_larger_of_percent_and_floor() {
         let m = one("baseline = 1.0\nallow_pct = 10\nallow_floor = 1\n");
@@ -1629,6 +1815,14 @@ tiers = "pr"
             "TRACKED (would be FAIL: regression)"
         );
         assert_eq!(Verdict::Skipped.text(), "SKIPPED");
+        let gap = Verdict::KnownGap("Quiet background".into());
+        assert_eq!(gap.text(), "KNOWN GAP (Quiet background)");
+        assert_eq!(gap.label(), "KNOWN GAP");
+        assert!(!gap.fails_gate());
+        assert_eq!(
+            Verdict::Tracked(Box::new(gap)).text(),
+            "TRACKED (would be KNOWN GAP: Quiet background)"
+        );
         assert!(!Verdict::Tracked(Box::new(fail)).fails_gate());
         assert!(Verdict::NotMeasured(String::new()).fails_gate());
         assert!(!Verdict::NoBaseline.fails_gate());
