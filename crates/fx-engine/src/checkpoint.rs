@@ -28,7 +28,7 @@ use fx_model::{EntryId, ResumeCursor, VolumeId};
 use fx_sort::{Order, SortKey};
 use fx_store::{MappedIndex, SaveInput, StoreError, create_private_dir, write_checkpoint};
 
-use crate::snapshot::{ENGINE_SORT_KEYS, EngineSnapshot};
+use crate::snapshot::{ENGINE_SORT_KEYS, EngineSnapshot, settled};
 
 /// Why a checkpoint was not written.
 #[derive(Debug)]
@@ -111,17 +111,27 @@ pub(crate) fn load(path: &Path) -> Option<Loaded> {
                 [(_, only)] => Some(*only),
                 _ => None,
             });
+        // The checksums prove the saved orders are the bytes written, and
+        // `verify_checksums` that each is a permutation of the live
+        // entries, but not that they are sorted by this build's rules: a
+        // build that sorts names differently (a changed rule, or another
+        // Unicode version's case folding) saves orders this build would
+        // read as unsorted. The writer merges every batch into the orders
+        // by halving, which assumes they are sorted, so a wrong order would
+        // spread and stay wrong until a rebuild. Every order is checked
+        // here, and a store whose orders fail is served with orders built
+        // afresh from its index. `validate_all` checks the Name order by
+        // comparing names, then the others by its ranks, in parallel.
         let orders: Option<Vec<Order>> = ENGINE_SORT_KEYS
             .iter()
             .map(|&key| {
-                let order = Order {
+                Some(Order {
                     key,
                     ids: mapped.order(order_code(key)?)?.to_vec(),
-                };
-                order.validate(&*snap).ok()?;
-                Some(order)
+                })
             })
-            .collect();
+            .collect::<Option<Vec<Order>>>()
+            .filter(|orders| Order::validate_all(orders, &*snap).is_ok());
         (orders, cursor)
     };
     Some(Loaded {
@@ -424,7 +434,9 @@ impl Checkpoints {
         if !clean && self.latest_saved(current) {
             return Ok(());
         }
-        let snap = current.load_full();
+        // Never the snapshot of an in-place merge, which has no orders: the
+        // store would then have none to load.
+        let snap = settled(current);
         self.write_snapshot(path, &snap, current, clean)
     }
 
@@ -455,7 +467,7 @@ impl Checkpoints {
             QuitSave::Skip => {}
             QuitSave::WaitForRunning => drop(lock(&self.save_lock)),
             QuitSave::Write => {
-                let snap = current.load_full();
+                let snap = settled(current);
                 self.write_snapshot(path, &snap, current, false)?;
             }
         }
@@ -684,7 +696,9 @@ mod tests {
                 db_uuid: [7; 16],
             }),
             generation,
+            hide_offline: false,
             priority: None,
+            orders_pending: false,
         }
     }
 

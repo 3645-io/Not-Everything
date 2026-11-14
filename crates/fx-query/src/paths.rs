@@ -376,6 +376,9 @@ pub(crate) struct PathCache {
     folded: HashMap<(u32, FoldOptions), Rc<str>>,
     /// Scratch space for the folder memos.
     pub scratch: Scratch,
+    /// The name under test, folded, when the view has no folded copy of it
+    /// (`Entry::with_hay` in the matcher).
+    pub fold_buf: Vec<u8>,
 }
 
 impl PathCache {

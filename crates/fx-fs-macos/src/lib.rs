@@ -13,17 +13,23 @@
 //! * `enumerator` (macOS only) holds `MacScanner`, which implements
 //!   `fx_fs::VolumeEnumerator` on top of `scan` and emits `fx_model::Entry`
 //!   values in parent-before-child order.
+//! * [`budget`] is the channel the streaming scan sends through, bounded by
+//!   the heap its messages hold rather than by their number.
 //! * [`fsevents`] is the FSEvents change source: a hand-written binding
 //!   (macOS only) with a per-volume stream that replays from a saved
 //!   `fx_model::ResumeCursor`, the `FsEventsSource` `fx_fs::ChangeSource`
 //!   on top of it (macOS only), plus the cross-platform event-flag
 //!   classifier, the pure event-to-`Change` mapping and the cursor logic.
 //! * `path_stat` (macOS only) holds `MacPathStat`, the `lstat`-based
-//!   `fx_fs::PathStat` that keys entries like `MacScanner` and never
+//!   `fx_fs::PathStat` that keys entries like `MacScanner`, names them as
+//!   the volume stores them, whatever spelling the path used, and never
 //!   materializes cloud files.
 //! * [`volumes`] is the mount table: `getfsstat` (macOS only) and the pure
-//!   mount policy. Only `/` is indexed in the MVP; every other mount point
-//!   is listed but not entered, and network mounts are never entered.
+//!   mount policy. `/` is indexed, and with [`volumes::ExternalVolumes`]
+//!   the external APFS, HFS+, FAT and exFAT volumes in `/Volumes` too (run
+//!   2.4); every other mount point is listed but not entered, and network
+//!   mounts are never entered. `fsevents::volumes_source` watches the
+//!   external volumes and reports their mounts and unmounts.
 //! * [`firmlinks`] parses `/usr/share/firmlinks` and folds
 //!   `/System/Volumes/Data/...` paths onto their canonical `/` form, so the
 //!   Data volume is never indexed twice.
@@ -37,6 +43,7 @@
 //!   that the non-FDA mode hands to the scanner.
 
 pub mod attrbuf;
+pub mod budget;
 pub mod cloud;
 pub mod fda;
 pub mod firmlinks;

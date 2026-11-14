@@ -94,15 +94,15 @@ dependencies = [
 
 [[package]]
 name = "fx-bench"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-channel"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-channel",
  "fx-engine",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "fx-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "fx-bench",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "fx-fs"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-model",
  "regex",
@@ -141,25 +141,26 @@ dependencies = [
 
 [[package]]
 name = "fx-fs-linux"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-fs-macos"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-bench",
  "fx-fs",
  "fx-model",
+ "fx-testkit",
  "libc",
 ]
 
 [[package]]
 name = "fx-fs-windows"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-index"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "fx-bench",
@@ -168,15 +169,15 @@ dependencies = [
 
 [[package]]
 name = "fx-ipc"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-model"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-bench",
  "memchr",
@@ -187,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "fx-sort"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-bench",
  "fx-index",
@@ -197,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "fx-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "fx-bench",
@@ -211,18 +212,18 @@ dependencies = [
 
 [[package]]
 name = "fx-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-channel",
 ]
 
 [[package]]
 name = "fx-ui-gtk"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "fx-ui-macos"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fx-bench",
  "fx-channel",
@@ -242,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "fx-ui-win32"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "gethostname"

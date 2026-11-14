@@ -21,6 +21,8 @@
 //!   Access;
 //! - its quick-tier map from crates to steps is the one the agent rule
 //!   (`.agents/rules/performance.md`) lists;
+//! - the soak (C3) runs only when asked for with `--step soak` at the rc
+//!   tier, in the scratch folder, and is in no default list of steps;
 //! - `check-perf-report.sh` passes a pull request that changes no shipped
 //!   code, or whose description has a passing summary of a run with no
 //!   skipped step or the owner's approval to skip, fails one without, and
@@ -193,6 +195,44 @@ fn perf_check_runs_file_activity_where_the_app_indexes_it() {
     }
 }
 
+/// B7 ("Disk writes a day") adds the index saves the background phases are
+/// too short to see (`docs/gates/performance.md`): `fx-bench saves` projects
+/// them from the store this run's app saved, its entry count and the
+/// phase's scripted file activity, and B7 is the measured writes plus that
+/// projection, never the measured writes alone.
+#[test]
+fn perf_check_adds_the_projected_index_saves_to_b7() {
+    let code = code();
+    let text = code.join("\n");
+    for needle in [
+        "\"$BIN/fx-bench\" saves",
+        "-get-result-count",
+        "churn_creates",
+        "churn_deletes",
+        "churn_seconds",
+        "--measured-per-day",
+    ] {
+        assert!(
+            text.contains(needle),
+            "{SCRIPT}: B7's projection needs {needle}"
+        );
+    }
+    assert!(
+        text.contains("\"$OUT\"/bg-data/stores"),
+        "{SCRIPT}: the saved store must be the run's own, in its data folder"
+    );
+    let b7: Vec<&String> = code
+        .iter()
+        .filter(|l| l.contains("emit disk_written_per_day_mb"))
+        .collect();
+    assert_eq!(b7.len(), 1, "{SCRIPT}: B7 is emitted in one place: {b7:?}");
+    assert!(
+        b7[0].contains("_disk_written_with_saves_per_day_bytes"),
+        "{SCRIPT}: B7 must add the projected saves: {}",
+        b7[0].trim()
+    );
+}
+
 /// The quick tier's crate-to-steps map in the script and the table in the
 /// agent rule are the same, so the rule never promises a step the script
 /// doesn't run.
@@ -250,6 +290,40 @@ fn quick_steps_match_the_agent_rule() {
     );
 }
 
+/// The soak (C3) runs for hours, so it runs only when asked for: never in
+/// a default list of steps, always in the scratch folder in `$TMPDIR`, and
+/// its `soak_differences` goes to the metrics.
+#[test]
+fn perf_check_runs_the_soak_only_when_asked() {
+    let code = code();
+    let soaks: Vec<&String> = code.iter().filter(|l| l.contains("\"$EX/soak\"")).collect();
+    assert!(!soaks.is_empty(), "{SCRIPT} must run the soak example");
+    for line in &soaks {
+        assert!(
+            line.contains("--dir \"$SCRATCH\"") && line.contains("--duration"),
+            "{SCRIPT}: the soak must run for its duration in the scratch folder: {}",
+            line.trim()
+        );
+    }
+    let text = code.join("\n");
+    assert!(
+        text.contains("emit soak_differences"),
+        "{SCRIPT} must report soak_differences"
+    );
+    let defaults: Vec<&String> = code
+        .iter()
+        .filter(|l| l.trim_start().starts_with("STEPS=\""))
+        .collect();
+    assert!(!defaults.is_empty(), "{SCRIPT} must set default steps");
+    for line in defaults {
+        assert!(
+            !line.contains("soak"),
+            "{SCRIPT}: the soak must not be a default step: {}",
+            line.trim()
+        );
+    }
+}
+
 #[cfg(unix)]
 mod refusals {
     use super::*;
@@ -298,6 +372,76 @@ mod refusals {
             assert_refused(&res, 2, phrase, &format!("{args:?}"));
             assert!(!out_dir.exists(), "{args:?} must not create --out");
         }
+    }
+
+    #[test]
+    fn refuses_bad_soak_arguments_before_creating_anything() {
+        let out_dir = temp_path("perf-check-soak-refused");
+        let out = out_dir.to_str().unwrap();
+        let cases: [(&[&str], &str); 5] = [
+            (
+                &["--tier", "pr", "--out", out, "--step", "soak"],
+                "--step soak runs at the rc tier only",
+            ),
+            (
+                &["--tier", "quick", "--out", out, "--step", "soak"],
+                "--step soak runs at the rc tier only",
+            ),
+            (
+                &[
+                    "--tier",
+                    "rc",
+                    "--out",
+                    out,
+                    "--step",
+                    "soak",
+                    "--soak-minutes",
+                    "ten",
+                ],
+                "--soak-minutes must be a whole number",
+            ),
+            (
+                &[
+                    "--tier",
+                    "rc",
+                    "--out",
+                    out,
+                    "--step",
+                    "soak",
+                    "--soak-minutes",
+                    "0",
+                ],
+                "--soak-minutes must be above 0",
+            ),
+            (
+                &["--tier", "rc", "--out", out, "--soak-minutes", "5"],
+                "--soak-minutes needs --step soak",
+            ),
+        ];
+        for (args, phrase) in cases {
+            let res = run(args);
+            assert_refused(&res, 2, phrase, &format!("{args:?}"));
+            assert!(!out_dir.exists(), "{args:?} must not create --out");
+        }
+    }
+
+    /// A valid soak request gets past every argument check: without cargo
+    /// on PATH it stops there, before building or creating anything.
+    #[test]
+    fn accepts_the_soak_at_the_rc_tier() {
+        let dir = temp_path("perf-check-soak-accepted");
+        let res = run(&[
+            "--tier",
+            "rc",
+            "--out",
+            dir.to_str().unwrap(),
+            "--step",
+            "soak",
+            "--soak-minutes",
+            "1440",
+        ]);
+        assert_refused(&res, 2, "cargo is not on PATH", "a valid soak request");
+        assert!(!dir.exists(), "--out must not be created without cargo");
     }
 
     #[test]

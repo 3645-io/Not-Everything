@@ -73,6 +73,14 @@
 //! saved cursor, falling back to a full rescan when the store is missing or
 //! rejected, or the source reports a gap.
 //!
+//! External volumes (run 2.4, [`EngineConfig::with_volumes_folder`]): a
+//! volume mounted in the volumes folder is indexed like any folder the
+//! change source reports. When it is unmounted, its entries stay, re-keyed
+//! onto a reserved offline volume ID ([`EngineSnapshot::is_offline`]), and
+//! rescans keep them until a volume mounted with its name replaces them.
+//! Searches ([`Engine::search`], [`StoreReader::search`]) leave offline
+//! entries out until the interface has a marker for them.
+//!
 //! Read-only access (for the command line): [`StoreReader::open`] loads a
 //! checkpoint without a change source, threads or any write to the store,
 //! and [`StoreReader::search`] answers queries over it with the same query
@@ -290,7 +298,9 @@ impl Engine {
                 orders: Arc::clone(&orders),
                 cursor: config.resume_from(),
                 generation: 0,
+                hide_offline: paths::has_offline(&index, config.root(), config.volumes_folder()),
                 priority: group.clone(),
+                orders_pending: false,
             }),
             subscribers: Mutex::new(Vec::new()),
             // Catching up with a startup rescan counts as recovering.
@@ -329,6 +339,9 @@ impl Engine {
             group,
             group_stale: false,
             fresh_base: false,
+            volumes_folder: config.volumes_folder().map(std::path::Path::to_path_buf),
+            next_offline: None,
+            in_place_cost: None,
         };
         let handle = thread::Builder::new()
             .name("fx-engine-writer".into())
@@ -629,10 +642,15 @@ impl Engine {
         }
     }
 
-    /// The latest published snapshot. Lock-free: never waits for the
-    /// writer, which keeps working on the next one.
+    /// The latest published snapshot. Lock-free: it doesn't wait for the
+    /// writer, which keeps working on the next one, except while the
+    /// writer merges a batch into the sort orders in place (only while no
+    /// window shows, and only when no reader holds the previous snapshot):
+    /// then it waits for that merge, a few milliseconds per million
+    /// entries, rather than hand out the snapshot whose orders the writer
+    /// took over.
     pub fn snapshot(&self) -> Arc<EngineSnapshot> {
-        self.shared.current.load_full()
+        snapshot::settled(&self.shared.current)
     }
 
     /// A channel that receives the generation of every snapshot published

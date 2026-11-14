@@ -14,6 +14,11 @@
 #          hidden and 30 showing a search with no scripted activity (the Mac
 #          in daily use), plus the DMG size with --dmg.
 #
+# The soak (C3) runs only when named: --step soak at the rc tier runs the
+# engine over a fresh folder in the scratch folder under a seeded stream of
+# random file operations for --soak-minutes (default 1440, 24 h) and counts
+# the differences from a fresh scan. It holds the lock for that long.
+#
 # Output in <out>: one <step>.log per step, metrics.txt (the metric=value
 # lines perf-compare reads), summary.md (the table that goes in the PR) and
 # run.txt (machine, build, load). The exit code is perf-compare's: 0 when
@@ -50,6 +55,7 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
                              [--machine LABEL] [--cache warm|cold]
                              [--baseline FILE] [--bg-minutes N]
                              [--churn-rate N] [--query TEXT] [--dmg FILE]
+                             [--soak-minutes N]
 
   --tier TIER       quick, pr or rc (see docs/gates/performance.md)
   --out NEW_DIR     directory for the logs and summary.md; must not exist yet
@@ -57,7 +63,8 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
                     e.g. --only fx-query. Unmeasured metrics are then SKIPPED
   --step STEP       run only this step (repeatable), to re-run one benchmark
                     alone: matcher, startup, catchup, freshness, first-run,
-                    cli, gate-probe, summon, sort, background, dmg
+                    cli, gate-probe, summon, sort, background, dmg; and
+                    soak (rc tier only), which no tier runs by itself
   --machine LABEL   machine label for run.txt (default: the CPU and memory)
   --cache STATE     warm (default) or cold (the first run after a reboot)
   --baseline FILE   default docs/gates/perf-baseline.toml
@@ -67,6 +74,7 @@ usage: scripts/perf-check.sh --tier quick|pr|rc --out NEW_DIR
   --query TEXT      the search shown in the "showing a search" phase
                     (default "report")
   --dmg FILE        rc tier: the release candidate's DMG, for its size
+  --soak-minutes N  with --step soak: how long the soak runs (default 1440)
 
 Run it from a quiet Mac: plugged in, nothing heavy running. cargo must be on
 PATH. The script never runs sudo or flushes caches itself.
@@ -94,10 +102,11 @@ BG_MINUTES=""
 CHURN_RATE=""
 QUERY=report
 DMG=""
+SOAK_MINUTES=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --tier | --out | --only | --step | --machine | --cache | --baseline | --bg-minutes | --churn-rate | --query | --dmg)
+        --tier | --out | --only | --step | --machine | --cache | --baseline | --bg-minutes | --churn-rate | --query | --dmg | --soak-minutes)
             [ $# -ge 2 ] || die_usage "$1 needs a value"
             case "$1" in
                 --tier) TIER=$2 ;;
@@ -111,6 +120,7 @@ while [ $# -gt 0 ]; do
                 --churn-rate) CHURN_RATE=$2 ;;
                 --query) QUERY=$2 ;;
                 --dmg) DMG=$2 ;;
+                --soak-minutes) SOAK_MINUTES=$2 ;;
             esac
             shift 2
             ;;
@@ -152,12 +162,21 @@ fi
 if [ -n "$DMG" ] && [ ! -f "$DMG" ]; then
     die_usage "--dmg '$DMG' is not a file"
 fi
+if [ -n "$SOAK_MINUTES" ]; then
+    is_count "$SOAK_MINUTES" || die_usage "--soak-minutes must be a whole number, got '$SOAK_MINUTES'"
+    [ "$SOAK_MINUTES" -gt 0 ] || die_usage "--soak-minutes must be above 0"
+fi
 for s in $STEPS; do
     case "$s" in
         matcher | startup | catchup | freshness | first-run | cli | gate-probe | summon | sort | background | dmg) ;;
+        soak) [ "$TIER" = rc ] || die_usage "--step soak runs at the rc tier only" ;;
         *) die_usage "unknown --step '$s'" ;;
     esac
 done
+case " $STEPS " in
+    *" soak "*) : "${SOAK_MINUTES:=1440}" ;;
+    *) [ -z "$SOAK_MINUTES" ] || die_usage "--soak-minutes needs --step soak" ;;
+esac
 if [ -e "$OUT" ] || [ -L "$OUT" ]; then
     echo "perf-check: '$OUT' already exists; pass a new directory (nothing was changed)" >&2
     exit 2
@@ -385,6 +404,9 @@ displays() {
     if wants background; then
         echo "background: $BG_MINUTES min per phase, churn $CHURN_RATE ops/s, query '$QUERY'"
     fi
+    if wants soak; then
+        echo "soak: $SOAK_MINUTES min, seed 1"
+    fi
 } >"$OUT/run.txt"
 
 LOAD1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print int($2) }')
@@ -585,9 +607,49 @@ stop_app() {
     fi
 }
 
+# project_saves LABEL: B7's index saves (docs/gates/performance.md). A phase
+# is too short to reach a compaction, after which the app rewrites its whole
+# store (about 150 MB for a whole-disk index, every 200,000 or so files
+# created or deleted), so `fx-bench saves` projects a day of them at the
+# phase's pace: from the store this run's app saved, its entry count and
+# the files churn created and deleted. Its total, the measured writes plus
+# the projected saves, is what B7 reads; without it B7 is not measured.
+project_saves() {
+    label=$1
+    # The app's one store in its data folder: stores/ with Full Disk Access,
+    # stores-limited/ without; the larger, should there be both.
+    store=""
+    for f in "$OUT"/bg-data/stores/*.fxstore "$OUT"/bg-data/stores-limited/*.fxstore; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        if [ -z "$store" ] || [ "$(stat -f %z "$f")" -gt "$(stat -f %z "$store")" ]; then
+            store=$f
+        fi
+    done
+    if [ -z "$store" ]; then
+        note "saves $label: the app saved no store in its data folder; B7 not measured"
+        return 0
+    fi
+    # Every entry of the saved index: an empty search matches them all.
+    entries=$("$BIN/not-everything" -store "$store" -get-result-count 2>>"$OUT/saves_$label.log" || true)
+    if [ "$CHURN_RATE" -gt 0 ]; then
+        creates=$(value_of churn_creates "$OUT/churn-$label.log" | tail -1)
+        deletes=$(value_of churn_deletes "$OUT/churn-$label.log" | tail -1)
+        seconds=$(value_of churn_seconds "$OUT/churn-$label.log" | tail -1)
+    else
+        # No scripted file activity, so nothing to project.
+        creates=0
+        deletes=0
+        seconds=$BG_SECONDS
+    fi
+    measured=$(value_of "${label}_disk_written_per_day_bytes" "$OUT/sample-$label/metrics.txt")
+    run_step "saves_$label" "$BIN/fx-bench" saves --label "$label" --entries "$entries" \
+        --save-bytes "$(stat -f %z "$store")" --creates "$creates" --deletes "$deletes" \
+        --duration "$seconds" --measured-per-day "$measured"
+}
+
 # background_phase LABEL WINDOW-ARGS...: launches the app on the run's data
 # folder, runs churn (when the rate is above 0) and samples the app for the
-# phase's length.
+# phase's length, then projects the phase's index saves.
 background_phase() {
     label=$1
     shift
@@ -607,6 +669,7 @@ background_phase() {
         CHURN_PID=""
     fi
     stop_app
+    project_saves "$label"
 }
 
 step_background() {
@@ -633,8 +696,36 @@ step_background() {
         emit "${label}_wakeups_per_s" $(value_of "${label}_wakeups_per_s" "$m")
         emit "${label}_footprint_mb" $(mb $(value_of "${label}_footprint_bytes" "$m"))
         emit cpu_max_interval_pct $(value_of "${label}_cpu_max_interval_pct" "$m")
-        emit disk_written_per_day_mb $(mb $(value_of "${label}_disk_written_per_day_bytes" "$m"))
+        # B7: the measured writes plus the projected index saves; their parts
+        # are kept beside it for the summary.
+        s="$OUT/saves_$label.log"
+        emit disk_written_per_day_mb $(mb $(value_of "${label}_disk_written_with_saves_per_day_bytes" "$s"))
+        emit "${label}_disk_written_measured_per_day_mb" $(mb $(value_of "${label}_disk_written_per_day_bytes" "$m"))
+        emit "${label}_compaction_saves_per_day_mb" $(mb $(value_of "${label}_compaction_saves_per_day_bytes" "$s"))
+        emit "${label}_compactions_per_day" $(value_of "${label}_compactions_per_day" "$s")
+        emit "${label}_save_mb" $(mb $(value_of "${label}_save_bytes" "$s"))
+        emit "${label}_index_entries" $(value_of "${label}_entries" "$s")
         emit "${label}_minutes" "$BG_MINUTES"
+    done
+}
+
+# B7's parts by phase, after the summary, so it shows what the projection
+# added.
+b7_breakdown() {
+    echo
+    echo "B7, disk writes a day, by phase: the writes measured, plus the index saves projected at the phase's rate of files created or deleted (each compaction rewrites the whole store)."
+    echo
+    echo "| Phase | Measured | Compactions a day | One save | Projected saves | B7 |"
+    echo "| --- | --- | --- | --- | --- | --- |"
+    for label in hidden search; do
+        total=$(mb $(value_of "${label}_disk_written_with_saves_per_day_bytes" "$OUT/saves_$label.log"))
+        total=${total:+$total MB}
+        printf '| %s | %s MB | %s | %s MB | %s MB | %s |\n' "$label" \
+            "$(value_of "${label}_disk_written_measured_per_day_mb" "$METRICS")" \
+            "$(value_of "${label}_compactions_per_day" "$METRICS")" \
+            "$(value_of "${label}_save_mb" "$METRICS")" \
+            "$(value_of "${label}_compaction_saves_per_day_mb" "$METRICS")" \
+            "${total:-not measured}"
     done
 }
 
@@ -643,7 +734,18 @@ step_dmg() {
     emit dmg_bytes "$(stat -f %z "$DMG")"
 }
 
-for s in matcher startup catchup freshness first-run cli gate-probe summon sort background dmg; do
+step_soak() {
+    # C3: the engine with the real FSEvents source over a fresh folder in
+    # the scratch folder, under a seeded stream of random file operations,
+    # compared with a fresh scan every 30 s and restarted from its saved
+    # index every 10 checks. The soak removes its own folder at the end.
+    run_step soak "$EX/soak" --duration "${SOAK_MINUTES}m" --dir "$SCRATCH" --seed 1
+    emit soak_differences $(value_of soak_differences "$OUT/soak.log")
+    emit soak_ops $(value_of soak_ops "$OUT/soak.log")
+    emit soak_minutes $(value_of soak_minutes "$OUT/soak.log")
+}
+
+for s in matcher startup catchup freshness first-run cli gate-probe summon sort background soak dmg; do
     wants "$s" || continue
     case "$s" in
         matcher) step_matcher ;;
@@ -656,6 +758,7 @@ for s in matcher startup catchup freshness first-run cli gate-probe summon sort 
         summon) step_summon ;;
         sort) step_sort ;;
         background) step_background ;;
+        soak) step_soak ;;
         dmg) [ -n "$DMG" ] && step_dmg ;;
     esac
 done
@@ -670,5 +773,8 @@ set -- --baseline "$BASELINE" --tier "$TIER" --out "$OUT/summary.md"
 [ "$PARTIAL" -eq 0 ] || set -- "$@" --partial
 status=0
 "$BIN/fx-bench" perf-compare "$@" "$METRICS" || status=$?
+if wants background && [ -f "$OUT/summary.md" ]; then
+    b7_breakdown >>"$OUT/summary.md"
+fi
 note "perf-compare exit code: $status (summary in $OUT/summary.md)"
 exit "$status"

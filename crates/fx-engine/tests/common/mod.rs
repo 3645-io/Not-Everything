@@ -103,7 +103,9 @@ impl TreeState {
     }
 
     fn insert(&mut self, parent: FileKey, name: &str, kind: EntryKind, size: u64) -> FileKey {
-        let k = key(self.next_id);
+        // An entry is on its folder's volume (a mounted volume's root
+        // starts a new one: `FakeTree::mount`).
+        let k = FileKey::new(parent.volume, self.next_id);
         self.next_id += 1;
         let t = self.tick();
         self.entries.insert(
@@ -180,6 +182,24 @@ impl FakeTree {
     /// Creates a folder; its parent must exist.
     pub fn mkdir(&self, path: &str) -> FileKey {
         self.lock().create(path, EntryKind::Dir, 0)
+    }
+
+    /// Mounts a volume at `path`: a folder keyed on volume `volume` (like
+    /// a mount point, keyed by the volume's root), whose entries are on
+    /// that volume too. Its parent must exist. Unmount with
+    /// [`remove`](Self::remove).
+    pub fn mount(&self, path: &str, volume: u32) -> FileKey {
+        let mut st = self.lock();
+        let p = Path::new(path);
+        let parent = st.resolve(p.parent().unwrap()).expect("parent exists");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(st.child(parent, name).is_none(), "{path:?} already exists");
+        let k = st.insert(parent, name, EntryKind::Dir, 0);
+        let mut e = st.entries.remove(&k).unwrap();
+        e.key = FileKey::new(VolumeId(volume), k.file_id);
+        let k = e.key;
+        st.entries.insert(k, e);
+        k
     }
 
     /// Creates a file of `size` bytes; its parent must exist.
@@ -277,6 +297,11 @@ impl VolumeEnumerator for FakeTree {
             let start = st
                 .resolve(root)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such folder"))?;
+            // As the macOS scanner, which opens the folder with
+            // `O_DIRECTORY`: a file (or symlink) is not walked.
+            if st.entries[&start].kind != EntryKind::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+            }
             let mut children: HashMap<FileKey, Vec<&Entry>> = HashMap::new();
             for e in st.entries.values() {
                 match e.parent {
@@ -478,6 +503,9 @@ pub fn wait_for(
         if cond(&snap) {
             return snap;
         }
+        // Not held while sleeping: a held snapshot keeps the writer from
+        // merging its orders in place.
+        drop(snap);
         assert!(Instant::now() < end, "timed out waiting for: {what}");
         thread::sleep(Duration::from_millis(5));
     }
@@ -493,6 +521,7 @@ pub fn wait_for_tree(engine: &Engine, tree: &FakeTree, what: &str) -> Arc<Engine
         if got == want {
             return snap;
         }
+        drop(snap);
         if Instant::now() >= end {
             let missing: Vec<_> = want.keys().filter(|k| !got.contains_key(*k)).collect();
             let extra: Vec<_> = got.keys().filter(|k| !want.contains_key(*k)).collect();

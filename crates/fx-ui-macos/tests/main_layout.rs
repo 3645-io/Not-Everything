@@ -164,7 +164,7 @@ fn columns_share_the_free_width_one_and_a_quarter_to_one_and_a_half() {
 /// their 2-point rim and 6-point padding, so headers and cells line up.
 #[test]
 fn the_card_puts_the_header_over_the_rows() {
-    let c = card(1248.0, 638.0, 0.0);
+    let c = card(1248.0, 638.0, 0.0, None);
     assert_eq!(c.header, Rect::new(0.0, 0.0, 1248.0, 44.0));
     assert_eq!(c.rows, Rect::new(0.0, 44.0, 1248.0, 594.0));
     assert!(close(c.columns.x[0], 16.0));
@@ -172,7 +172,33 @@ fn the_card_puts_the_header_over_the_rows() {
     assert!(close(c.columns.x[2], 452.0 + 504.0 + 16.0));
     assert!(close(c.columns.x[3], 972.0 + 88.0 + 16.0));
     assert!(close(c.columns.x[3] + c.columns.widths[3], 1248.0 - 16.0));
-    assert_eq!(card(1248.0, 20.0, 0.0).rows.height, 0.0);
+    assert_eq!(card(1248.0, 20.0, 0.0, None).rows.height, 0.0);
+    assert_eq!(c.width, 1248.0, "nothing to scroll sideways");
+}
+
+/// `.ne-col-handle`: a 12-point target the header cell's height (44 less
+/// the 1-point line under the header) centred in the 16-point gap after
+/// Name, Path and Size (`right: calc(var(--space-4) / -2 - 6px)`). Its
+/// line is 1 point wide 13 points in from the cell's top and bottom at
+/// rest, and 2 points wide 9 points in when hovered, focused or dragged.
+#[test]
+fn the_column_dividers_sit_in_the_gaps() {
+    let c = card(1248.0, 638.0, 0.0, None);
+    // Name ends at 16 + 420, Path at 452 + 504, Size at 972 + 88.
+    for (d, end) in c.dividers.iter().zip([436.0, 956.0, 1060.0]) {
+        let mid = end + 8.0;
+        assert!(close(d.hit.x, mid - 6.0), "{d:?}");
+        assert_eq!((d.hit.y, d.hit.width, d.hit.height), (0.0, 12.0, 43.0));
+        assert!(close(d.line.x, mid - 0.5), "{d:?}");
+        assert_eq!((d.line.y, d.line.width, d.line.height), (13.0, 1.0, 17.0));
+        assert!(close(d.active_line.x, mid - 1.0), "{d:?}");
+        assert_eq!(
+            (d.active_line.y, d.active_line.width, d.active_line.height),
+            (9.0, 2.0, 25.0)
+        );
+    }
+    // Date Modified has none: it takes the rest.
+    assert_eq!(c.dividers.len(), 3);
 }
 
 /// The rows' table is exactly as wide as the part of the scroll view that
@@ -188,9 +214,9 @@ fn the_rows_fit_beside_a_legacy_scroller() {
     // once per column.
     let table = |c: &CardLayout| c.columns.widths.iter().sum::<f64>() + 4.0 * 16.0;
     // The scroll view: the card less 8 points of inset a side.
-    let overlay = card(1068.0, 600.0, 0.0);
+    let overlay = card(1068.0, 600.0, 0.0, None);
     assert!(close(table(&overlay), 1068.0 - 16.0));
-    let legacy = card(1068.0, 600.0, 17.0);
+    let legacy = card(1068.0, 600.0, 17.0, None);
     assert!(close(table(&legacy), 1068.0 - 16.0 - 17.0));
     let (o, l) = (overlay.columns.widths, legacy.columns.widths);
     assert!(close(l[0] + l[1], o[0] + o[1] - 17.0));

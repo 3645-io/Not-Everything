@@ -36,9 +36,13 @@
 //!   APFS's `getattrlistbulk` reports mount status 0 for some of them
 //!   (`/System/Volumes/Data` among them), also by the kernel's mount table
 //!   ([`crate::volumes::list_mounts`]) read at scan start. A mount below the
-//!   root is entered only if [`crate::volumes::mount_policy`] says
-//!   [`MountPolicy::Index`]; in the MVP only `/` is indexed, so in practice
-//!   only the scan root's own volume is walked.
+//!   root is entered only if [`crate::volumes::mount_policy_with`] says
+//!   [`MountPolicy::Index`] for [`ScanOptions::external_volumes`]: without
+//!   that setting (the default) only the scan root's own volume is walked;
+//!   with it, the external volumes it accepts are walked too (run 2.4). A
+//!   mount point's entry, entered or not, is keyed by the mounted volume's
+//!   root as `lstat` reports it, except a network or automount one, which
+//!   is never looked into (see [`ScannedEntry::dev`]).
 //! * Firmlinks: `/System/Volumes/Data` and everything below it
 //!   ([`crate::firmlinks::is_data_volume_alias`]) is listed but never
 //!   entered from a root above it, so a scan of `/` reaches the Data volume
@@ -63,7 +67,6 @@ use std::ffi::{OsStr, c_int, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -73,9 +76,10 @@ use crate::attrbuf::{
     ATTR_BIT_MAP_COUNT, Descend, Entries, EntryKind, REQUESTED_DIR_ATTRS, REQUESTED_FILE_ATTRS,
     REQUESTED_OPTIONS, RawEntry, SkipReason, WALKER_COMMON_ATTRS, descend_decision,
 };
+use crate::budget;
 use crate::cloud::{OpenSkip, classify_open_error};
 use crate::firmlinks::{DATA_VOLUME, FirmlinkMap};
-use crate::volumes::{MountPolicy, list_mounts, mount_policy};
+use crate::volumes::{ExternalVolumes, MountPolicy, list_mounts, mount_policy_with};
 
 /// `UF_HIDDEN` (`sys/stat.h`): hidden from the Finder.
 pub const UF_HIDDEN: u32 = 0x0000_8000;
@@ -180,6 +184,23 @@ fn open_at(dirfd: c_int, path: &[u8]) -> io::Result<Fd> {
     }
 }
 
+/// `(st_dev, st_ino)` of `path` (absolute, without a NUL) as `lstat`
+/// reports them; `None` if it fails. The device is converted the way the
+/// keys are (`dev_t as u32`).
+#[allow(clippy::cast_sign_loss)]
+fn lstat_identity(path: &[u8]) -> Option<(u32, u64)> {
+    let mut c = Vec::with_capacity(path.len() + 1);
+    c.extend_from_slice(path);
+    c.push(0);
+    // SAFETY: `stat` is plain old data; all-zero is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and `st` is valid for writes.
+    if unsafe { libc::lstat(c.as_ptr().cast(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.st_dev as u32, st.st_ino))
+}
+
 /// Device and inode number of an open descriptor (`fstat`).
 fn fd_identity(fd: &Fd) -> io::Result<(libc::dev_t, u64)> {
     // SAFETY: `stat` is plain old data; all-zero is a valid value.
@@ -207,7 +228,29 @@ pub struct ScanOptions {
     /// What to leave out; applied before descending (see the module docs).
     /// The default excludes nothing.
     pub exclusions: Exclusions,
+    /// External volumes to enter (run 2.4): a mount below the root that
+    /// [`ExternalVolumes::indexes`] accepts is walked like any folder.
+    /// `None` (the default) enters no mount below the root.
+    pub external_volumes: Option<ExternalVolumes>,
+    /// Heap, in bytes, that the entries a streaming scan has listed and its
+    /// receiver hasn't taken yet may hold ([`crate::budget`]). Used by
+    /// [`MacScanner`](crate::enumerator::MacScanner).
+    pub stream_budget: usize,
 }
+
+/// Default [`ScanOptions::stream_budget`]: 1 MiB, about nine chunks of
+/// entries. Measured on an M4 Pro over a 3.2M-entry disk (`rescan_bench`,
+/// `first_run_bench`): a rescan's walk peaked at 37 MB of heap with any
+/// budget from 256 KiB to 4 MiB, against 76 to 84 MB with the 256-message
+/// channel before it, and neither the rescan nor the first scan got
+/// slower. A larger budget only holds more: on a tree of small folders,
+/// 8 MiB held more than the 256 messages did.
+pub const DEFAULT_STREAM_BUDGET: usize = 1 << 20;
+
+/// The most entries a streaming scan sends in one message: a big folder's
+/// entries go in several, so no message (and no walker's pending list)
+/// outgrows the budget.
+pub const STREAM_CHUNK: usize = 1024;
 
 /// An exclusion engine that excludes nothing.
 fn no_exclusions() -> Exclusions {
@@ -222,6 +265,8 @@ impl Default for ScanOptions {
             collect: true,
             buf_size: DEFAULT_BUF_SIZE,
             exclusions: no_exclusions(),
+            external_volumes: None,
+            stream_budget: DEFAULT_STREAM_BUDGET,
         }
     }
 }
@@ -313,7 +358,8 @@ pub struct ScannedEntry {
     pub mtime_sec: i64,
     /// Modification time, nanoseconds part.
     pub mtime_nsec: u32,
-    /// File ID (inode number, `st_ino`).
+    /// File ID (inode number, `st_ino`). For a mount point, the mounted
+    /// volume root's (see `dev`).
     pub file_id: u64,
     /// BSD flags (`st_flags`).
     pub flags: u32,
@@ -322,7 +368,9 @@ pub struct ScannedEntry {
     /// Device (`st_dev`) of the directory the entry was listed in. With
     /// `file_id` this forms the entry's key; for a firmlinked directory
     /// seen from `/` (such as `/Users`) it is the system volume's device,
-    /// not the one `lstat` reports (see the `enumerator` module docs).
+    /// not the one `lstat` reports (see the `enumerator` module docs). For
+    /// a mount point it is the mounted volume's device: a mount point is
+    /// keyed by the volume's root as `lstat` reports it (run 2.4).
     pub dev: u32,
     /// The walker's hidden rule ([`is_hidden`]).
     pub hidden: bool,
@@ -420,6 +468,12 @@ struct Ctx<'a> {
     /// List-only mount points strictly below the root, as root-relative
     /// paths.
     mounts: HashSet<Vec<u8>>,
+    /// Mount points strictly below the root that are entered (external
+    /// volumes, [`ScanOptions::external_volumes`]), as root-relative paths.
+    entered: HashSet<Vec<u8>>,
+    /// Network and automount mount points strictly below the root, keyed
+    /// by the listing, never `lstat`ed.
+    remote: HashSet<Vec<u8>>,
     /// `/System/Volumes/Data` relative to the canonical root, when the root
     /// is a strict ancestor of it.
     alias_rel: Option<Vec<u8>>,
@@ -429,7 +483,7 @@ struct Ctx<'a> {
     exclusions: &'a Exclusions,
     /// Where a streaming scan ([`scan_streaming`]) sends each directory's
     /// entries; `None` for a collecting scan.
-    emit: Option<&'a SyncSender<Vec<ScannedEntry>>>,
+    emit: Option<&'a budget::Sender<Vec<ScannedEntry>>>,
 }
 
 /// Per-thread walker state.
@@ -636,12 +690,45 @@ impl<'a> Worker<'a> {
                 s.errors += 1;
             }
         }
-        let decision = descend_decision(raw, false);
+        let mut decision = descend_decision(raw, false);
         match decision {
-            Descend::Skip(SkipReason::MountPoint) => s.skipped_mount_points += 1,
             Descend::Skip(SkipReason::AutomountTrigger) => s.skipped_automount_triggers += 1,
             Descend::Skip(SkipReason::Dataless) => s.skipped_dataless += 1,
             _ => {}
+        }
+
+        // The folder's path below the root, for folders the walk enters and
+        // for mount points.
+        let rel = matches!(
+            decision,
+            Descend::Descend | Descend::Skip(SkipReason::MountPoint)
+        )
+        .then(|| {
+            let mut rel = Vec::with_capacity(dir.rel.len() + 1 + raw.name.len());
+            rel.extend_from_slice(&dir.rel);
+            if !rel.is_empty() {
+                rel.push(b'/');
+            }
+            rel.extend_from_slice(raw.name);
+            rel
+        });
+        // getattrlistbulk does not report every mount point (APFS returns
+        // mount status 0 for /System/Volumes/Data), so the mount table is
+        // checked as well. An external volume the options accept is
+        // entered (run 2.4).
+        let entered = rel
+            .as_ref()
+            .is_some_and(|rel| !self.ctx.entered.is_empty() && self.ctx.entered.contains(rel));
+        let listed_mount = !entered
+            && (decision == Descend::Skip(SkipReason::MountPoint)
+                || rel.as_ref().is_some_and(|rel| {
+                    !self.ctx.mounts.is_empty() && self.ctx.mounts.contains(rel)
+                }));
+        if entered {
+            decision = Descend::Descend;
+        } else if listed_mount {
+            self.stats.skipped_mount_points += 1;
+            decision = Descend::Skip(SkipReason::MountPoint);
         }
 
         // Keying rule: (st_dev of the directory being listed, file ID from
@@ -651,7 +738,27 @@ impl<'a> Worker<'a> {
         // reports; its children are listed with the Data volume's device
         // and match lstat. The reconcile and FSEvents run (1.8) must use
         // the same rule or remap these keys. See the `enumerator` docs.
-        let key = (self.cur_dev as u32, raw.file_id);
+        //
+        // A mount point is the exception (run 2.4): the listing reports the
+        // covered folder's ID, while lstat, and so the path stat, sees the
+        // mounted volume's root. It is keyed by that root's own (st_dev,
+        // st_ino), which is unique while the volume is mounted (two
+        // volumes' roots often share an inode number, never a device), and
+        // the volume's entries hang off that key. A network or automount
+        // mount point keeps the listing's key: an lstat could wait on a
+        // server, or trigger the mount.
+        let remote = || {
+            rel.as_ref()
+                .is_some_and(|rel| !self.ctx.remote.is_empty() && self.ctx.remote.contains(rel))
+        };
+        let key = if (entered || listed_mount) && !remote() {
+            self.dir_abs.extend_from_slice(raw.name);
+            let own = lstat_identity(&self.dir_abs);
+            self.dir_abs.truncate(abs_len);
+            own.unwrap_or((self.cur_dev as u32, raw.file_id))
+        } else {
+            (self.cur_dev as u32, raw.file_id)
+        };
         let (worker, index) = if self.collect && emit {
             let index = self.entries.len() as u32;
             self.entries.push(ScannedEntry {
@@ -660,7 +767,7 @@ impl<'a> Worker<'a> {
                 size: raw.size.unwrap_or(0),
                 mtime_sec: raw.mtime_sec,
                 mtime_nsec: u32::try_from(raw.mtime_nsec).unwrap_or(0),
-                file_id: raw.file_id,
+                file_id: key.1,
                 flags: raw.flags,
                 crtime_sec: raw.crtime_sec,
                 dev: key.0,
@@ -670,26 +777,21 @@ impl<'a> Worker<'a> {
                 parent_key: self.cur_key,
             });
             self.parent_workers.push(dir.worker);
+            if self.ctx.emit.is_some() && self.entries.len() >= STREAM_CHUNK {
+                // A big folder goes in chunks. Its subfolders are queued
+                // only after its last chunk, so the order holds.
+                self.flush();
+            }
             (self.id, index)
         } else {
             (NONE, NONE)
         };
 
-        if decision == Descend::Descend {
-            let mut rel = Vec::with_capacity(dir.rel.len() + 1 + raw.name.len());
-            rel.extend_from_slice(&dir.rel);
-            if !rel.is_empty() {
-                rel.push(b'/');
-            }
-            rel.extend_from_slice(raw.name);
-            // getattrlistbulk does not report every mount point (APFS
-            // returns mount status 0 for /System/Volumes/Data), so the
-            // mount table is checked as well. Firmlink aliases are never
-            // entered from above, even when the mount table lacks them; a
-            // skip is counted once, as a mount point if the table has it.
-            if !self.ctx.mounts.is_empty() && self.ctx.mounts.contains(&rel) {
-                self.stats.skipped_mount_points += 1;
-            } else if self.ctx.alias_rel.as_deref() == Some(rel.as_slice()) {
+        if let (Descend::Descend, Some(rel)) = (decision, rel) {
+            // Firmlink aliases are never entered from above, even when the
+            // mount table lacks them; a skip is counted once, as a mount
+            // point if the table has it (counted above).
+            if !entered && self.ctx.alias_rel.as_deref() == Some(rel.as_slice()) {
                 self.stats.skipped_firmlink_aliases += 1;
             } else {
                 self.children.push(WorkItem {
@@ -719,10 +821,12 @@ impl<'a> Worker<'a> {
     }
 
     /// In a streaming scan, sends the entries recorded since the last call
-    /// (one directory's). Called after a directory is scanned and before
-    /// its subdirectories are queued, so every directory's own entry is
-    /// sent before any of its children can be listed: the receiver gets
-    /// each entry after its parent, whichever worker lists what.
+    /// (one directory's, or a chunk of a big one's), first waiting while
+    /// the receiver is a budget's worth behind. Called after a directory is
+    /// scanned and before its subdirectories are queued, so every
+    /// directory's own entry is sent before any of its children can be
+    /// listed: the receiver gets each entry after its parent, whichever
+    /// worker lists what.
     fn flush(&mut self) {
         let Some(tx) = self.ctx.emit else {
             return;
@@ -732,9 +836,10 @@ impl<'a> Worker<'a> {
         }
         let batch = std::mem::take(&mut self.entries);
         self.parent_workers.clear();
+        let bytes = batch_bytes(&batch);
         // A receiver that hung up gets nothing more; the walk still ends
         // normally with its counters.
-        let _ = tx.send(batch);
+        let _ = tx.send(batch, bytes);
     }
 
     /// Single-threaded walk of everything queued in `self.children`.
@@ -814,28 +919,40 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> io::Result<ScanResult> {
 }
 
 /// Scans like [`scan`], but sends the entries to `out` as the walk lists
-/// them, one directory's entries per message, instead of collecting them
-/// all: a caller that consumes them as they come never holds every entry
-/// at once (run 2.17). Every entry arrives after its parent directory's
-/// own entry; entries directly in the root, and below a traverse-only
-/// directory, arrive with a parent that is never sent. `parent` indices
-/// are not meaningful; `parent_key` is. Returns the counters (`entries` of
-/// the result is `None`). `out` should be bounded, so a slow receiver
+/// them, one directory's entries per message (at most [`STREAM_CHUNK`]),
+/// instead of collecting them all: a caller that consumes them as they
+/// come never holds every entry at once (run 2.17). Every entry arrives
+/// after its parent directory's own entry; entries directly in the root,
+/// and below a traverse-only directory, arrive with a parent that is never
+/// sent. `parent` indices are not meaningful; `parent_key` is. Returns the
+/// counters (`entries` of the result is `None`). `out`'s budget bounds the
+/// heap held by entries the receiver hasn't taken yet, so a slow receiver
 /// slows the walk instead of letting entries pile up.
 pub fn scan_streaming(
     root: &Path,
     opts: &ScanOptions,
-    out: &SyncSender<Vec<ScannedEntry>>,
+    out: &budget::Sender<Vec<ScannedEntry>>,
 ) -> io::Result<ScanStats> {
     let mut opts = opts.clone();
     opts.collect = true;
     scan_inner(root, &opts, Some(out)).map(|r| r.stats)
 }
 
+/// The heap a batch of listed entries holds, as the streaming scan counts
+/// it against its budget: the batch's buffer and every name, rounded up to
+/// the allocator's 16-byte quantum.
+fn batch_bytes(batch: &Vec<ScannedEntry>) -> usize {
+    let names: usize = batch
+        .iter()
+        .map(|e| e.name.len().next_multiple_of(16))
+        .sum();
+    batch.capacity() * std::mem::size_of::<ScannedEntry>() + names
+}
+
 fn scan_inner(
     root: &Path,
     opts: &ScanOptions,
-    emit: Option<&SyncSender<Vec<ScannedEntry>>>,
+    emit: Option<&budget::Sender<Vec<ScannedEntry>>>,
 ) -> io::Result<ScanResult> {
     let start = Instant::now();
     let root_bytes = root.as_os_str().as_bytes();
@@ -852,9 +969,12 @@ fn scan_inner(
 
     let threads = opts.effective_threads();
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let sets = mount_sets(&canon, opts.external_volumes.as_ref());
     let ctx = Ctx {
         root: root_bytes,
-        mounts: list_only_mounts_below(&canon),
+        mounts: sets.list_only,
+        entered: sets.entered,
+        remote: sets.remote,
         alias_rel: Path::new(DATA_VOLUME)
             .strip_prefix(&canon)
             .ok()
@@ -917,22 +1037,47 @@ fn scan_inner(
     Ok(result)
 }
 
-/// Mount points strictly below the canonical root `canon` that
-/// [`mount_policy`] does not index, as paths relative to it, from the
+/// The mount points strictly below a scan's root, as paths relative to it.
+#[derive(Default)]
+struct MountSets {
+    /// Listed, not entered.
+    list_only: HashSet<Vec<u8>>,
+    /// Entered: external volumes the options accept.
+    entered: HashSet<Vec<u8>>,
+    /// Network and automount mounts: never looked into, not even with
+    /// `lstat` (a server that does not answer would hang the walk), so
+    /// keyed by the listing like any folder.
+    remote: HashSet<Vec<u8>>,
+}
+
+/// The mount points strictly below the canonical root `canon`, sorted by
+/// what [`mount_policy_with`] (with `external`) does with them, from the
 /// kernel's mount table ([`list_mounts`], `getfsstat`). Mount paths are
-/// canonical, hence the canonical root. If the table cannot be read, the
-/// `ATTR_DIR_MOUNTSTATUS` check still applies.
-fn list_only_mounts_below(canon: &Path) -> HashSet<Vec<u8>> {
+/// canonical, hence the canonical root. If the table cannot be read, none:
+/// the `ATTR_DIR_MOUNTSTATUS` check still keeps the walk out of mount
+/// points, and no external volume is entered.
+fn mount_sets(canon: &Path, external: Option<&ExternalVolumes>) -> MountSets {
+    let mut sets = MountSets::default();
     let Ok(mounts) = list_mounts() else {
-        return HashSet::new();
+        return sets;
     };
-    mounts
-        .iter()
-        .filter(|m| mount_policy(m) == MountPolicy::ListOnly)
-        .filter_map(|m| m.mount_point.strip_prefix(canon).ok())
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| rel.as_os_str().as_bytes().to_vec())
-        .collect()
+    for m in &mounts {
+        let Ok(rel) = m.mount_point.strip_prefix(canon) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let rel = rel.as_os_str().as_bytes().to_vec();
+        if m.flags.network || m.fs_type == "autofs" {
+            sets.remote.insert(rel.clone());
+        }
+        match mount_policy_with(m, external) {
+            MountPolicy::Index => sets.entered.insert(rel),
+            MountPolicy::ListOnly => sets.list_only.insert(rel),
+        };
+    }
+    sets
 }
 
 /// Firmlinks of the system table ([`FirmlinkMap::system`]) strictly below

@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.5.0: external drives, resizable columns, a faster start (November 2026)
+
+Not-Everything now indexes your external drives, lets you resize its columns, previews files with Quick Look, works with VoiceOver, and shows its first result in half the time. Signed and notarized. Apple silicon only, macOS 13 or later.
+
+### Before you update
+
+- **Nothing to do.** Full Disk Access, Launch at Login, your hotkey, your settings and your index carry over from 0.4.0.
+- **The first start adds your drives.** With Full Disk Access, the first start after the update indexes every external drive that is connected. A large drive makes that start take longer and use more memory until its scan ends.
+
+### New
+
+- **External drives.** With Full Disk Access, Not-Everything indexes the drives you connect (APFS, Mac OS Extended, exFAT and FAT) when they mount, and keeps them up to date. When you eject a drive, its files leave the results; they come back when you connect it again.
+- **Resizable columns.** Drag the dividers between the column titles to resize Name, Path and Size; Date Modified takes the rest. Left and Right move a focused divider (Shift moves it further), and a double-click returns to the default layout. The widths are remembered, and the results scroll sideways when the columns don't fit.
+- **Quick Look.** Space in the results previews the selected files, up to 1,000, in macOS's Quick Look panel. Space or Escape closes it, and the arrow keys move through the results while it is open.
+- **VoiceOver.** Each result is read in words, column by column ("~" as Home, dates with the month in full), as are the status bar and the shortcut hints. A new search announces how many results it found once you pause typing.
+
+### Changed
+
+- **The first result in half the time.** From launch to the first result takes about 0.5 s (about 0.9 s in 0.4.0), and a search is usable about 5 ms after a relaunch (10 ms). The app now checks its saved sort orders in one cheap pass.
+- **Lighter while files change.** With files changing on the disk (20 a second in the test), the app takes about 30% less memory with its window hidden, and showing a search costs about a third less processor time and 40% less energy.
+- **A faster command.** `not-everything` answers a search on a 2-million-file index in about 0.15 s (0.74 s in 0.4.0). It now checks only the sort order the search uses, and only on its matches.
+
+### Fixed
+
+- **A file renamed only in letter case** (report.pdf to Report.pdf) could go back to its old spelling in the index after a later change or a rescan.
+- **Changes could be missed** when macOS dropped change notices, asked for a folder above the indexed one to be looked through again, or the indexed folder itself was moved or renamed. Each of these now leads to the right rescan.
+- **A deleted folder could stay in the index** when, while the app was closed, a file and a folder swapped names and something inside the swapped folder was deleted.
+- **A rescan of a big folder could run far ahead of the index** and hold the folders it had listed in memory; it now waits for the index to catch up.
+
+### Known limits
+
+- **An ejected drive's files are hidden** from the results until it is connected again; a marker for them is planned.
+- **With VoiceOver, an empty search listing every file may not read its rows.** Type a search first.
+
+### For testers
+
+Release candidates install as **Not-Everything Preview**, with its own settings, index, hotkey (Option-Shift-Space) and command (`not-everything-preview`). It runs next to your everyday Not-Everything without touching it.
+
+### Install
+
+Open `Not-Everything-0.5.0-macos-arm64.dmg` and drag Not-Everything to Applications, replacing the old copy. The zip, `Not-Everything-0.5.0-macos-arm64.zip`, holds the same signed app. `not-everything-cli-0.5.0-macos-arm64.tar.gz` holds the `not-everything` command, its manual (`cli.md`), the license and the third-party notices.
+
 ## v0.4.0: a tenth of the memory, a quiet background (November 2026)
 
 Not-Everything now uses about a tenth of the memory it did, barely touches the processor while its window is hidden, and scans the disk faster. Signed and notarized. Apple silicon only, macOS 13 or later.

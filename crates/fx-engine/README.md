@@ -37,6 +37,31 @@ cargo test -p fx-engine
   memory report (≤100 B per entry at 100k entries), an offline catch-up of
   500 changes equal to a fresh scan, and a first result from a reopened
   store (through `StoreReader` and `Engine::open`).
+- `tests/fuzz.rs` runs `fx_testkit::soak`'s seeded stream of random file
+  operations (the soak's) against the fakes, 48 seeds at once, reporting
+  each operation as the FSEvents source would and delivering the events
+  exactly, late, shuffled with duplicates, folded into one subtree rescan,
+  or with folder renames as plain path checks. It runs in lockstep, so it
+  is deterministic, and whenever no event is left to deliver the index
+  must equal a fresh enumeration exactly and every order a fresh build.
+  `FX_ENGINE_FUZZ_SEEDS` and `FX_ENGINE_FUZZ_ROUNDS` make a longer run,
+  `FX_ENGINE_FUZZ_SEED` one seed alone. It found a writer bug (a change
+  reported under a folder's old path in the same batch as the folder's
+  move removed the entry), which run 2.17 fixed; the bug's two tests now
+  run with the rest (see the file's documentation).
+- `tests/case_rename.rs` (macOS only) covers a bug the soak found: after a
+  case-only rename on a case-insensitive volume, an event or a rescan for
+  the old spelling put the old name back, because `MacPathStat` named an
+  entry after the path it was given. It now reads the name stored on disk,
+  and the tests check both event orders, the old spelling alone and a
+  folder rescanned under its old spelling, with the real stat and scanner.
+- `tests/catch_up.rs` covers another bug the soak found with restarts: a
+  file and a folder swapped names while the engine was down, then a
+  folder inside the swapped folder was deleted, and the deleted folder
+  stayed indexed. A subtree rescan compared its walk with the subtree of
+  the entry the index had at the path (the file, about to be found at its
+  new name) instead of the folder the disk has there. The tests deliver
+  name swaps and kind changes in every order, in one batch and in two.
 
 fx-fs-macos is a dev-dependency under
 `[target.'cfg(target_os = "macos")'.dev-dependencies]` only; the library
@@ -255,3 +280,55 @@ N` (default 2700000), `--selected N` (default 1000), `--runs N` (default
 20), `--query TEXT` (default empty), `--cache`. Exit codes: 0 after a
 completed run, 1 on an error or a wrong answer, 2 for bad arguments. It
 writes nothing to disk.
+
+## Search re-run benchmark
+
+```text
+cargo run --release -p fx-engine --example rerun_bench -- --entries 2000000 --cache warm
+```
+
+`examples/rerun_bench.rs` times what a window pays for each new
+generation while it shows a search: a full scan of the published
+snapshot, since a new snapshot can't be answered from the refinement
+cache. fx-query's `matcher_bench` measures that scan over its own view,
+which keeps a folded copy of every name and has no delta; this one
+measures it over the engine's snapshot. It builds `--entries` synthetic
+entries into a compacted base, saves it as a store and serves the base
+from the file's memory map, as the app does (`--heap-base` keeps it on
+the heap), then applies a delta of `--delta` percent of the live entries
+(default 10, the writer's compaction limit): half new files, half
+updates of base entries, every other one a rename. Each sample is one
+search with a fresh `Searcher` and the default options (case and
+diacritics folded) on rayon's global pool (`RAYON_NUM_THREADS` sets its
+size), for each of `matcher_bench`'s engine queries. Output follows the
+format above: the setup (`base_entries`, `delta_rows`, the share of names
+folding changes and what a folded copy of just those would take), then
+`rerun_<query>_p50_ms`, `_p95_ms`, `_max_ms` and `_n`, `rerun_worst_p95_ms`,
+`rerun_mean_p50_ms`, and the snapshot's `memory_*` report. Flags:
+`--entries N` (default 2000000), `--delta PCT` (0 to 10), `--iters K`
+(default 30), `--warmup W` (default 3), `--seed S`, `--heap-base`,
+`--cache`. Exit codes: 0 after a completed run, 1 on an error or a hit
+count that changes between runs, 2 for bad arguments. It writes only its
+store, in a temporary directory it removes at the end.
+
+## Soak
+
+```text
+cargo run --release -p fx-engine --example soak -- --duration 24h
+```
+
+`examples/soak.rs` (macOS only) is the 24 h soak behind metric C3 of
+`docs/gates/performance.md`, which describes it; `scripts/perf-check.sh
+--tier rc --step soak` runs it in the gate. It runs the engine with the
+real FSEvents source, path stat and scanner, set up as the app sets them
+up, over a fresh folder in `--dir` (default `$TMPDIR`), applies
+`fx_testkit::soak`'s operation stream at `--rate` operations a second, and
+every `--check-every` waits for the index to equal a fresh scan and every
+order a fresh build; every `--restart-every` checks it closes and reopens
+the engine around changes made while it is down. Output: one line per
+check, then `soak_differences` and the other `soak_*` metrics. Flags:
+`--duration` (default 10m), `--seed` (1), `--rate` (10), `--check-every`
+(30s), `--restart-every` (10), `--max-entries` (10000), `--settle-timeout`
+(30s), `--dir`, `--keep` (leave the folder in place). Exit codes: 0 without
+differences, 1 with differences, 2 for bad arguments, 3 when the harness
+failed. It only touches the folder it makes and removes it at the end.

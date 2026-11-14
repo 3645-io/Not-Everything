@@ -2,15 +2,21 @@
 //!
 //! [`StoreReader::open`] maps an fx-store checkpoint (as written by
 //! [`Engine::checkpoint`](crate::Engine::checkpoint)), verifies it and
-//! rebuilds the index and sort orders, like [`Engine::open`](crate::Engine::open)
-//! does, but it never writes, renames, creates or removes anything (not even
-//! stale temp files), starts no change source and spawns no threads. It
-//! works on a read-only file in a read-only folder.
+//! rebuilds the index, like [`Engine::open`](crate::Engine::open) does, but
+//! it never writes, renames, creates or removes anything (not even stale
+//! temp files), starts no change source and spawns no threads. It works on
+//! a read-only file in a read-only folder.
 //!
 //! [`StoreReader::search`] runs the same query and sort path as
 //! [`Engine::search`](crate::Engine::search) over the loaded snapshot, with
-//! the search toggles of [`ReadOptions`].
+//! the search toggles of [`ReadOptions`]. Unlike the engine, which checks
+//! every saved sort order against the index when it opens a store, a search
+//! here reads only the saved order it sorts by, and checks it only on the
+//! entries it matched ([`matches_in_order`]): a command runs one search, so
+//! checking all four orders over every entry would cost it most of its
+//! time.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,11 +26,11 @@ use fx_query::{
     Cancelled, CompiledQuery, Diagnostic, Node, Pattern, RegexError, RegexTerm, SearchOptions,
     SearchView,
 };
-use fx_sort::{Direction, Order, SortKey};
+use fx_sort::{Direction, MatchSet, Order, SortKey, SortSource};
 use fx_store::{LoadError, MappedIndex};
 
 use crate::query;
-use crate::snapshot::{ENGINE_SORT_KEYS, EngineSnapshot};
+use crate::snapshot::EngineSnapshot;
 
 /// Why [`StoreReader::open`] failed.
 #[derive(Debug)]
@@ -153,6 +159,41 @@ pub(crate) fn first_regex_error(node: &Node) -> Option<RegexError> {
 
 impl std::error::Error for SearchError {}
 
+/// Whether the entries of `matches` appear in `ids` once each and in
+/// strictly ascending `key` order. Only matched entries are compared, so a
+/// saved order costs a search time in proportion to its matches, not to the
+/// index.
+///
+/// That is enough to sort by the order: [`fx_sort::emit`] reads only the
+/// matched entries of an order, so it gives the same page from any order
+/// that passes as from one sorted throughout. `key` is a total order
+/// (entry IDs break ties), so ascending matched entries are exactly the
+/// matches sorted. Counting them keeps an order that lacks a match from
+/// dropping it; strictly ascending entries are never repeated.
+pub(crate) fn matches_in_order<S: SortSource + ?Sized>(
+    ids: &[u32],
+    key: SortKey,
+    src: &S,
+    matches: &MatchSet,
+) -> bool {
+    let mut seen = 0usize;
+    let mut prev: Option<EntryId> = None;
+    for &id in ids {
+        let id = EntryId(id);
+        if !matches.contains(id) {
+            continue;
+        }
+        if let Some(p) = prev {
+            if key.compare(src, p, id) != Ordering::Less {
+                return false;
+            }
+        }
+        prev = Some(id);
+        seen += 1;
+    }
+    seen == matches.len()
+}
+
 /// The global search toggles for [`StoreReader::search`]. Every flag
 /// defaults to off, like [`fx_query::SearchOptions::default`]; modifiers
 /// inside the query (`case:`, `ww:`, ...) still override them per term.
@@ -202,15 +243,21 @@ pub struct ReadPage {
 
 /// A read-only index loaded from a checkpoint store.
 ///
-/// Opening maps the store read-only, verifies it and rebuilds the index and
-/// sort orders in memory; nothing on disk is ever written, renamed, created
-/// or removed (not even stale temp files), no change source is started and
-/// no thread is spawned. Searches run the same query and sort path as
-/// [`Engine::search`](crate::Engine::search), with the toggles of
-/// [`ReadOptions`].
+/// Opening maps the store read-only, verifies it and rebuilds the index,
+/// whose columns are served from the map; nothing on disk is ever written,
+/// renamed, created or removed (not even stale temp files), no change
+/// source is started and no thread is spawned. Searches run the same query
+/// and sort path as [`Engine::search`](crate::Engine::search), with the
+/// toggles of [`ReadOptions`], reading the saved sort orders from the map
+/// as they need them.
 #[derive(Debug)]
 pub struct StoreReader {
+    /// The index, with no orders: [`StoreReader::search`] takes them from
+    /// `mapped` or builds them.
     snap: EngineSnapshot,
+    /// The store's map, for its saved sort orders. Its checksums and its
+    /// orders' permutation checks passed when it was opened.
+    mapped: MappedIndex,
     utc_offset: Option<i32>,
 }
 
@@ -228,9 +275,11 @@ fn order_code(key: SortKey) -> Option<u8> {
 
 impl StoreReader {
     /// Opens and fully verifies the checkpoint store at `path` (header,
-    /// tables and every column checksum), rebuilding the index and the
-    /// saved sort orders. Orders that are missing or do not fit the index
-    /// are rebuilt in memory.
+    /// tables, every column checksum, and that each saved sort order is a
+    /// permutation of the live entries), rebuilding the index. Whether a
+    /// saved order is sorted is checked later, by each search on the
+    /// entries it matched; an order that is missing or out of order there
+    /// is built in memory for that search.
     ///
     /// Nothing on disk is written, renamed, created or removed.
     ///
@@ -252,31 +301,42 @@ impl StoreReader {
                 reason: format!("the index does not rebuild: {e}"),
             })
         })?;
-        let snap = index.snapshot();
-        let orders: Vec<Order> = ENGINE_SORT_KEYS
-            .iter()
-            .map(|&key| {
-                let saved = order_code(key)
-                    .and_then(|code| mapped.order(code))
-                    .map(|ids| Order {
-                        key,
-                        ids: ids.to_vec(),
-                    })
-                    .filter(|order| order.validate(&*snap).is_ok());
-                saved.unwrap_or_else(|| Order::build(&*snap, key))
-            })
-            .collect();
         Ok(StoreReader {
             snap: EngineSnapshot {
-                index: snap,
-                orders: Arc::new(orders),
+                index: index.snapshot(),
+                // Read from `mapped` by each search, for its own sort only.
+                orders: Arc::new(Vec::new()),
                 cursor: None,
                 generation: 0,
+                // The reader doesn't know where volumes are mounted, and
+                // finding offline entries would read every key: each hit is
+                // checked instead, so offline entries stay hidden here too.
+                hide_offline: true,
                 // The command line keeps the plain sort.
                 priority: None,
+                orders_pending: false,
             },
+            mapped,
             utc_offset: None,
         })
+    }
+
+    /// The order to read `matches` in by `sort`: the store's saved order
+    /// when the matched entries appear in it in `sort` order, else one built
+    /// from the index (an order that is missing, or that a store saved
+    /// under other sort rules would hold).
+    fn order_for(&self, sort: SortKey, matches: &MatchSet) -> Order {
+        let index = self.snap.index();
+        let saved = order_code(sort)
+            .and_then(|code| self.mapped.order(code))
+            .filter(|ids| matches_in_order(ids, sort, index, matches));
+        match saved {
+            Some(ids) => Order {
+                key: sort,
+                ids: ids.to_vec(),
+            },
+            None => Order::build(index, sort),
+        }
     }
 
     /// Evaluates date functions (`dm:today`, ...) at `offset` seconds east
@@ -332,8 +392,13 @@ impl StoreReader {
             .search(&self.snap, &generation.token())
             .unwrap_or_default();
         let matches = self.snap.match_set(&hits);
-        let order = self.snap.order_or_build(sort);
-        let page = fx_sort::emit(&order, &matches, direction, offset, limit);
+        // No matches need no order (an empty page either way).
+        let page = if matches.is_empty() {
+            fx_sort::Page::default()
+        } else {
+            let order = self.order_for(sort, &matches);
+            fx_sort::emit(&order, &matches, direction, offset, limit)
+        };
         Ok(ReadPage {
             total: page.total,
             ids: page.ids,
@@ -411,5 +476,135 @@ impl StoreReader {
     pub fn created(&self, id: u32) -> Option<i64> {
         self.contains(id)
             .then(|| self.snap.index().created(EntryId(id)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use fx_model::{EntryId, EntryKind};
+    use fx_sort::{MatchSet, SortKey, SortSource};
+
+    use super::matches_in_order;
+
+    /// Live, parentless entries with these names, recording every entry
+    /// whose name is read.
+    struct Names {
+        names: Vec<&'static str>,
+        read: RefCell<Vec<u32>>,
+    }
+
+    impl Names {
+        fn new(names: &[&'static str]) -> Names {
+            Names {
+                names: names.to_vec(),
+                read: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SortSource for Names {
+        fn id_bound(&self) -> usize {
+            self.names.len()
+        }
+        fn is_live(&self, id: EntryId) -> bool {
+            id.index() < self.names.len()
+        }
+        fn name(&self, id: EntryId) -> &str {
+            self.read.borrow_mut().push(id.0);
+            self.names[id.index()]
+        }
+        fn parent(&self, _: EntryId) -> EntryId {
+            EntryId::NONE
+        }
+        fn size(&self, _: EntryId) -> u64 {
+            0
+        }
+        fn modified(&self, _: EntryId) -> i64 {
+            0
+        }
+        fn created(&self, _: EntryId) -> i64 {
+            0
+        }
+        fn kind(&self, _: EntryId) -> EntryKind {
+            EntryKind::File
+        }
+    }
+
+    fn set(ids: &[u32]) -> MatchSet {
+        let mut set = MatchSet::with_bound(16);
+        for &id in ids {
+            set.insert(EntryId(id));
+        }
+        set
+    }
+
+    // IDs 0..6 by name: a (3), b (0), c (4), d (1), e (5), f (2).
+    const NAMES: [&str; 6] = ["b", "d", "f", "a", "c", "e"];
+
+    #[test]
+    fn a_saved_order_wrong_only_outside_the_matches_is_used() {
+        let src = Names::new(&NAMES);
+        // b, d and f (0, 1, 2) are in order; e (5) first is not.
+        let ids = [5, 0, 4, 1, 3, 2];
+        assert!(matches_in_order(
+            &ids,
+            SortKey::Name,
+            &src,
+            &set(&[0, 1, 2])
+        ));
+        assert!(!matches_in_order(
+            &ids,
+            SortKey::Name,
+            &src,
+            &set(&[0, 1, 2, 3, 4, 5])
+        ));
+    }
+
+    #[test]
+    fn matched_entries_out_of_order_reject_the_saved_order() {
+        let src = Names::new(&NAMES);
+        // f (2) before d (1).
+        let ids = [3, 0, 4, 2, 5, 1];
+        assert!(!matches_in_order(&ids, SortKey::Name, &src, &set(&[1, 2])));
+        assert!(matches_in_order(&ids, SortKey::Name, &src, &set(&[0, 2])));
+    }
+
+    #[test]
+    fn only_the_matched_entries_are_compared() {
+        let src = Names::new(&NAMES);
+        let ids = [3, 0, 4, 1, 5, 2];
+        assert!(matches_in_order(&ids, SortKey::Name, &src, &set(&[0, 5])));
+        let mut read = src.read.borrow().clone();
+        read.sort_unstable();
+        read.dedup();
+        assert_eq!(read, vec![0, 5], "names read");
+    }
+
+    #[test]
+    fn a_match_missing_from_the_order_or_repeated_rejects_it() {
+        let src = Names::new(&NAMES);
+        // d (1) is missing.
+        assert!(!matches_in_order(
+            &[3, 0, 4, 5, 2],
+            SortKey::Name,
+            &src,
+            &set(&[0, 1])
+        ));
+        // b (0) twice, d (1) missing.
+        assert!(!matches_in_order(
+            &[3, 0, 0, 4, 5, 2],
+            SortKey::Name,
+            &src,
+            &set(&[0, 1])
+        ));
+    }
+
+    #[test]
+    fn no_matches_fit_any_order() {
+        let src = Names::new(&NAMES);
+        assert!(matches_in_order(&[2, 1, 0], SortKey::Path, &src, &set(&[])));
+        assert!(src.read.borrow().is_empty());
     }
 }
