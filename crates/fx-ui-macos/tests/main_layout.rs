@@ -322,6 +322,37 @@ fn the_status_bar_wraps_what_does_not_fit() {
     assert_eq!(s.index, Rect::new(615.0, 70.0, 121.0, 22.0));
 }
 
+/// Run 2.12 adds "⌘C Copy" to the hints. At the window's narrowest the
+/// four hints still fit the bar whole: they are never cut, though with long
+/// counts they may take the bar's second line, as the board's flex-wrap
+/// does. The widths are generous estimates of the 13-point labels (8 points
+/// a character, above SF Pro's average) and the caps at their 22-point
+/// minimum; the app's own measures are in the PR.
+#[test]
+fn the_four_result_hints_fit_the_narrowest_window() {
+    use fx_ui_macos::key_caps::RESULT_HINTS;
+    use fx_ui_macos::theme::metrics;
+    let items: Vec<(Vec<f64>, f64)> = RESULT_HINTS
+        .iter()
+        .map(|h| {
+            let keys = h.keys.iter().map(|_| key_width(14.0)).collect();
+            (keys, 8.0 * h.label.chars().count() as f64)
+        })
+        .collect();
+    assert_eq!(items.len(), 4);
+    let width = hints(&items).width;
+    // "2,014,377 results · 2,014,377 objects" and "Up to date · 999 ms".
+    let (counts, index) = (8.0 * 37.0, 8.0 * 19.0);
+    let s = status_bar(metrics::WINDOW_MIN_WIDTH, counts, Some(width), index);
+    let middle = s.middle.expect("the hints show");
+    assert_eq!(
+        middle.width, width,
+        "the hints are cut at the minimum width"
+    );
+    // On one line, after the counts or on the next one, never past the bar.
+    assert!(middle.right() <= metrics::WINDOW_MIN_WIDTH - metrics::STATUS_PADDING[1]);
+}
+
 /// `.ne-key { min-width: 22px; padding: 0 6px }`.
 #[test]
 fn key_caps_are_at_least_square() {

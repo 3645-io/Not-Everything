@@ -18,6 +18,8 @@ Every change that ships is measured before its pull request against the metrics 
 
 GitHub's shared macOS runners vary more between runs than the allowances, and have no real disk, Full Disk Access or daily file activity, so the timing tiers run on the owner's Mac. Every app launch uses a data folder inside the run's output (`--data-dir`), never the daily app's.
 
+Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a locked screen the app's window can't come forward, so every probe that summons it times out: on 13 Nov 2026 the screen locked two minutes into an rc run, and all 50 shortcut presses of F3 timed out at 5 s. `perf-check.sh` refuses to start on a locked screen (exit 2, nothing changed), and checks again once it holds the lock. `run.txt` records the screen at the start and at the end, and notes each step after which it was locked.
+
 ## Allowances
 
 A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.4.0's CPU showing a search, B2, and its first results during the first scan, F5), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
@@ -54,6 +56,8 @@ Tiers: Q quick, P pr, R rc. MB means 1,048,576 bytes, as Activity Monitor counts
 B7 adds the index saves a phase is too short to see. After each compaction the app saves its whole index to the store file, about 150 MB for a whole-disk index of 2M entries. The writer compacts when the files created since the last compaction, or the files deleted since then, pass 10% of the index's entries (at least 1,024): about every 200,000 at that scale, where a 10-minute phase at 20 operations a second creates about 6,000. So after each phase `perf-check.sh` runs `fx-bench saves`. It takes the store file the run's app saved (its size, and its entry count from `not-everything -get-result-count`) and the files `fx-bench churn` created and deleted in the phase, scales the larger of the two counts to a day, and projects one save of the store's size for every 10% of the entries in it. B7 is the measured writes plus that projection. At the pr tier's 20 operations a second, about half of them creates, that comes to about 4.3 saves a day: about 650 MB on the 2M-entry index. The summary shows the parts by phase, and fx-engine's `tests/compaction_saves.rs` checks the model against the real writer.
 
 The projection counts only the scripted activity: the rc tier's phases, with none, project no saves, though a Mac in daily use compacts too, and the daily save, which comes only after a day without one, is not projected either.
+
+The compaction saves add to the daily save, with an upper bound. The daily save comes 24 hours after the store's last write, whatever made it, so a compaction's save restarts the day: a day with a compaction often has no daily save, and a disk that compacts more than once a day makes no daily save at all. So "one save a day" means at most one daily save plus one save per compaction, plus one per quit (fx-ui-macos's `tests/daily_save_day.rs` simulates weeks of it). How often a whole disk in daily use compacts is still to be measured: fx-engine's `day_replay_bench` counts the files a day's FSEvents history created and deleted and projects the compactions a day with the same model (numbers to come). B7's target, and whether it gates, stay the owner's call once those numbers are in.
 
 ### Memory
 

@@ -67,6 +67,7 @@ fn the_result_hints_match_the_key_map() {
         [
             (&["↩"][..], "Open"),
             (&["⌘", "↩"][..], "Reveal in Finder"),
+            (&["⌘", "C"][..], "Copy"),
             (&["⌥", "⌘", "C"][..], "Copy path"),
         ]
     );
@@ -86,7 +87,12 @@ fn the_result_hints_match_the_key_map() {
     let actions: Vec<Action> = RESULT_HINTS.iter().map(|h| h.action).collect();
     assert_eq!(
         actions,
-        [Action::Open, Action::RevealInFinder, Action::CopyPath]
+        [
+            Action::Open,
+            Action::RevealInFinder,
+            Action::Copy,
+            Action::CopyPath
+        ]
     );
     assert_eq!(
         actions::action_for_key(actions::Key::Return, plain),
@@ -100,6 +106,9 @@ fn the_result_hints_match_the_key_map() {
         actions::action_for_key(actions::Key::Char('c'), option_cmd),
         Some(Action::CopyPath)
     );
-    // Cmd+C alone copies nothing in the results, so no hint shows it.
-    assert_eq!(actions::action_for_key(actions::Key::Char('c'), cmd), None);
+    // Cmd+C copies the files, as in Finder (run 2.12).
+    assert_eq!(
+        actions::action_for_key(actions::Key::Char('c'), cmd),
+        Some(Action::Copy)
+    );
 }

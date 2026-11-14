@@ -2,11 +2,12 @@
 //!
 //! - [`ResultsTableView`]: an `NSTableView` subclass that maps Space and
 //!   Escape to the Quick Look panel through [`preview_command`], other keys
-//!   through [`action_for_key`] and Escape through [`escape_action`], leaves
-//!   `copy:` unanswered so Edit > Copy is off, limits drag-out to copy and
-//!   link, tracks the row under the pointer for the rows' hover look and,
-//!   in `measure` builds, records its draw times for the launch and gate
-//!   probes.
+//!   through [`action_for_key`] and Escape through [`escape_action`],
+//!   answers Edit > Copy (`copy:`) with the selected files, shows the
+//!   right-click menu (a right-click, a Control-click, the keyboard or
+//!   VoiceOver), limits drag-out to copy and link, tracks the row under the
+//!   pointer for the rows' hover look and, in `measure` builds, records its
+//!   draw times for the launch and gate probes.
 //! - [`WinController`]: data source and delegate of the table, target and
 //!   delegate of the search field, application delegate and timer target.
 //!   It owns the [`ResultsController`]. It is also the status menu's target
@@ -20,8 +21,10 @@
 //!   focus, answers the chips, column titles, syntax examples and ×,
 //!   highlights matches in the visible rows, and times each search for the
 //!   status bar. It controls the Quick Look panel while the panel shows the
-//!   selection (its data source and delegate, see `quick_look.rs`), and
-//!   announces a new search's result count to VoiceOver.
+//!   selection (its data source and delegate, see `quick_look.rs`),
+//!   announces a new search's result count to VoiceOver, and builds the
+//!   right-click menu, delegates it and its Open With submenu, and performs
+//!   their items (see `context_menu.rs`).
 //! - [`Waker`]: a stateless object the background threads message with
 //!   `performSelectorOnMainThread:` to have the main thread drain the inbox.
 
@@ -51,11 +54,12 @@ use objc2_app_kit::{
     NSAccessibilityPostNotificationWithUserInfo, NSAccessibilityPriorityKey,
     NSAccessibilityPriorityLevel, NSApplication, NSApplicationDelegate, NSControl,
     NSControlTextEditingDelegate, NSDragOperation, NSDraggingContext, NSEvent,
-    NSEventModifierFlags, NSEventType, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
+    NSEventModifierFlags, NSEventType, NSFontAttributeName, NSForegroundColorAttributeName, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSPasteboardTypeString, NSPasteboardWriting, NSResponder,
     NSSearchFieldDelegate, NSTableColumn, NSTableRowView, NSTableView, NSTableViewDataSource,
     NSTableViewDelegate, NSTextAlignment, NSTextFieldDelegate, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindow, NSWindowOcclusionState, NSWorkspace,
+    NSTrackingAreaOptions, NSView, NSViewContentSelectionInfo, NSWindow, NSWindowOcclusionState,
+    NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSDictionary, NSIndexSet, NSMutableAttributedString, NSMutableIndexSet, NSNotFound,
@@ -68,6 +72,7 @@ use objc2_foundation::{NSDate, NSRunLoop};
 use super::callout::Callout;
 use super::card::{ResultCell, ResultRowView, ResultsCard};
 use super::chrome::{RootView, SearchField, SearchWindow, TopBar};
+use super::context_menu::{self as menus, file_url};
 use super::quick_look;
 use super::resident::ResidentState;
 use super::status::StatusBar;
@@ -86,6 +91,10 @@ use crate::appkit::spike::next_scroll_y;
 use crate::appkit::time_zone::SystemTimeZone;
 use crate::chips::QueryOptions;
 use crate::columns::{Column, SortState};
+use crate::context_menu::{
+    ContextItem, MAX_KIND_CHECKS, MenuEntry, MenuRequest, MenuTargets, TargetMix, item_limit,
+    menu_entries, menu_targets, open_with_entries, target_mix,
+};
 use crate::controller::{
     CopiedPaths, DEFAULT_THROTTLE, MAX_COPY_PATHS, MAX_KEPT_SELECTION, RequestId,
     ResultsController, SearchRequest,
@@ -104,7 +113,7 @@ use crate::quick_look::{
 };
 use crate::quit::{QuitStep, quit_steps};
 use crate::source::{ResultPage, ResultsSource};
-use crate::status_view::{StatusInput, status_view};
+use crate::status_view::{Copied, StatusInput, status_view};
 use crate::theme::{Theme, Token, TypeStyle, metrics, styles};
 use crate::window_view::{body, folder_highlights, with_example};
 
@@ -170,9 +179,13 @@ define_class!(
         /// A click on a row moves the keyboard focus to the results, so the
         /// arrow keys move from the clicked row at once. Clicks land on a
         /// row's labels, which refuse the focus, so the window would leave
-        /// it in the search field.
+        /// it in the search field. A Control-click is a right-click.
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            if event.modifierFlags().contains(NSEventModifierFlags::Control) {
+                self.pop_up_menu(event);
+                return;
+            }
             if let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self));
             }
@@ -205,11 +218,74 @@ define_class!(
             let _: () = unsafe { msg_send![super(self), keyDown: event] };
         }
 
-        // No `copy:` here, on purpose: with nothing in the responder chain
-        // answering it, AppKit greys out Edit > Copy while the table has
-        // the focus. Cmd+C is kept for copying the files themselves, as in
-        // Finder, which is not built yet; Option+Cmd+C copies the paths
-        // through `keyDown:` and `action_for_key`.
+        /// A right-click shows the menu for the clicked row or the
+        /// selection ([`menu_targets`]), or nothing on empty space. The
+        /// table's own handling is skipped: it would draw the system's
+        /// outline around the row, where the design shows the hover look,
+        /// and select nothing either way.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            self.pop_up_menu(event);
+        }
+
+        /// The menu for `event`, also asked for by AppKit when the keyboard
+        /// (Control-Return) or VoiceOver shows the menu, with a right-click
+        /// at [`selectionAnchorRect`](Self::selection_anchor_rect).
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            let mut menu = None;
+            with_controller(|c| menu = c.menu_for_event(event));
+            menu
+        }
+
+        /// The keyboard or VoiceOver asks for the menu: with nothing
+        /// selected there is nothing to act on, so the request goes on up
+        /// the responder chain; otherwise the first selected row is
+        /// scrolled into view and AppKit shows the menu there.
+        #[unsafe(method(showContextMenuForSelection:))]
+        fn show_context_menu_for_selection(&self, sender: Option<&AnyObject>) {
+            let first = self.selectedRowIndexes().firstIndex();
+            let first = (first != NSNotFound as usize)
+                .then(|| isize::try_from(first).ok())
+                .flatten();
+            let Some(first) = first else {
+                // SAFETY: reading the responder chain on the main thread.
+                if let Some(next) = unsafe { self.nextResponder() } {
+                    // SAFETY: `tryToPerform:with:` takes a selector and an
+                    // optional object, and returns whether one handled it.
+                    let _: bool = unsafe {
+                        msg_send![&*next, tryToPerform: sel!(showContextMenuForSelection:), with: sender]
+                    };
+                }
+                return;
+            };
+            self.scrollRowToVisible(first);
+            // SAFETY: `showContextMenuForSelection:` takes an optional sender
+            // and returns void.
+            let _: () = unsafe { msg_send![super(self), showContextMenuForSelection: sender] };
+        }
+
+        /// Edit > Copy, and Cmd+C through it: the selected files, as
+        /// Finder's Copy ([`Action::Copy`]).
+        #[unsafe(method(copy:))]
+        fn copy(&self, _sender: Option<&AnyObject>) {
+            with_controller(|c| c.perform(Action::Copy, None));
+        }
+
+        /// Edit > Copy is on while a row is selected.
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            if item.action() == Some(sel!(copy:)) {
+                self.numberOfSelectedRows() > 0
+            } else if NSTableView::class().responds_to(sel!(validateMenuItem:)) {
+                // SAFETY: the superclass implements `validateMenuItem:`,
+                // which takes a menu item and returns a BOOL.
+                let enabled: bool = unsafe { msg_send![super(self), validateMenuItem: item] };
+                enabled
+            } else {
+                true
+            }
+        }
 
         /// Drag-out offers copy and link only, whatever the destination.
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
@@ -251,6 +327,22 @@ define_class!(
             }
         }
     }
+
+    // SAFETY: NSTableView inherits NSObject's conformance.
+    unsafe impl NSObjectProtocol for ResultsTableView {}
+
+    // SAFETY: `selectionAnchorRect` returns an NSRect in the table's
+    // coordinates, as the protocol asks.
+    unsafe impl NSViewContentSelectionInfo for ResultsTableView {
+        /// Where the keyboard's and VoiceOver's menu opens: on the first
+        /// selected row in view, else the first selected row.
+        #[unsafe(method(selectionAnchorRect))]
+        fn selection_anchor_rect(&self) -> NSRect {
+            let mut rect = NSRect::ZERO;
+            with_controller(|c| rect = c.selection_anchor());
+            rect
+        }
+    }
 );
 
 impl ResultsTableView {
@@ -281,6 +373,16 @@ impl ResultsTableView {
     fn hover_at(&self, point: NSPoint) {
         let row = usize::try_from(self.rowAtPoint(point)).ok();
         with_controller(|c| c.set_hover_row(row));
+    }
+
+    /// Shows the right-click menu for `event` (a right-click or a
+    /// Control-click), if it has one; nothing on empty space.
+    fn pop_up_menu(&self, event: &NSEvent) {
+        let mut menu = None;
+        with_controller(|c| menu = c.menu_for_event(event));
+        if let Some(menu) = menu {
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+        }
     }
 }
 
@@ -323,6 +425,91 @@ fn debug_key(window: &SearchWindow, ch: char, code: u16, flags: NSEventModifierF
             window.sendEvent(&event);
         }
     }
+}
+
+/// A debug script's key press (key code `code`) with `flags`, typing
+/// `chars` (`ignoring` without the modifiers but Shift), sent through the
+/// application as the hardware's are, so the main menu's key equivalents
+/// (Edit > Copy's Cmd+C) and the context-menu key fire before the window's
+/// own handling.
+#[cfg(debug_assertions)]
+fn debug_app_key(
+    mtm: MainThreadMarker,
+    window: &SearchWindow,
+    [chars, ignoring]: [&str; 2],
+    code: u16,
+    flags: NSEventModifierFlags,
+) {
+    let text = NSString::from_str(chars);
+    let ignoring = NSString::from_str(ignoring);
+    // The hardware sends keys to the key window: the Quick Look panel
+    // while it shows.
+    let app = NSApplication::sharedApplication(mtm);
+    let number = app
+        .keyWindow()
+        .map_or_else(|| window.windowNumber(), |w| w.windowNumber());
+    for kind in [NSEventType::KeyDown, NSEventType::KeyUp] {
+        let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            kind,
+            NSPoint::new(0.0, 0.0),
+            flags,
+            0.0,
+            number,
+            None,
+            &text,
+            &ignoring,
+            false,
+            code,
+        );
+        if let Some(event) = event {
+            NSApplication::sharedApplication(mtm).sendEvent(&event);
+        }
+    }
+}
+
+/// A debug log line per item of `menu`: its title, whether it is hidden or
+/// enabled, its shortcut, whether it has an image, its tag and its
+/// submenu's size.
+#[cfg(debug_assertions)]
+fn debug_menu_items(menu: &NSMenu, indent: &str) -> String {
+    let mut out = Vec::new();
+    for i in 0..menu.numberOfItems() {
+        let Some(item) = menu.itemAtIndex(i) else {
+            continue;
+        };
+        if item.isSeparatorItem() {
+            out.push(format!("{indent}----"));
+            continue;
+        }
+        let mask = item.keyEquivalentModifierMask();
+        let mut keys = String::new();
+        for (flag, cap) in [
+            (NSEventModifierFlags::Control, "⌃"),
+            (NSEventModifierFlags::Option, "⌥"),
+            (NSEventModifierFlags::Shift, "⇧"),
+            (NSEventModifierFlags::Command, "⌘"),
+        ] {
+            if mask.contains(flag) {
+                keys.push_str(cap);
+            }
+        }
+        keys.push_str(&format!("{:?}", item.keyEquivalent().to_string()));
+        out.push(format!(
+            "{indent}{:?} hidden {} enabled {} keys {} image {} tag {} submenu {:?}",
+            item.title().to_string(),
+            item.isHidden(),
+            item.isEnabled(),
+            if item.keyEquivalent().length() == 0 {
+                "-".to_owned()
+            } else {
+                keys
+            },
+            item.image().is_some(),
+            item.tag(),
+            item.submenu().map(|s| s.numberOfItems()),
+        ));
+    }
+    out.join("\n")
 }
 
 /// The range holding just `row`.
@@ -507,9 +694,24 @@ pub(crate) struct WinIvars {
     hover_row: Cell<Option<usize>>,
     /// Where the keyboard focus was at the last focus change.
     focus: Cell<Focus>,
-    /// A copy just stopped at the copy limit after this many paths; shown
-    /// until the status bar is next refreshed.
-    copy_note: Cell<Option<usize>>,
+    /// A copy just stopped at the copy limit; shown until the status bar is
+    /// next refreshed.
+    copy_note: Cell<Option<Copied>>,
+    /// The right-click menu, the table's `menu`, refilled each time it
+    /// opens.
+    context_menu: OnceCell<Retained<NSMenu>>,
+    /// Its Open With submenu, filled when it opens.
+    open_with_menu: RefCell<Option<Retained<NSMenu>>>,
+    /// What the menu's items act on, from when it was last filled; kept
+    /// after it closes, since AppKit sends the chosen item's action after
+    /// `menuDidClose:`.
+    menu_targets: Cell<Option<MenuTargets>>,
+    /// The menu was filled for a right-click (or AppKit's `menuForEvent:`)
+    /// and is open or opening: `menuNeedsUpdate:` keeps it.
+    menu_filled: Cell<bool>,
+    /// The menu gave the clicked row (outside the selection) the hover
+    /// look, to take back when it closes.
+    menu_hover: Cell<bool>,
     /// Whether the source was indexing at the last status refresh.
     was_indexing: Cell<Option<bool>>,
     /// The files the Quick Look panel shows.
@@ -705,7 +907,112 @@ define_class!(
         }
     }
 
+    // SAFETY: the delegate methods below have the signatures NSMenuDelegate
+    // declares.
+    unsafe impl NSMenuDelegate for WinController {
+        /// The right-click menu is about to show without a right-click (the
+        /// keyboard, VoiceOver): fill it for the selection. The Open With
+        /// submenu lists its apps the first time it opens.
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            self.menu_will_show(menu);
+        }
+
+        /// The right-click menu closed, before its chosen item acts.
+        #[unsafe(method(menuDidClose:))]
+        fn menu_did_close(&self, menu: &NSMenu) {
+            self.menu_closed(menu);
+        }
+    }
+
     impl WinController {
+        /// A right-click menu item; its tag names it ([`ContextItem`]).
+        #[unsafe(method(contextItem:))]
+        fn context_item_sel(&self, sender: &NSMenuItem) {
+            if let Some(item) = ContextItem::from_tag(sender.tag()) {
+                self.context_item(item);
+            }
+        }
+
+        /// An app in Open With; the item carries its path.
+        #[unsafe(method(openWithApp:))]
+        fn open_with_app_sel(&self, sender: &NSMenuItem) {
+            let app = sender
+                .representedObject()
+                .and_then(|o| o.downcast::<NSString>().ok())
+                .map(|p| p.to_string());
+            if let Some(app) = app {
+                let paths = self.menu_paths(ContextItem::OpenWith);
+                menus::open_with(&paths, &file_url(&app));
+            }
+        }
+
+        /// Open With > App Store….
+        #[unsafe(method(openWithAppStore:))]
+        fn open_with_app_store_sel(&self, _sender: Option<&AnyObject>) {
+            menus::open_app_store();
+        }
+
+        /// Open With > Other….
+        #[unsafe(method(openWithOther:))]
+        fn open_with_other_sel(&self, _sender: Option<&AnyObject>) {
+            let paths = self.menu_paths(ContextItem::OpenWith);
+            if !paths.is_empty() {
+                menus::choose_other_app(self.mtm(), &paths);
+            }
+        }
+
+        /// A debug script's right-click menu shown for real has been open
+        /// long enough: close it.
+        #[cfg(debug_assertions)]
+        #[unsafe(method(debugCloseMenu:))]
+        fn debug_close_menu(&self, _timer: &NSTimer) {
+            if let Some(menu) = self.ivars().context_menu.get() {
+                menu.cancelTracking();
+            }
+        }
+
+        /// A debug script's Other… panel has been open long enough: log
+        /// what it offers and close it without choosing.
+        #[cfg(debug_assertions)]
+        #[unsafe(method(debugEndModal:))]
+        fn debug_end_modal(&self, _timer: &NSTimer) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            if let Some(panel) = app.modalWindow() {
+                // SAFETY: an open panel answers `message`,
+                // `directoryURL` and `allowedContentTypes` (macOS 11) with
+                // a string, a URL and an array, or nil.
+                let message: Option<Retained<NSString>> = unsafe { msg_send![&*panel, message] };
+                // SAFETY: as above.
+                let folder: Option<Retained<NSURL>> = unsafe { msg_send![&*panel, directoryURL] };
+                // SAFETY: as above.
+                let types: Option<Retained<NSArray>> =
+                    unsafe { msg_send![&*panel, allowedContentTypes] };
+                let types: Vec<String> = types
+                    .map(|a| {
+                        a.iter()
+                            .map(|t| {
+                                // SAFETY: a UTType answers `identifier`
+                                // with a string.
+                                let id: Retained<NSString> =
+                                    unsafe { msg_send![&*t, identifier] };
+                                id.to_string()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "debug other: {:?} open, message {:?}, folder {:?}, types {types:?}",
+                    panel.class().name(),
+                    message.map(|m| m.to_string()),
+                    folder.and_then(|f| f.path()).map(|p| p.to_string()),
+                );
+            } else {
+                eprintln!("debug other: no panel open");
+            }
+            app.abortModal();
+        }
+
         /// Action of the search field: run the new query.
         #[unsafe(method(search:))]
         fn search_action(&self, _sender: Option<&AnyObject>) {
@@ -939,6 +1246,11 @@ impl WinController {
             hover_row: Cell::new(None),
             focus: Cell::new(Focus::SearchField),
             copy_note: Cell::new(None),
+            context_menu: OnceCell::new(),
+            open_with_menu: RefCell::new(None),
+            menu_targets: Cell::new(None),
+            menu_filled: Cell::new(false),
+            menu_hover: Cell::new(false),
             was_indexing: Cell::new(None),
             preview: RefCell::new(PreviewItems::default()),
             previewing: Cell::new(false),
@@ -981,6 +1293,17 @@ impl WinController {
 
     pub(crate) fn set_ui(&self, ui: WinUi) {
         views::set_scale(ui.window.backingScaleFactor());
+        // The right-click menu is the table's, so AppKit and VoiceOver find
+        // it; it is filled each time it opens, with only the items that
+        // apply, so none is greyed out (Open With would be, its submenu
+        // being empty until it opens).
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), &NSString::from_str(""));
+        menu.setAutoenablesItems(false);
+        menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+        // SAFETY: the menu is a plain NSMenu the table keeps; its delegate
+        // is the controller, which lives until the app quits.
+        unsafe { ui.table.setMenu(Some(&menu)) };
+        let _ = self.ivars().context_menu.set(menu);
         let _ = self.ivars().ui.set(ui);
         views::set_theme(self.window_theme());
         self.restyle();
@@ -1175,6 +1498,13 @@ impl WinController {
                     false,
                 );
             }
+            Step::SelectRange(first, last) => {
+                let rows = NSIndexSet::indexSetWithIndexesInRange(NSRange::new(
+                    first,
+                    last.saturating_sub(first) + 1,
+                ));
+                ui.table.selectRowIndexes_byExtendingSelection(&rows, false);
+            }
             Step::FocusResults => {
                 ui.window.makeFirstResponder(Some(&ui.table));
             }
@@ -1265,6 +1595,19 @@ impl WinController {
                     let (count, took) = super::debug_script::ax_count(table.as_ref(), name);
                     eprintln!("debug ax {name}: {count:?} in {took:?}");
                 }
+                // SAFETY: every AppKit object answers
+                // `accessibilityActionNames` with an array of strings.
+                let actions: Option<Retained<NSArray>> =
+                    unsafe { msg_send![table, accessibilityActionNames] };
+                eprintln!(
+                    "debug ax actions: {:?}",
+                    actions.map(|a| a
+                        .iter()
+                        .map(|s| s
+                            .downcast::<NSString>()
+                            .map_or_else(|_| String::new(), |s| s.to_string()))
+                        .collect::<Vec<_>>())
+                );
                 let results = self.ivars().results.borrow();
                 eprintln!(
                     "debug ax announcement: {:?}",
@@ -1283,6 +1626,94 @@ impl WinController {
                     (0..preview.len())
                         .filter_map(|i| preview.get(i))
                         .collect::<Vec<_>>(),
+                );
+            }
+            Step::Menu(at, what) => self.debug_menu(ui, at, what),
+            Step::RightClick(row, secs) => {
+                let r = ui.table.rectOfRow(row as isize);
+                let point = NSPoint::new(r.origin.x + 40.0, r.origin.y + r.size.height / 2.0);
+                let at = ui.table.convertPoint_toView(point, None);
+                self.debug_close_menu_after(secs);
+                eprintln!("debug rclick: showing the menu for {secs} s");
+                if let Some(down) = debug_mouse(&ui.window, NSEventType::RightMouseDown, at) {
+                    // Shows the menu and tracks it until the timer closes it.
+                    ui.window.sendEvent(&down);
+                }
+                eprintln!("debug menu closed; {}", self.debug_menu_state());
+            }
+            Step::MenuKey(secs) => {
+                self.debug_close_menu_after(secs);
+                self.ivars().menu_targets.set(None);
+                eprintln!("debug rclick: showing the menu for {secs} s, by Control-Return");
+                // Control-Return, the system's default key for the context
+                // menu, through the application as a real key press.
+                debug_app_key(
+                    self.mtm(),
+                    &ui.window,
+                    ["\r", "\r"],
+                    36,
+                    NSEventModifierFlags::Control,
+                );
+                eprintln!("debug menu closed; {}", self.debug_menu_state());
+            }
+            Step::ShowMenu(secs) => {
+                self.debug_close_menu_after(secs);
+                self.ivars().menu_targets.set(None);
+                eprintln!("debug rclick: showing the menu for {secs} s, as VoiceOver asks");
+                // SAFETY: `showContextMenuForSelection:` takes an optional
+                // sender; it shows the menu and returns once it closes.
+                let _: () = unsafe {
+                    msg_send![&*ui.table, showContextMenuForSelection: Option::<&AnyObject>::None]
+                };
+                eprintln!("debug menu closed; {}", self.debug_menu_state());
+            }
+            Step::Origin(x, y) => {
+                let top = objc2_app_kit::NSScreen::screens(self.mtm())
+                    .firstObject()
+                    .map_or(0.0, |s| s.frame().size.height);
+                ui.window.setFrameTopLeftPoint(NSPoint::new(x, top - y));
+            }
+            Step::Pasteboard => {
+                let pasteboard = menus::copy_pasteboard();
+                // SAFETY: reading an immutable AppKit string constant.
+                let kind = unsafe { NSPasteboardTypeString };
+                eprintln!(
+                    "debug pasteboard {:?}: types {:?}, files {:?}, text {:?}",
+                    pasteboard.name().to_string(),
+                    menus::pasteboard_types(&pasteboard),
+                    menus::read_files(&pasteboard),
+                    pasteboard.stringForType(kind).map(|s| s.to_string()),
+                );
+            }
+            Step::Chord(chord) => {
+                use super::debug_script::Chord;
+                // What a US keyboard types with each chord.
+                let (flags, chars) = match chord {
+                    Chord::CmdC => (NSEventModifierFlags::empty(), ["c", "c"]),
+                    Chord::OptionCmdC => (NSEventModifierFlags::Option, ["\u{e7}", "c"]),
+                    Chord::ShiftCmdC => (NSEventModifierFlags::Shift, ["C", "C"]),
+                    Chord::ControlCmdC => (NSEventModifierFlags::Control, ["\u{3}", "c"]),
+                };
+                let flags = flags | NSEventModifierFlags::Command;
+                debug_app_key(self.mtm(), &ui.window, chars, 8, flags);
+            }
+            Step::Status => {
+                // The window's number and frame from the screen's top left,
+                // as `screencapture -l` and `-R` take them.
+                let f = ui.window.frame();
+                // Global coordinates run down from the top of the first
+                // screen, the one with the menu bar.
+                let top = objc2_app_kit::NSScreen::screens(self.mtm())
+                    .firstObject()
+                    .map_or(0.0, |s| s.frame().size.height);
+                eprintln!(
+                    "debug status: window {} at {:.0},{:.0},{:.0},{:.0}; {}",
+                    ui.window.windowNumber(),
+                    f.origin.x,
+                    top - f.origin.y - f.size.height,
+                    f.size.width,
+                    f.size.height,
+                    ui.status.debug_layout()
                 );
             }
             Step::Type(text) => {
@@ -1308,6 +1739,153 @@ impl WinController {
             self.ivars().results.borrow().current_request(),
         );
         true
+    }
+
+    /// A debug script's `menu:` step: fills the right-click menu as a
+    /// right-click `at` a row (or below the rows, or from the keyboard)
+    /// would, without showing it, then logs it, performs one of its items
+    /// as choosing it would (closing it first, as AppKit does), or fills
+    /// and logs its Open With submenu.
+    #[cfg(debug_assertions)]
+    fn debug_menu(
+        &self,
+        ui: &WinUi,
+        at: super::debug_script::MenuAt,
+        what: super::debug_script::MenuStep,
+    ) {
+        use super::debug_script::{MenuAt, MenuStep};
+        let point = match at {
+            MenuAt::Row(row) => {
+                let r = ui.table.rectOfRow(row as isize);
+                Some(NSPoint::new(
+                    r.origin.x + 40.0,
+                    r.origin.y + r.size.height / 2.0,
+                ))
+            }
+            MenuAt::Empty => {
+                let v = ui.table.visibleRect();
+                Some(NSPoint::new(
+                    v.origin.x + 40.0,
+                    v.origin.y + v.size.height - 4.0,
+                ))
+            }
+            MenuAt::Keyboard => None,
+        };
+        let menu = match point {
+            Some(point) => {
+                let at = ui.table.convertPoint_toView(point, None);
+                debug_mouse(&ui.window, NSEventType::RightMouseDown, at)
+                    .and_then(|event| self.menu_for_event(&event))
+            }
+            None => self.fill_menu(MenuRequest::Keyboard),
+        };
+        eprintln!(
+            "debug menu {at:?}: {}, acts on {:?}",
+            self.debug_menu_state(),
+            self.menu_paths(ContextItem::Open)
+                .iter()
+                .map(|p| p.rsplit('/').next().unwrap_or(p))
+                .collect::<Vec<_>>(),
+        );
+        let Some(menu) = menu else {
+            eprintln!("debug menu {at:?}: no menu");
+            return;
+        };
+        menu.update();
+        match what {
+            MenuStep::Log => eprintln!("{}", debug_menu_items(&menu, "  ")),
+            MenuStep::OpenWith => {
+                let apps = self.ivars().open_with_menu.borrow().clone();
+                match apps {
+                    Some(apps) => {
+                        let start = Instant::now();
+                        self.menu_will_show(&apps);
+                        eprintln!(
+                            "debug open with ({:?}):\n{}",
+                            start.elapsed(),
+                            debug_menu_items(&apps, "  ")
+                        );
+                    }
+                    None => eprintln!("debug open with: no Open With item"),
+                }
+            }
+            MenuStep::Other => {
+                let apps = self.ivars().open_with_menu.borrow().clone();
+                self.menu_closed(&menu);
+                let Some(apps) = apps else {
+                    eprintln!("debug other: no Open With item");
+                    return;
+                };
+                self.menu_will_show(&apps);
+                let target: &AnyObject = self.as_ref();
+                // SAFETY: `debugEndModal:` is implemented as
+                // `-(void)debugEndModal:(NSTimer *)timer`; the run loop
+                // retains the timer, which retains its target until it
+                // fires once, in the panel's modal run loop mode.
+                unsafe {
+                    let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                        2.0,
+                        target,
+                        sel!(debugEndModal:),
+                        None,
+                        false,
+                    );
+                    NSRunLoop::currentRunLoop()
+                        .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes);
+                }
+                let last = apps.numberOfItems() - 1;
+                apps.performActionForItemAtIndex(last);
+                eprintln!("debug other: closed without choosing");
+                return;
+            }
+            MenuStep::Perform(item) => {
+                self.menu_closed(&menu);
+                match menu.indexOfItemWithTag(item.tag()) {
+                    -1 => eprintln!("debug menu: no {item:?} item"),
+                    i => {
+                        menu.performActionForItemAtIndex(i);
+                        eprintln!("debug menu: performed {item:?}");
+                    }
+                }
+                return;
+            }
+        }
+        self.menu_closed(&menu);
+    }
+
+    /// What the right-click menu acts on and its state, for the debug log.
+    #[cfg(debug_assertions)]
+    fn debug_menu_state(&self) -> String {
+        let iv = self.ivars();
+        format!(
+            "targets {:?}, filled {}, hover row {:?}, selected {}",
+            iv.menu_targets.get(),
+            iv.menu_filled.get(),
+            iv.hover_row.get(),
+            self.ui().map_or(0, |ui| ui.table.numberOfSelectedRows()),
+        )
+    }
+
+    /// Schedules a timer, in the run loop's common modes so it fires while
+    /// a menu tracks the mouse, that closes the right-click menu after
+    /// `secs` seconds.
+    #[cfg(debug_assertions)]
+    fn debug_close_menu_after(&self, secs: f64) {
+        let target: &AnyObject = self.as_ref();
+        // SAFETY: `debugCloseMenu:` is implemented as `-(void)debugCloseMenu:
+        // (NSTimer *)timer`; the run loop retains the timer, which retains
+        // its target until it fires once.
+        unsafe {
+            let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                secs,
+                target,
+                sel!(debugCloseMenu:),
+                None,
+                false,
+            );
+            NSRunLoop::currentRunLoop()
+                .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes);
+        }
     }
 
     /// The pasteboard writer for dragging `row` out: its file URL.
@@ -1744,7 +2322,7 @@ impl WinController {
         let limit = match action {
             Action::Open | Action::RevealInFinder => MAX_OPEN,
             // One row past the cap, so the controller reports truncation.
-            Action::CopyPath => MAX_COPY_PATHS + 1,
+            Action::Copy | Action::CopyPath => MAX_COPY_PATHS + 1,
             Action::QuickLook => MAX_PREVIEW_ITEMS,
         };
         if action == Action::QuickLook && quick_look::is_open() {
@@ -1788,20 +2366,287 @@ impl WinController {
                 let urls: Vec<Retained<NSURL>> = paths.iter().map(|p| file_url(p)).collect();
                 workspace.activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&urls));
             }
+            Action::Copy => {
+                menus::write_files(&menus::copy_pasteboard(), &paths);
+                if copied.truncated {
+                    self.ivars().copy_note.set(Some(Copied::Files(paths.len())));
+                    self.update_status();
+                }
+            }
             Action::CopyPath => {
-                let pasteboard = NSPasteboard::generalPasteboard();
+                let pasteboard = menus::copy_pasteboard();
                 pasteboard.clearContents();
                 // SAFETY: reading an immutable AppKit string constant.
                 let kind = unsafe { NSPasteboardTypeString };
                 pasteboard.setString_forType(&NSString::from_str(&copy_text(&paths)), kind);
                 if copied.truncated {
-                    self.ivars().copy_note.set(Some(paths.len()));
+                    self.ivars().copy_note.set(Some(Copied::Paths(paths.len())));
                     self.update_status();
                 }
             }
             // Shown above, before the paths were taken.
             Action::QuickLook => {}
         }
+    }
+
+    // -------------------------------------------------- right-click menu
+
+    /// The right-click menu for `event` on the table, filled for what it
+    /// acts on ([`menu_targets`]): the clicked row, or the selection when
+    /// the click is inside it. `None` (no menu) on empty space.
+    pub(super) fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+        let ui = self.ui()?;
+        let point = ui
+            .table
+            .convertPoint_fromView(event.locationInWindow(), None);
+        let row = usize::try_from(ui.table.rowAtPoint(point)).ok();
+        let row_selected = row
+            .and_then(|r| isize::try_from(r).ok())
+            .is_some_and(|r| ui.table.isRowSelected(r));
+        let menu = self.fill_menu(MenuRequest::Pointer { row, row_selected })?;
+        self.ivars().menu_filled.set(true);
+        Some(menu)
+    }
+
+    /// Fills the right-click menu for `request` and returns it; `None`
+    /// (the menu left empty) when there is nothing to act on. A row
+    /// outside the selection takes the hover look while the menu is open.
+    fn fill_menu(&self, request: MenuRequest) -> Option<Retained<NSMenu>> {
+        let ui = self.ui()?;
+        let menu = self.ivars().context_menu.get()?.clone();
+        menu.removeAllItems();
+        self.ivars().open_with_menu.replace(None);
+        let selected = usize::try_from(ui.table.numberOfSelectedRows()).unwrap_or(0);
+        let targets = menu_targets(request, selected);
+        self.ivars().menu_targets.set(targets);
+        let targets = targets?;
+        if let MenuTargets::Row(row) = targets {
+            self.set_hover_row(Some(row));
+            self.ivars().menu_hover.set(true);
+        }
+        let mix = self.target_mix_of(targets, selected);
+        let mtm = self.mtm();
+        let target: &AnyObject = self.as_ref();
+        for entry in menu_entries(mix) {
+            let item = match entry {
+                MenuEntry::Separator => NSMenuItem::separatorItem(mtm),
+                MenuEntry::Item(item) => {
+                    let entry = menus::context_item(mtm, item, sel!(contextItem:), target);
+                    if item == ContextItem::OpenWith {
+                        // Its apps are listed when it opens.
+                        let apps = NSMenu::initWithTitle(
+                            NSMenu::alloc(mtm),
+                            &NSString::from_str(item.title()),
+                        );
+                        apps.setAutoenablesItems(false);
+                        apps.setDelegate(Some(ProtocolObject::from_ref(self)));
+                        entry.setSubmenu(Some(&apps));
+                        // SAFETY: an item with a submenu sends no action.
+                        unsafe { entry.setAction(None) };
+                        self.ivars().open_with_menu.replace(Some(apps));
+                    }
+                    entry
+                }
+            };
+            menu.addItem(&item);
+        }
+        Some(menu)
+    }
+
+    /// What the targets are on disk together ([`target_mix`]), read for at
+    /// most [`MAX_KIND_CHECKS`] of them; more, or rows that can't be read
+    /// now, count as [`TargetMix::Other`].
+    fn target_mix_of(&self, targets: MenuTargets, selected: usize) -> TargetMix {
+        let count = targets.count(selected);
+        if count == 0 || count > MAX_KIND_CHECKS {
+            return TargetMix::Other;
+        }
+        let paths = self.target_paths(targets, count).paths;
+        if paths.len() != count {
+            return TargetMix::Other;
+        }
+        let workspace = NSWorkspace::sharedWorkspace();
+        target_mix(paths.iter().map(|p| menus::target_kind(&workspace, p)))
+    }
+
+    /// The first `limit` targets' full paths, resolved as the keyboard's
+    /// actions resolve the selection.
+    fn target_paths(&self, targets: MenuTargets, limit: usize) -> CopiedPaths {
+        let copied = match targets {
+            MenuTargets::Selection => {
+                let ranges = self.selected_ranges(limit);
+                let selected = self.ui().map_or(0, |ui| ui.table.numberOfSelectedRows());
+                self.ivars()
+                    .results
+                    .borrow_mut()
+                    .paths_of_selection(&ranges, usize::try_from(selected).unwrap_or(0))
+            }
+            MenuTargets::Row(row) => self
+                .ivars()
+                .results
+                .borrow_mut()
+                .paths_for_ranges(&[one_row(row)]),
+        };
+        self.schedule_tick_if_pending();
+        copied
+    }
+
+    /// The paths the menu's `item` acts on: its targets, at most
+    /// [`item_limit`] of them.
+    fn menu_paths(&self, item: ContextItem) -> Vec<String> {
+        self.ivars()
+            .menu_targets
+            .get()
+            .map(|t| self.target_paths(t, item_limit(item)).paths)
+            .unwrap_or_default()
+    }
+
+    /// The menu is about to show: a right-click filled it already; the
+    /// keyboard and VoiceOver get it for the selection. The Open With
+    /// submenu lists its apps once per menu.
+    fn menu_will_show(&self, menu: &NSMenu) {
+        let iv = self.ivars();
+        if iv
+            .context_menu
+            .get()
+            .is_some_and(|m| std::ptr::eq(&**m, menu))
+        {
+            if !iv.menu_filled.get() {
+                let _ = self.fill_menu(MenuRequest::Keyboard);
+            }
+            return;
+        }
+        let is_open_with = iv
+            .open_with_menu
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| std::ptr::eq(&**m, menu));
+        if is_open_with && menu.numberOfItems() == 0 {
+            self.fill_open_with(menu);
+        }
+    }
+
+    /// Lists the apps that can open the targets in the Open With submenu
+    /// ([`open_with_entries`]).
+    fn fill_open_with(&self, menu: &NSMenu) {
+        let paths = self.menu_paths(ContextItem::OpenWith);
+        if paths.is_empty() {
+            return;
+        }
+        let (apps, default) = menus::open_with_apps(&paths);
+        let target: &AnyObject = self.as_ref();
+        let actions = [
+            sel!(openWithApp:),
+            sel!(openWithAppStore:),
+            sel!(openWithOther:),
+        ];
+        for entry in open_with_entries(default.as_deref(), apps) {
+            menu.addItem(&menus::open_with_item(self.mtm(), &entry, target, actions));
+        }
+    }
+
+    /// The right-click menu closed (before the chosen item's action, which
+    /// still finds its targets): the clicked row loses the hover look,
+    /// unless the pointer is over it.
+    fn menu_closed(&self, menu: &NSMenu) {
+        let iv = self.ivars();
+        if !iv
+            .context_menu
+            .get()
+            .is_some_and(|m| std::ptr::eq(&**m, menu))
+        {
+            return;
+        }
+        iv.menu_filled.set(false);
+        if iv.menu_hover.replace(false) {
+            let Some(ui) = self.ui() else { return };
+            let point = ui
+                .table
+                .convertPoint_fromView(ui.window.mouseLocationOutsideOfEventStream(), None);
+            let row = usize::try_from(ui.table.rowAtPoint(point))
+                .ok()
+                .filter(|_| ui.window.isKeyWindow());
+            self.set_hover_row(row);
+        }
+    }
+
+    /// Performs the right-click menu's `item` on the targets the menu was
+    /// filled for.
+    fn context_item(&self, item: ContextItem) {
+        let Some(targets) = self.ivars().menu_targets.get() else {
+            return;
+        };
+        let rows = match targets {
+            MenuTargets::Selection => None,
+            MenuTargets::Row(row) => Some(vec![one_row(row)]),
+        };
+        match item {
+            ContextItem::QuickLook => self.menu_quick_look(targets),
+            ContextItem::Share => {
+                let paths = self.menu_paths(item);
+                if let Some(ui) = self.ui() {
+                    menus::share(&paths, &ui.table, self.target_rect(targets));
+                }
+            }
+            ContextItem::NewTerminal => menus::new_terminal(&self.menu_paths(item)),
+            // A submenu, which sends no action.
+            ContextItem::OpenWith => {}
+            ContextItem::Open
+            | ContextItem::RevealInFinder
+            | ContextItem::Copy
+            | ContextItem::CopyPath => {
+                if let Some(action) = item.action() {
+                    self.perform(action, rows);
+                }
+            }
+        }
+    }
+
+    /// Quick Look from the menu: on a row outside the selection, selects
+    /// it first; then shows the selection in the panel, which it opens and
+    /// never closes (Space toggles; the menu shows).
+    fn menu_quick_look(&self, targets: MenuTargets) {
+        let Some(ui) = self.ui() else { return };
+        if let MenuTargets::Row(row) = targets {
+            ui.table
+                .selectRowIndexes_byExtendingSelection(&NSIndexSet::indexSetWithIndex(row), false);
+        }
+        let resolved = self.selection_for_preview();
+        self.show_preview(resolved);
+    }
+
+    /// Where Share… shows its picker from: the clicked row, or the
+    /// selection's anchor.
+    fn target_rect(&self, targets: MenuTargets) -> NSRect {
+        match (targets, self.ui()) {
+            (MenuTargets::Row(row), Some(ui)) => {
+                isize::try_from(row).map_or(NSRect::ZERO, |r| ui.table.rectOfRow(r))
+            }
+            _ => self.selection_anchor(),
+        }
+    }
+
+    /// The first selected row in view, else the first selected row (zero
+    /// with nothing selected), in the table's coordinates: where the
+    /// keyboard's and VoiceOver's menu opens.
+    pub(super) fn selection_anchor(&self) -> NSRect {
+        let Some(ui) = self.ui() else {
+            return NSRect::ZERO;
+        };
+        let set = ui.table.selectedRowIndexes();
+        let in_view = ui.table.rowsInRect(ui.table.visibleRect());
+        let first_in_view = set.indexGreaterThanOrEqualToIndex(in_view.location);
+        let row = if first_in_view != NSNotFound as usize
+            && first_in_view < in_view.location + in_view.length
+        {
+            first_in_view
+        } else {
+            set.firstIndex()
+        };
+        if row == NSNotFound as usize {
+            return NSRect::ZERO;
+        }
+        isize::try_from(row).map_or(NSRect::ZERO, |r| ui.table.rectOfRow(r))
     }
 
     // --------------------------------------------------------- Quick Look
@@ -2524,11 +3369,6 @@ fn highlighted(
         }
     }
     Retained::into_super(s)
-}
-
-/// A file URL for `path`.
-fn file_url(path: &str) -> Retained<NSURL> {
-    NSURL::fileURLWithPath(&NSString::from_str(path))
 }
 
 /// Prints and flushes, since `terminate:` exits without running Rust

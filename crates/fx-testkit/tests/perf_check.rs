@@ -11,6 +11,9 @@
 //!   with the app's `measure` feature, and finishes with `perf-compare`;
 //! - it validates its arguments before taking the lock, building or
 //!   creating anything, and never touches an existing `--out`;
+//! - it refuses to start on a locked screen, before taking the lock and
+//!   again once it holds it, and records the screen's state in `run.txt`
+//!   (with fake `ioreg`, `cargo` and benchmarks, so nothing is built);
 //! - it deletes nothing but its own lock and, when it ends, its own scratch
 //!   folder (it leaves `$TMPDIR` as it found it), runs only the app and
 //!   `fx-bench churn` in the background (the app has to run while it is
@@ -468,40 +471,19 @@ mod refusals {
     /// fails, through a `cargo` that only exits 1) leaves nothing in
     /// `$TMPDIR`: no lock and no scratch folder, whose files the app would
     /// otherwise index in every later run. `--out` keeps `run.txt`, which
-    /// records the displays by size only.
+    /// records the displays by size only. The screen reads as unlocked
+    /// (a fake `ioreg`), so the test passes on a locked Mac too.
     #[cfg(target_os = "macos")]
     #[test]
     fn removes_its_scratch_folder_and_lock_when_it_stops() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = temp_path("perf-check-scratch");
-        let bin = root.join("bin");
-        let tmp = root.join("tmp");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&tmp).unwrap();
-        let cargo = bin.join("cargo");
-        fs::write(&cargo, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-        let out = root.join("out");
-        let mut cmd = Command::new("sh");
-        cmd.arg(repo_root().join(SCRIPT))
-            .args(["--tier", "quick", "--out", out.to_str().unwrap()])
-            .env(
-                "PATH",
-                format!("{}:{}", bin.display(), common::shell::SYSTEM_PATH),
-            )
-            .env("TMPDIR", &tmp);
-        let res = run_with_timeout(&mut cmd);
+        let fakes = crate::fakes::Fakes::new("perf-check-scratch");
+        fakes.cargo(1, "");
+        fakes.ioreg("false");
+        let res = fakes.run(common::shell::SYSTEM_PATH, &["--tier", "quick"]);
         assert_refused(&res, 2, "release build failed", "a failing build");
-        let left: Vec<_> = fs::read_dir(&tmp)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
+        let left = fakes.tmp_left();
         assert!(left.is_empty(), "$TMPDIR must be left empty: {left:?}");
-        let run_txt = fs::read_to_string(out.join("run.txt")).unwrap();
-        let displays = run_txt
-            .lines()
-            .find_map(|l| l.strip_prefix("displays: "))
-            .unwrap_or_else(|| panic!("run.txt must record the displays:\n{run_txt}"));
+        let displays = fakes.run_txt_value("displays");
         assert!(
             displays == "unknown"
                 || displays.split("; ").all(|d| d
@@ -509,7 +491,306 @@ mod refusals {
                     .all(|c| c.is_ascii_digit() || " x.@()Hzpxlookslikemain".contains(c))),
             "the displays line holds sizes only, no names: {displays}"
         );
-        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Runs of the real script with fake tools, so nothing is built or
+/// measured: a throwaway folder whose `bin/` comes first on `PATH` (a
+/// `cargo`, an `ioreg`), whose `tmp/` is `$TMPDIR` (the lock and the
+/// scratch folder go there), whose `target/` is `CARGO_TARGET_DIR` (fake
+/// benchmarks) and whose `out/` is `--out`. The fake tools append what they
+/// were run with to `calls.log`. The folder is removed on drop.
+#[cfg(target_os = "macos")]
+mod fakes {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Output;
+
+    pub struct Fakes {
+        pub root: PathBuf,
+    }
+
+    impl Fakes {
+        pub fn new(tag: &str) -> Fakes {
+            let root = temp_path(tag);
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::create_dir_all(root.join("tmp")).unwrap();
+            Fakes { root }
+        }
+
+        pub fn out(&self) -> PathBuf {
+            self.root.join("out")
+        }
+
+        fn log(&self) -> PathBuf {
+            self.root.join("calls.log")
+        }
+
+        /// Writes an executable `sh` script with `body` at `rel`.
+        pub fn tool(&self, rel: &str, body: &str) {
+            let path = self.root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// A `cargo` that logs `cargo <args>`, runs the shell code `then`
+        /// and exits with `code`.
+        pub fn cargo(&self, code: i32, then: &str) {
+            let log = self.log();
+            self.tool(
+                "bin/cargo",
+                &format!(
+                    "echo \"cargo $*\" >>'{}'\n{then}\nexit {code}",
+                    log.display()
+                ),
+            );
+        }
+
+        /// An `ioreg` that logs `ioreg <args> lock=held|free` (whether the
+        /// run's lock folder exists) and prints the I/O Registry's root as
+        /// `ioreg -n Root -d1` does, cut to the console users, with the
+        /// screen locked while the shell test `locked_if` succeeds.
+        pub fn ioreg(&self, locked_if: &str) {
+            let log = self.log();
+            self.tool(
+                "bin/ioreg",
+                &format!(
+                    r#"if [ -d "$TMPDIR/not-everything-perf.lock" ]; then lock=held; else lock=free; fi
+echo "ioreg $* lock=$lock" >>'{log}'
+if {locked_if}; then key='"CGSSessionScreenIsLocked"=Yes,'; else key=; fi
+cat <<EOF
++-o Root  <class IORegistryEntry, id 0x100000100, retain 36>
+    {{
+      "IOKitBuildVersion" = "Darwin Kernel Version 27.0.0"
+      "IOConsoleUsers" = ({{"kCGSSessionOnConsoleKey"=Yes,${{key}}"kCGSSessionUserIDKey"=501}})
+    }}
+EOF"#,
+                    log = log.display()
+                ),
+            );
+        }
+
+        /// Runs the repository's script with `args` and `--out`, the fake
+        /// tools first on `PATH` and then `path`.
+        pub fn run(&self, path: &str, args: &[&str]) -> Output {
+            let mut cmd = Command::new("sh");
+            cmd.arg(repo_root().join(SCRIPT))
+                .args(args)
+                .arg("--out")
+                .arg(self.out())
+                .env(
+                    "PATH",
+                    format!("{}:{path}", self.root.join("bin").display()),
+                )
+                .env("TMPDIR", self.root.join("tmp"))
+                .env("CARGO_TARGET_DIR", self.root.join("target"));
+            run_with_timeout(&mut cmd)
+        }
+
+        /// What the fake tools were run with, in order.
+        pub fn calls(&self) -> Vec<String> {
+            fs::read_to_string(self.log())
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// What the run left in `$TMPDIR`.
+        pub fn tmp_left(&self) -> Vec<OsString> {
+            fs::read_dir(self.root.join("tmp"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        }
+
+        pub fn run_txt(&self) -> String {
+            read(&self.out().join("run.txt"))
+        }
+
+        /// The value of the `run.txt` line `<key>: <value>`.
+        pub fn run_txt_value(&self, key: &str) -> String {
+            let run_txt = self.run_txt();
+            let prefix = format!("{key}: ");
+            let values: Vec<&str> = run_txt
+                .lines()
+                .filter_map(|l| l.strip_prefix(prefix.as_str()))
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "run.txt must have one line {prefix:?}:\n{run_txt}"
+            );
+            values[0].to_owned()
+        }
+    }
+
+    impl Drop for Fakes {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+/// A locked screen stops a run before it starts: on one, the app's window
+/// can't come forward, so every probe that summons it times out. On 13 Nov
+/// 2026 the screen locked two minutes into an rc run, all 50 shortcut
+/// presses of F3 timed out at 5 s, and the 75-minute run was wasted. The
+/// script reads the screen's state with `ioreg -n Root -d1` before it takes
+/// the lock and again once it holds it, records it in `run.txt` at the start
+/// and at the end, and notes each step after which it was locked. Without
+/// `ioreg` the state is unknown, and the run goes on.
+#[cfg(target_os = "macos")]
+mod screen {
+    use super::*;
+    use crate::fakes::Fakes;
+    use common::shell::SYSTEM_PATH;
+    use std::path::Path;
+
+    const LOCKED: &str = "the screen is locked";
+    const FREE: &str = "ioreg -n Root -d1 lock=free";
+    const HELD: &str = "ioreg -n Root -d1 lock=held";
+
+    #[test]
+    fn refuses_a_locked_screen_before_taking_the_lock() {
+        let fakes = Fakes::new("perf-check-locked");
+        fakes.cargo(1, "");
+        fakes.ioreg("true");
+        let res = fakes.run(SYSTEM_PATH, &["--tier", "rc"]);
+        assert_refused(&res, 2, LOCKED, "a locked screen");
+        assert_refused(&res, 2, "nothing was changed", "a locked screen");
+        assert!(
+            !fakes.out().exists(),
+            "--out must not be created on a locked screen"
+        );
+        let left = fakes.tmp_left();
+        assert!(
+            left.is_empty(),
+            "no lock or scratch folder on a locked screen: {left:?}"
+        );
+        assert_eq!(
+            fakes.calls(),
+            [FREE],
+            "one check, before the lock, and no build"
+        );
+    }
+
+    /// Waiting for another run's lock can take an hour: a screen that
+    /// locked meanwhile is refused once the lock is held, and the lock is
+    /// given back.
+    #[test]
+    fn refuses_a_screen_that_locked_while_it_waited_for_the_lock() {
+        let fakes = Fakes::new("perf-check-locked-later");
+        fakes.cargo(1, "");
+        fakes.ioreg("[ -d \"$TMPDIR/not-everything-perf.lock\" ]");
+        let res = fakes.run(SYSTEM_PATH, &["--tier", "pr"]);
+        assert_refused(&res, 2, LOCKED, "a screen locked once the lock is held");
+        assert_refused(&res, 2, "nothing was changed", "a screen locked later");
+        assert!(!fakes.out().exists(), "--out must not be created");
+        let left = fakes.tmp_left();
+        assert!(left.is_empty(), "the lock must be given back: {left:?}");
+        assert_eq!(fakes.calls(), [FREE, HELD], "no build");
+    }
+
+    #[test]
+    fn checks_the_screen_before_the_lock_and_the_build_and_records_it() {
+        let fakes = Fakes::new("perf-check-unlocked");
+        fakes.cargo(1, "");
+        fakes.ioreg("false");
+        let res = fakes.run(SYSTEM_PATH, &["--tier", "pr"]);
+        assert_refused(&res, 2, "release build failed", "a failing build");
+        let calls = fakes.calls();
+        assert!(
+            calls.len() == 4
+                && calls[..2] == [FREE, HELD]
+                && calls[2].starts_with("cargo build --release")
+                && calls[3].starts_with("ioreg -n Root -d1 "),
+            "the screen is checked before the lock, once it is held and before \
+             the build, and at the end: {calls:?}"
+        );
+        assert_eq!(fakes.run_txt_value("screen at the start"), "unlocked");
+        assert_eq!(fakes.run_txt_value("screen at the end"), "unlocked");
+    }
+
+    /// The end of a run is recorded however it ends: here the screen locks
+    /// during a build that fails.
+    #[test]
+    fn records_a_screen_that_locked_during_the_run() {
+        let fakes = Fakes::new("perf-check-locked-during");
+        let marker = fakes.root.join("locked");
+        fakes.cargo(1, &format!("touch '{}'", marker.display()));
+        fakes.ioreg(&format!("[ -e '{}' ]", marker.display()));
+        let res = fakes.run(SYSTEM_PATH, &["--tier", "pr"]);
+        assert_refused(&res, 2, "release build failed", "a failing build");
+        assert_eq!(fakes.run_txt_value("screen at the start"), "unlocked");
+        assert_eq!(fakes.run_txt_value("screen at the end"), "locked");
+    }
+
+    /// With fake benchmarks, the screen locks during the catchup step: its
+    /// note names catchup, and the matcher step before it has none.
+    #[test]
+    fn notes_each_step_after_which_the_screen_was_locked() {
+        let fakes = Fakes::new("perf-check-locked-step");
+        let marker = fakes.root.join("locked");
+        fakes.cargo(0, "");
+        fakes.ioreg(&format!("[ -e '{}' ]", marker.display()));
+        fakes.tool("target/release/examples/matcher_bench", "exit 0");
+        fakes.tool(
+            "target/release/examples/catchup_bench",
+            &format!("touch '{}'", marker.display()),
+        );
+        fakes.tool("target/release/fx-bench", "exit 0");
+        let res = fakes.run(
+            SYSTEM_PATH,
+            &["--tier", "pr", "--step", "catchup", "--step", "matcher"],
+        );
+        assert_eq!(res.status.code(), Some(0), "{}", describe(&res));
+        let run_txt = fakes.run_txt();
+        let notes: Vec<&str> = run_txt
+            .lines()
+            .filter(|l| l.contains("screen locked after"))
+            .collect();
+        assert!(
+            notes.len() == 1 && notes[0].contains("the catchup step"),
+            "one note, naming the catchup step:\n{run_txt}"
+        );
+        assert_eq!(fakes.run_txt_value("screen at the start"), "unlocked");
+        assert_eq!(fakes.run_txt_value("screen at the end"), "locked");
+    }
+
+    /// Without `ioreg`, or with one that fails, the screen's state is
+    /// unknown: the run is not refused, and `run.txt` says so.
+    #[test]
+    fn runs_when_the_screen_state_is_unknown() {
+        // No ioreg anywhere on PATH (it lives in /usr/sbin).
+        let path = "/usr/bin:/bin";
+        for dir in path.split(':') {
+            assert!(
+                !Path::new(dir).join("ioreg").exists(),
+                "{dir} has an ioreg, so this case can't run without one"
+            );
+        }
+        let missing = Fakes::new("perf-check-no-ioreg");
+        missing.cargo(1, "");
+        let failing = Fakes::new("perf-check-ioreg-fails");
+        failing.cargo(1, "");
+        failing.tool("bin/ioreg", "exit 1");
+        for (fakes, path, why) in [
+            (&missing, path, "no ioreg"),
+            (&failing, SYSTEM_PATH, "a failing ioreg"),
+        ] {
+            let res = fakes.run(path, &["--tier", "pr"]);
+            assert_refused(&res, 2, "release build failed", why);
+            assert_eq!(
+                fakes.run_txt_value("screen at the start"),
+                "unknown",
+                "{why}"
+            );
+            assert_eq!(fakes.run_txt_value("screen at the end"), "unknown", "{why}");
+        }
     }
 }
 

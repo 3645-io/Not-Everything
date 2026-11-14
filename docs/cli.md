@@ -29,8 +29,13 @@ with `-export-*`:
   a read-only folder works.
 - Nothing is rescanned and no file is opened or downloaded; results come
   from the saved index only, so they are as fresh as the app's last save.
-  The app saves its index once a day, when it quits and after a full
-  rescan, so while it runs the results can be up to a day old.
+  While it runs, the app saves its index once a day, at a moment when
+  nobody has used the keyboard or mouse for a minute, so the results are
+  usually less than a day old. They are fresher after the app quits,
+  after a full rescan, and after the app compacts its index, which saves
+  it too. On a Mac that is never idle for a minute when the app checks
+  (every 5 minutes), the index is saved every 2 days of awake time
+  instead, which on a laptop that sleeps at night can be 3 days or more.
 - With Full Disk Access the app also indexes the external drives in
   `/Volumes` (APFS, Mac OS Extended, FAT and exFAT). A drive that was
   ejected stays in the saved index as offline, but its files are left out

@@ -12,7 +12,8 @@
 //!    once the access callout is dismissed with Not Now, since the callout
 //!    says it while it shows) and the resident note (Launch at Login needs
 //!    approval). A copy cut at the copy limit is noted even over the hints,
-//!    because it answers the Option+Cmd+C just pressed in the results.
+//!    because it answers the Cmd+C or Option+Cmd+C just pressed in the
+//!    results ([`Copied`]).
 //! 3. **The index** ([`IndexSlot`]): an error when there is one (it replaces
 //!    everything else here); else "Indexing… N of about M" with a progress
 //!    fraction, M being the previous index's size (the count alone on a
@@ -32,6 +33,17 @@ use crate::source::ResultsSource;
 
 /// The separator between parts of a slot.
 const SEP: &str = " \u{b7} ";
+
+/// What a copy cut at the copy limit (`MAX_COPY_PATHS`) copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Copied {
+    /// This many full paths (Option+Cmd+C): "Copied the first 100,000
+    /// paths only (copy limit)".
+    Paths(usize),
+    /// This many files and folders themselves (Cmd+C): "… 100,000 items
+    /// only …", Finder's word for both.
+    Files(usize),
+}
 
 /// What the status bar shows, from the window's state.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,8 +65,8 @@ pub struct StatusInput<'a> {
     pub focus: Focus,
     /// How many rows are selected.
     pub selected: usize,
-    /// A copy just stopped at the copy limit after this many paths.
-    pub copy_limit: Option<usize>,
+    /// A copy just stopped at the copy limit.
+    pub copy_limit: Option<Copied>,
     /// The scope of the index, when it is worth a note.
     pub scope: Option<ScopeNote>,
     /// Whether the Full Disk Access callout shows above the results.
@@ -201,9 +213,13 @@ fn counts(input: &StatusInput<'_>) -> Counts {
 
 fn middle(input: &StatusInput<'_>) -> Middle {
     if let Some(copied) = input.copy_limit {
+        let (count, what) = match copied {
+            Copied::Paths(n) => (n, "paths"),
+            Copied::Files(n) => (n, "items"),
+        };
         return Middle::Note(format!(
-            "Copied the first {} paths only (copy limit)",
-            group_thousands(copied)
+            "Copied the first {} {what} only (copy limit)",
+            group_thousands(count)
         ));
     }
     if input.focus == Focus::Results && input.selected > 0 {

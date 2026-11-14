@@ -87,10 +87,11 @@ pub struct KeyHint {
 }
 
 /// The hints shown while the results have the focus and a row is selected
-/// (the Main board, without its "Space Quick Look" hint: Space works since
-/// run 2.5, but the hint waits for the owner to confirm its place on the
-/// board, so the status bar is unchanged).
-pub const RESULT_HINTS: [KeyHint; 3] = [
+/// (the Main board and the right-click boards, without the "Space Quick
+/// Look" hint: Space works since run 2.5, but the hint waits for the owner
+/// to confirm its place on the board). The right-click menu shows the same
+/// caps for the same items ([`crate::context_menu::ContextItem::shortcut`]).
+pub const RESULT_HINTS: [KeyHint; 4] = [
     KeyHint {
         action: Action::Open,
         keys: &[RETURN],
@@ -100,6 +101,11 @@ pub const RESULT_HINTS: [KeyHint; 3] = [
         action: Action::RevealInFinder,
         keys: &[COMMAND, RETURN],
         label: "Reveal in Finder",
+    },
+    KeyHint {
+        action: Action::Copy,
+        keys: &[COMMAND, "C"],
+        label: "Copy",
     },
     KeyHint {
         action: Action::CopyPath,

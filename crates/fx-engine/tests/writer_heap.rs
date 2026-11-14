@@ -199,20 +199,23 @@ fn a_hidden_commit_merges_the_orders_in_place() {
     drop(wait_for_tree(&engine, &tree, "first scan published"));
     engine.set_foreground(false);
 
-    let apply = |changes: Vec<fx_model::Change>| {
-        let old_cursor = source.current_cursor();
-        source.push(changes);
-        // The source's cursor moves when the writer takes the batch, and
-        // the writer publishes it once the batch is applied.
-        drop(wait_for(&engine, "the batch's cursor", |s| {
-            let now = source.current_cursor();
-            now != old_cursor && s.cursor() == Some(now)
-        }));
-    };
     // A first batch builds what the writer keeps for good (its children
-    // index), so the measured batch shows the commit's own peak.
-    tree.set_size(&format!("{ROOT}/d0000/file-0.dat"), 1);
-    apply(vec![check(&format!("{ROOT}/d0000/file-0.dat"))]);
+    // index, built when it first looks a path up), so the measured batch
+    // shows the commit's own peak. It checks a file that hasn't changed: a
+    // batch that changes nothing merges nothing, so the writer has no
+    // timing of a merge in place yet. A timed one would set the cost the
+    // writer expects of the next: in this debug build, on a loaded machine,
+    // enough to expect the measured batch past its budget and copy the
+    // orders instead.
+    let old_cursor = source.current_cursor();
+    source.push(vec![check(&format!("{ROOT}/d0000/file-0.dat"))]);
+    // The source's cursor moves when the writer takes the batch, and the
+    // writer publishes it once the batch is applied (with no new
+    // generation, since nothing changed).
+    drop(wait_for(&engine, "the first batch's cursor", |s| {
+        let now = source.current_cursor();
+        now != old_cursor && s.cursor() == Some(now)
+    }));
     thread::sleep(Duration::from_millis(300));
 
     // Changed sizes, new files and removed files, spread over the tree.
@@ -226,9 +229,23 @@ fn a_hidden_commit_merges_the_orders_in_place() {
             changes.push(check(&format!("{dir}/{name}")));
         }
     }
+    let generations = engine.subscribe();
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
-    apply(changes);
+    let old_cursor = source.current_cursor();
+    source.push(changes);
+    // Waits for the batch's snapshot without reading one meanwhile: a
+    // snapshot the test held when the writer took the orders over would
+    // make it copy them, as a window's does.
+    loop {
+        generations
+            .recv_timeout(WAIT)
+            .expect("timed out waiting for the batch's snapshot");
+        let now = source.current_cursor();
+        if now != old_cursor && engine.snapshot().cursor() == Some(now) {
+            break;
+        }
+    }
     let peak = PEAK.load(Ordering::Relaxed).saturating_sub(before);
     eprintln!(
         "hidden commit of 60 changes: peak {peak} B above the engine's heap, \
@@ -238,7 +255,9 @@ fn a_hidden_commit_merges_the_orders_in_place() {
     assert!(
         peak <= entries * MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY,
         "a hidden commit of 60 changes took {peak} B at its peak, more than \
-         {MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY} B per entry ({entries} entries)"
+         {MAX_HIDDEN_COMMIT_PEAK_PER_ENTRY} B per entry ({entries} entries): \
+         the writer took the copy path (16 B per entry) instead of merging \
+         the batch into its orders in place"
     );
     let snap = wait_for_tree(&engine, &tree, "the index after the batch");
     assert_orders_match(&snap);

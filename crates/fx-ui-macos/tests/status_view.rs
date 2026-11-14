@@ -9,7 +9,7 @@ use fx_ui_macos::key_caps::RESULT_HINTS;
 use fx_ui_macos::onboarding::{
     INDEXING_PROTECTED_SUFFIX, IndexScope, LIMITED_MODE_SUFFIX, ScopeNote,
 };
-use fx_ui_macos::status_view::{Counts, IndexSlot, Middle, StatusInput, status_view};
+use fx_ui_macos::status_view::{Copied, Counts, IndexSlot, Middle, StatusInput, status_view};
 
 fn ready(results: usize) -> StatusInput<'static> {
     StatusInput {
@@ -230,12 +230,28 @@ fn a_copy_cut_at_the_limit_is_noted_even_over_the_hints() {
     let v = status_view(&StatusInput {
         focus: Focus::Results,
         selected: 250_000,
-        copy_limit: Some(100_000),
+        copy_limit: Some(Copied::Paths(100_000)),
         ..ready(300_000)
     });
     assert_eq!(
         v.middle,
         Middle::Note("Copied the first 100,000 paths only (copy limit)".into())
+    );
+}
+
+#[test]
+fn a_file_copy_cut_at_the_limit_says_items() {
+    // Cmd+C copies the files themselves; Finder calls them items, since
+    // folders are copied too.
+    let v = status_view(&StatusInput {
+        focus: Focus::Results,
+        selected: 250_000,
+        copy_limit: Some(Copied::Files(100_000)),
+        ..ready(300_000)
+    });
+    assert_eq!(
+        v.middle,
+        Middle::Note("Copied the first 100,000 items only (copy limit)".into())
     );
 }
 
