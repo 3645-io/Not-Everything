@@ -4,8 +4,8 @@ Every change that ships is measured before its pull request against the metrics 
 
 - `scripts/perf-check.sh --tier quick|pr|rc --out <new dir>` runs the measurements and writes `summary.md`.
 - `fx-bench perf-compare` judges them against `docs/gates/perf-baseline.toml`: one table per metric with its key, target, allowance, tiers and baseline.
-- The baseline is 0.5.0, the latest release, from its release candidate's rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
-- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is 0.5.0 too, measured at the pr tier on 14 Nov 2026.
+- The baseline is 0.6.0, the latest release, from its release candidates' rc tier on the M4 Pro (24 GB, macOS 27) with a warm cache; it was first set from 0.3.2. It moves only at a release, or by an exception the owner approved, which the baseline file records with its reason and pull request.
+- The pr tier runs its background phases under file activity and the rc tier without, so the background metrics (B1 to B6, M1 and M2) also carry a `pr_baseline`, measured at the pr tier, that the pr tier compares with. The others compare with `baseline` at both tiers. The pr-tier baseline is still 0.5.0's, measured at the pr tier on 14 Nov 2026: 0.6.0 had no pr-tier run, since the gate moves to absolute targets in 0.7.0.
 
 ## Tiers
 
@@ -22,7 +22,7 @@ Keep the Mac unlocked and the display awake for the `pr` and `rc` tiers. On a lo
 
 ## Allowances
 
-A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.5.0's first results during the first scan, F5, tracked until the first scan shows results as it goes), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
+A metric fails when it misses its target or is worse than the baseline by more than its allowance. While the baseline itself misses the target (0.6.0's first results during the first scan, F5, tracked until the first scan shows results as it goes), the allowance alone holds the metric, so it can't get worse while its fix is pending; the report shows `PASS (target not yet met)`. Once a release meets the target, the target holds it too.
 
 | Class | Metrics | Allowance |
 | --- | --- | --- |
@@ -127,7 +127,7 @@ scripts/perf-check.sh --tier rc --step soak --out <new dir>
 
 ## In release notes
 
-Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes. The script refuses to publish a release candidate or a release without an rc-tier run of the same code (the same commit, or one with the same tree, so a release can use its candidate's run) that has no failing metric. Once it has built the DMG, it adds the DMG's size (O1) and judges the whole rc tier again, so a failing or unmeasured metric stops the release then.
+Every release candidate and release has a Performance section in its GitHub release notes. It compares the release with the previous release and the targets: a summary table (the IDs in the baseline file's `[meta]` `summary`), any hand-written notes, then every metric in a folded `<details>` table. `fx-bench perf-release` writes it, and `scripts/release-macos.sh --perf <perf-check rc folder>` adds it to the notes. The script refuses to publish a release candidate or a release without an rc-tier run of the same code that has no failing metric. The code is the same for the same commit, one with the same tree (so a release can use its candidate's run), or one that differs only in files no build compiles: documents (but `THIRD-PARTY-NOTICES.md`, which the app and the command embed), `docs/`, `scripts/`, `.github/`, `.agents/` and crates' tests. Once it has built the DMG, it adds the DMG's size (O1) and judges the whole rc tier again, so a failing or unmeasured metric stops the release then. With the owner's approval, `--targets-only` judges the run on targets only: a metric that failed only its regression check (beyond its allowance, within its target) doesn't stop the release, and the notes name it; a missed target or an unmeasured metric still does.
 
 GitHub strips text colour from release notes, so each row carries a dot next to its words:
 
