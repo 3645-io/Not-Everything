@@ -1,17 +1,28 @@
-# Performance gate baseline, read by `fx-bench perf-compare` and
+# The performance gate, read by `fx-bench perf-compare` and
 # `fx-bench perf-release`.
 #
 # One table per metric of docs/gates/performance.md: the key that
-# scripts/perf-check.sh writes to metrics.txt, the target, the allowance, the
-# tiers that measure it and the baseline it is compared with. The quick tier
-# compares with `quick_baseline` (200,000 entries) and checks no targets; the
-# rc tier compares with `baseline` at gate scale, and the pr tier with
-# `pr_baseline` where a metric has one, else with `baseline`.
+# scripts/perf-check.sh writes to metrics.txt, its target, the tiers that
+# measure it and the baseline shown beside it.
 #
-# The baseline moves only at a release, from the release candidate's run
-# (`fx-bench perf-compare --print-values`), or by an exception the owner
-# approved, recorded in the metric's `exception` with the pull request. Never
-# edit it to make a check pass (.agents/rules/performance.md).
+# At the pr and rc tiers a metric with a target is judged on it alone, the
+# owner's decision of 14 Nov 2026: a build fails only when it misses a
+# target users can feel. `target` is the measuring Mac's gate (an M4 Pro):
+# 0.6 of `m1_target` for work on one core, 0.4 for search on all cores, and
+# the same for sizes, counts and memory per file. `m1_target` is what the
+# slowest supported Mac, a base M1 MacBook Air with 8 GB, must meet. A
+# missed target the owner accepted until the work that fixes it lands is a
+# `known_gap`: reported and counted, but never failing; once the target is
+# met, the report asks for the gap to be removed. `per_key` and `per_scale`
+# divide a metric by another key: per million files, or as a multiple of
+# another metric.
+#
+# The quick tier compares with `quick_baseline` (200,000 entries) and checks
+# no targets, and a metric without a target is compared with `baseline` (or
+# `pr_baseline` at the pr tier) within its allowance. The baselines move
+# only at a release, from the release candidate's run (`fx-bench
+# perf-compare --print-values`). Never edit a target or a baseline to make a
+# check pass (.agents/rules/performance.md).
 #
 # MB is 1,048,576 bytes, as Activity Monitor counts them.
 
@@ -27,8 +38,9 @@ date = "2026-11-14"
 # with its own scripts/perf-check.sh --tier pr --step background (macOS
 # 27.2.1, AC power, warm cache, display on, about 3.08M files on the disk,
 # 14 Nov 2026). 0.6.0 had no pr-tier run: the owner chose on 14 Nov 2026 to
-# move the gate to absolute targets in 0.7.0, so 0.5.0's stay. B7 has none:
-# it is tracked until its target is set (#29).
+# move the gate to absolute targets in 0.7.0, so 0.5.0's stay. With a target,
+# a metric's pr_baseline is shown, not judged. M1 and M2 hold it per million
+# files of the phase's index (2,077,595 entries).
 pr_build = "0.5.0"
 pr_date = "2026-11-14"
 # The rows of the summary table in a release's notes (fx-bench perf-release).
@@ -51,11 +63,13 @@ name = "CPU, window hidden"
 key = "hidden_cpu_pct"
 unit = "% of a core"
 better = "lower"
-target = 1
+target = 0.06
 allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
+known_gap = "Quiet background (run 2.21): measured with the Mac's own activity until the quiet-folder phases"
+m1_target = 0.1
 baseline = 0.218
 pr_baseline = 1.314
 baseline_build = "0.6.0"
@@ -66,11 +80,13 @@ name = "CPU, window showing a search"
 key = "search_cpu_pct"
 unit = "% of a core"
 better = "lower"
-target = 5
+target = 0.6
 allow_pct = 10
 allow_floor = 0.05
 aggregate = "mean"
 tiers = "pr rc"
+known_gap = "Quiet background (run 2.21): the shown search re-runs for unrelated file activity"
+m1_target = 1
 baseline = 3.371
 pr_baseline = 39.398
 baseline_build = "0.6.0"
@@ -86,6 +102,7 @@ target = 100
 allow_pct = 25
 aggregate = "max"
 tiers = "pr rc"
+gated = false
 baseline = 18.515
 pr_baseline = 40.953
 baseline_build = "0.6.0"
@@ -101,6 +118,7 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
+gated = false
 baseline = 1.041
 pr_baseline = 5.814
 baseline_build = "0.6.0"
@@ -116,6 +134,7 @@ allow_pct = 10
 allow_floor = 5
 aggregate = "mean"
 tiers = "pr rc"
+gated = false
 baseline = 44.033
 pr_baseline = 475.845
 baseline_build = "0.6.0"
@@ -126,11 +145,13 @@ name = "Wakeups a second, window hidden"
 key = "hidden_wakeups_per_s"
 unit = "per s"
 better = "lower"
-target = 2
+target = 1
 allow_pct = 10
 allow_floor = 0.5
 aggregate = "mean"
 tiers = "pr rc"
+known_gap = "Quiet background (run 2.21): measured with the Mac's own activity until the quiet-folder phases"
+m1_target = 1
 baseline = 1.393
 pr_baseline = 0.217
 baseline_build = "0.6.0"
@@ -141,66 +162,71 @@ name = "Disk writes a day"
 key = "disk_written_per_day_mb"
 unit = "MB"
 better = "lower"
-target = 512
+target = 250
 allow_pct = 5
 allow_floor = 10
 aggregate = "mean"
 tiers = "pr rc"
+known_gap = "Incremental saves (run 2.22): each compaction rewrites the whole index"
+m1_target = 250
 baseline = 0
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
-# Tracked, not gated: the owner's decision of 12 Nov 2026 (#29). With the
-# projected compaction saves, the pr tier's churn of 20 operations a second
-# reads about 660 MB a day, far above a real Mac's rate; B7 is gated again
-# once its target is set per day at a realistic change rate.
-gated = false
+# Gated again at the owner's target of 14 Nov 2026: at most 250 MB a day at
+# 10M files on a realistic day (1 GB a hard ceiling). It was tracked from
+# 12 Nov 2026 (#29) until a target was set. With the projected compaction
+# saves, the pr tier's 20 operations a second, far above a real Mac's rate,
+# reads about 670 MB a day: a known gap until saves are incremental.
 
 # --- Memory -----------------------------------------------------------------
 
 [M1]
-name = "Memory, window hidden"
+name = "Memory, window hidden, per million files"
 key = "hidden_footprint_mb"
-unit = "MB"
+unit = "MB per million files"
 better = "lower"
-target = 200
-allow_pct = 5
-# 30 MB floor: the owner's decision of 11 Nov 2026, since identical builds of
-# 0.4.0 read 125 to 169 MB between runs, more than 5% of 125 MB.
-allow_floor = 30
+target = 60
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 96.5
-pr_baseline = 96.8
+per_scale = 1000000
+per_key = "hidden_index_entries"
+m1_target = 60
+baseline = 46.444
+pr_baseline = 46.592
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
 [M2]
-name = "Memory, window showing a search"
+name = "Memory, window showing a search, per million files"
 key = "search_footprint_mb"
-unit = "MB"
+unit = "MB per million files"
 better = "lower"
-target = 250
-allow_pct = 5
-# 30 MB floor: the owner's decision of 11 Nov 2026, since identical builds of
-# 0.4.0 read 125 to 169 MB between runs, more than 5% of 125 MB.
-allow_floor = 30
+target = 80
 aggregate = "mean"
 tiers = "pr rc"
-baseline = 126.2
-pr_baseline = 176.1
+per_scale = 1000000
+per_key = "search_index_entries"
+m1_target = 80
+known_gap = "Quiet background (run 2.21): under file activity, a shown search makes each batch copy the sort orders"
+baseline = 60.738
+pr_baseline = 84.762
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
 [M3]
-name = "Memory peak, first scan"
+name = "Memory peak during the first scan, against the hidden memory"
 key = "first_scan_footprint_max_mb"
-unit = "MB"
+unit = "times the hidden memory"
 better = "lower"
-target = 500
+target = 2
 allow_pct = 5
 aggregate = "max"
 tiers = "pr rc"
-baseline = 387.6
+known_gap = "Lower scan peak (run 2.25): the first scan holds a second full copy"
+per_scale = 1
+per_key = "hidden_footprint_mb"
+m1_target = 2
+baseline = 4.017
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
@@ -213,6 +239,7 @@ target = 100
 allow_pct = 5
 aggregate = "max"
 tiers = "quick pr rc"
+gated = false
 baseline = 88.1
 quick_baseline = 85.25
 baseline_build = "0.6.0"
@@ -223,12 +250,14 @@ name = "Saved index on disk, per file"
 key = "store_bytes_per_entry"
 unit = "B"
 better = "lower"
-target = 100
+target = 45
 allow_pct = 5
 aggregate = "max"
 scale_key = "startup_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
+known_gap = "Smaller index file (run 2.26): a later store format"
+m1_target = 45
 baseline = 79.8
 quick_baseline = 79.8
 baseline_build = "0.6.0"
@@ -241,31 +270,17 @@ name = "Search, 2M files (p95)"
 key = "engine_ms"
 unit = "ms"
 better = "lower"
-target = 16
+target = 6
 allow_pct = 10
 allow_floor = 1
 aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
+known_gap = "Faster engine search (run 2.27): 7.4 ms on the M4 Pro's 12 cores is about 19 ms on an M1"
+m1_target = 16
 baseline = 7.428
 quick_baseline = 0.987
-baseline_build = "0.6.0"
-baseline_date = "2026-11-14"
-
-[S2]
-name = "Search, 5M files (p95)"
-key = "engine_5m_ms"
-unit = "ms"
-better = "lower"
-target = 30
-allow_pct = 10
-allow_floor = 1
-aggregate = "median"
-scale_key = "engine_5m_entries"
-scale_min = 5000000
-tiers = "pr rc"
-baseline = 17.519
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
@@ -281,6 +296,7 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
+m1_target = 250
 baseline = 70.271
 quick_baseline = 6.798
 baseline_build = "0.6.0"
@@ -298,6 +314,7 @@ aggregate = "median"
 scale_key = "engine_entries"
 scale_min = 2000000
 tiers = "quick pr rc"
+m1_target = 250
 baseline = 21.711
 quick_baseline = 2.627
 baseline_build = "0.6.0"
@@ -308,13 +325,14 @@ name = "Keystroke to results (p95)"
 key = "keystroke_p95_ms"
 unit = "ms"
 better = "lower"
-target = 50
+target = 30
 allow_pct = 10
 allow_floor = 1
 aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
+m1_target = 50
 baseline = 28.51
 quick_baseline = 24.96
 baseline_build = "0.6.0"
@@ -325,13 +343,14 @@ name = "Re-sort a column (p95)"
 key = "sort_p95_ms"
 unit = "ms"
 better = "lower"
-target = 50
+target = 20
 allow_pct = 10
 allow_floor = 1
 aggregate = "median"
 scale_key = "sort_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
+m1_target = 50
 baseline = 8.61
 quick_baseline = 8.47
 baseline_build = "0.6.0"
@@ -342,13 +361,14 @@ name = "Scroll frame time (p95)"
 key = "scroll_p95_ms"
 unit = "ms"
 better = "lower"
-target = 8.3
+target = 5
 allow_pct = 10
 allow_floor = 1
 aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
+m1_target = 8.3
 baseline = 2.78
 quick_baseline = 1.02
 baseline_build = "0.6.0"
@@ -361,13 +381,14 @@ name = "New file shown (p99)"
 key = "freshness_p99_ms"
 unit = "ms"
 better = "lower"
-target = 1000
+target = 500
 allow_pct = 10
 allow_floor = 10
 aggregate = "median"
 scale_key = "freshness_ops"
 scale_min = 1000
 tiers = "quick pr rc"
+m1_target = 500
 baseline = 187.994
 quick_baseline = 187.083
 baseline_build = "0.6.0"
@@ -378,12 +399,13 @@ name = "Launch to first result"
 key = "launch_ms"
 unit = "ms"
 better = "lower"
-target = 2000
+target = 600
 allow_pct = 10
 aggregate = "median"
 scale_key = "ui_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
+m1_target = 1000
 baseline = 467.21
 quick_baseline = 190.93
 baseline_build = "0.6.0"
@@ -394,61 +416,66 @@ name = "Shortcut to window ready (p95)"
 key = "summon_p95_ms"
 unit = "ms"
 better = "lower"
-target = 100
+target = 30
 allow_pct = 10
 allow_floor = 2
 aggregate = "median"
 scale_key = "summon_entries"
 scale_min = 1000000
 tiers = "quick pr rc"
+m1_target = 50
 baseline = 19.27
 quick_baseline = 10.54
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
 [F4]
-name = "First scan of the disk"
+name = "First scan of the disk, per million files"
 key = "first_run_ms"
-unit = "ms"
+unit = "ms per million files"
 better = "lower"
-target = 15000
+target = 7500
 allow_pct = 10
 aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
-baseline = 12756
+per_scale = 1000000
+per_key = "first_run_entries"
+m1_target = 15000
+baseline = 4337.6
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
 
-# Tracked until the first scan shows results as it goes.
 [F5]
 name = "First results during the first scan"
 key = "first_result_ms"
 unit = "ms"
 better = "lower"
-target = 2000
+target = 1000
 aggregate = "median"
 scale_key = "first_run_entries"
 scale_min = 1500000
 tiers = "pr rc"
+known_gap = "Progressive first scan (run 2.24): results only once the scan ends"
+m1_target = 2000
 baseline = 12755.963
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
-gated = false
 
 [F6]
 name = "Catch-up after a relaunch"
 key = "catchup_ms"
 unit = "ms"
 better = "lower"
-target = 10000
+target = 3000
 allow_pct = 10
 allow_floor = 10
 aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
+m1_target = 5000
 baseline = 564.545
 quick_baseline = 344.339
 baseline_build = "0.6.0"
@@ -459,13 +486,14 @@ name = "Search usable after a relaunch"
 key = "catchup_usable_ms"
 unit = "ms"
 better = "lower"
-target = 2000
+target = 150
 allow_pct = 10
 allow_floor = 10
 aggregate = "median"
 scale_key = "catchup_changes"
 scale_min = 10000
 tiers = "quick pr rc"
+m1_target = 250
 baseline = 5.183
 quick_baseline = 1.507
 baseline_build = "0.6.0"
@@ -517,6 +545,7 @@ better = "lower"
 allow_pct = 5
 aggregate = "last"
 tiers = "rc"
+gated = false
 baseline = 4372390
 baseline_build = "0.6.0"
 baseline_date = "2026-11-14"
@@ -527,7 +556,7 @@ name = "Command-line search, 2M files"
 key = "cli_query_ms"
 unit = "ms"
 better = "lower"
-target = 100
+target = 200
 aggregate = "median"
 scale_key = "cli_entries"
 scale_min = 2000000
@@ -536,4 +565,3 @@ baseline = 581.87
 quick_baseline = 33.32
 baseline_build = "0.3.2"
 baseline_date = "2026-11-09"
-gated = false

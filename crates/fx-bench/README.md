@@ -464,37 +464,48 @@ For each metric whose `tiers` include `--tier`:
 1. No sample of its key: `NOT MEASURED` (`SKIPPED` with `--partial`).
 2. At the pr and rc tiers, a `scale_key` value below `scale_min` (the
    smallest one counts), or none while `scale_min` is set: `NOT MEASURED`.
-3. The value is the `aggregate` of every sample of the key.
-4. The target is checked at the pr and rc tiers: `lower` passes at or
-   below it, `higher` at or above it, `equal` only at it. The quick tier
-   runs at a small scale, so it skips `lower` and `higher` targets (shown
-   in parentheses) but still checks `equal` targets, which state
-   correctness rather than speed. While the baseline itself misses a
-   `lower` or `higher` target (memory far above its goal, say), the target
-   is pending: only the allowance holds the metric, so it can't get worse
-   while its fix is under way, and a pass that still misses the target
-   reads `PASS (target not yet met)`.
-5. The regression check compares with `quick_baseline` at the quick tier
-   and `baseline` otherwise, allowing max(baseline × `allow_pct` / 100,
-   `allow_floor`), or nothing when neither is set: `lower` fails above
-   baseline + allowance, `higher` below baseline − allowance; `equal` has
-   no regression check. Without a baseline for the tier the verdict is
-   `NO BASELINE`, which is not a failure: the first run sets the baseline.
+3. The value is the `aggregate` of every sample of the key. With `per_key`,
+   it is divided by the median of that key's samples over `per_scale`
+   (1000000 for per million files, 1 for a multiple of another metric);
+   without samples of `per_key`, or with it at 0, `NOT MEASURED`.
+4. At the pr and rc tiers a metric with a target is judged on the target
+   alone: `lower` passes at or below it, `higher` at or above it, `equal`
+   only at it. A miss is `FAIL (target)`, unless the metric has a
+   `known_gap` (the work that fixes it): then `KNOWN GAP (<work>)`, which
+   doesn't fail. A pass at 80% of the target or more reads `PASS (near
+   limit: N% of target)` (not for `bool` or `equal` metrics), and a pass
+   that meets a known gap's target reads `PASS (known gap met at this
+   tier)`. `m1_target` is shown beside the target in the report. The quick
+   tier runs at a small scale, so it skips `lower` and `higher` targets
+   (shown in parentheses) but still checks `equal` targets, which state
+   correctness rather than speed.
+5. The regression check applies at the quick tier, against
+   `quick_baseline`, and to a metric without a target, against `baseline`
+   (`pr_baseline` at the pr tier when set), allowing max(baseline ×
+   `allow_pct` / 100, `allow_floor`), or nothing when neither is set:
+   `lower` fails above baseline + allowance, `higher` below baseline −
+   allowance; `equal` has no regression check. Without a baseline for the
+   tier the verdict is `NO BASELINE`, which is not a failure: the first run
+   sets the baseline.
 
-Verdicts: `PASS` or `PASS (target not yet met)`; `FAIL (target)`, `FAIL (regression)` or
-`FAIL (target, regression)`; `NOT MEASURED (<reason>)`; `NO BASELINE`;
-`TRACKED (would be <verdict>)` for an ungated metric; `SKIPPED`.
+Verdicts: `PASS`, `PASS (near limit: N% of target)` or `PASS (known gap met
+at this tier)`; `FAIL (target)` or `FAIL (regression)`; `KNOWN GAP
+(<work>)`; `NOT MEASURED (<reason>)`; `NO BASELINE`; `TRACKED (would be
+<verdict>)` for an ungated metric; `SKIPPED`.
 
 The markdown report has a header (tier and `[meta]`), the table
 `| ID | Metric | Baseline | Now | Change | Target | Verdict |` (values with
 units, Change as a signed % against the tier's baseline), any exceptions,
 and the line `perf-compare: <p> pass, <f> fail, <n> not measured, <b> no
-baseline, <t> tracked, <s> skipped`. The JSON report is
+baseline, <t> tracked, <s> skipped, <k> known gaps` (the known gaps last,
+so readers of the earlier fields keep working). The Target cell adds the
+M1 target in brackets when there is one. The JSON report is
 `{"tier","meta":{"machine","cache","build","date"},"metrics":[{"id","name",
 "key","unit","better","gated","baseline","now","change_pct","target",
-"target_checked","verdict","failed","reason","would_be","exception"}...],
-"counts":{"pass","fail","not_measured","no_baseline","tracked","skipped"},
-"result":"PASS"|"FAIL"}`.
+"target_checked","m1_target","known_gap","near_limit_pct","verdict",
+"failed","reason","would_be","exception"}...],
+"counts":{"pass","fail","not_measured","no_baseline","tracked","skipped",
+"known_gaps"},"result":"PASS"|"FAIL"}`.
 
 Exit codes: 0 when no gated metric is `FAIL` or `NOT MEASURED`; 1
 otherwise; 2 for bad arguments (usage on stderr), an unreadable or
