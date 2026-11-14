@@ -37,9 +37,14 @@
 # window's size and icon positions on a read-write image, which is then
 # converted to a read-only zlib-compressed one (UDZO, as Apple's packaging
 # guide asks; APFS) and signed with the Developer ID (identifier
-# <bundle ID>.dmg). If Finder can't be scripted, or macOS doesn't let this
-# terminal control it, the image keeps Finder's plain layout and the script
-# says so. The zip holds the same app; the tarball holds the command,
+# <bundle ID>.dmg). Finder lists a new disk about a second after it
+# mounts, so its script waits up to 10 s for the disk (asked at once, it
+# missed the disk for the 0.5.0 release and 0.6.0-RC-1, which shipped
+# Finder's plain window). A release or an RC stops if Finder didn't lay
+# out the window (macOS must let this terminal control Finder; --resume
+# then builds the disk image again), and its quarantined copy is checked
+# for the layout too; a beta keeps the plain layout and says so. The zip
+# holds the same app; the tarball holds the command,
 # cli.md, LICENSE and THIRD-PARTY-NOTICES.md. The app carries the notices
 # too (in its About panel and bundle), and the script stops before building
 # (or, for --resume, before going on) if they don't match Cargo.lock
@@ -60,7 +65,8 @@
 # quarantined copy of the disk image, as a download arrives: hdiutil verify,
 # codesign --verify and, unless it is a beta, spctl --assess --type open
 # (which must report "Notarized Developer ID") and stapler validate; then it
-# mounts the copy read-only and checks the app inside like the zipped one,
+# mounts the copy read-only, checks that a release's or an RC's window keeps
+# its layout (has_layout), and checks the app inside like the zipped one,
 # syspolicy_check distribution included (which wants that app stapled).
 # After writing them it checks a quarantined copy of the zipped app:
 # codesign --verify --deep --strict and, unless it is a beta, spctl --assess
@@ -618,6 +624,19 @@ check_app() {
     syspolicy_check distribution "$1"
 }
 
+# Whether the volume at $1 holds the Finder layout of its window for the
+# app $2: a .DS_Store with the window's settings (bwsp) and its icon view
+# (icvp), recorded for the volume's root ("."), and the positions (Iloc)
+# of $2 and of the Applications shortcut. Finder writes each record's file
+# name in UTF-16 and its type in ASCII, so with the zero bytes removed a
+# name runs straight into its type.
+has_layout() {
+    [ -f "$1/.DS_Store" ] || return 1
+    for hl_record in .bwsp .icvp "${2}Iloc" ApplicationsIloc; do
+        LC_ALL=C tr -d '\000' <"$1/.DS_Store" | LC_ALL=C grep -a -q -F -e "$hl_record" || return 1
+    done
+}
+
 # Makes the disk image from the signed $APP (stapled, for a release or an
 # RC) and sets DMG to it, as Apple's "Packaging Mac software for
 # distribution" describes: a folder with the app and a shortcut to
@@ -644,11 +663,17 @@ on run argv
     set appName to item 2 of argv
     tell application "Finder"
         -- The disk mounted there, even if another disk has its name.
+        -- Finder lists a new disk about a second after it mounts, so wait
+        -- for it, up to 10 s.
         set theDisk to missing value
-        repeat with d in (get every disk)
-            if POSIX path of (d as alias) is (mountPoint & "/") then set theDisk to contents of d
+        repeat 40 times
+            repeat with d in (get every disk)
+                if POSIX path of (d as alias) is (mountPoint & "/") then set theDisk to contents of d
+            end repeat
+            if theDisk is not missing value then exit repeat
+            delay 0.25
         end repeat
-        if theDisk is missing value then error "Finder does not list " & mountPoint
+        if theDisk is missing value then error "Finder does not list " & mountPoint & " after 10 s"
         open theDisk
         set theWindow to container window of theDisk
         set current view of theWindow to icon view
@@ -670,18 +695,20 @@ EOF
     then
         # Finder saves the layout in .DS_Store once the window has closed.
         n=0
-        while [ ! -f "$MOUNTED/.DS_Store" ] && [ "$n" -lt 10 ]; do
+        while ! has_layout "$MOUNTED" "$APP_NAME.app" && [ "$n" -lt 10 ]; do
             n=$((n + 1))
             sleep 1
         done
-        if [ -f "$MOUNTED/.DS_Store" ]; then
-            echo "Finder laid out the window"
-        else
-            echo "Finder did not save the layout, so the disk image keeps the plain layout (the app and the Applications shortcut)"
-        fi
     else
         cat "$build/layout.log"
-        echo "Finder could not be scripted (not running, or this terminal is not allowed under Privacy & Security > Automation), so the disk image keeps the plain layout (the app and the Applications shortcut)"
+    fi
+    # The saved layout decides, whatever Finder's script returned.
+    if has_layout "$MOUNTED" "$APP_NAME.app"; then
+        echo "Finder laid out the window"
+    elif [ "$CHANNEL" = beta ]; then
+        echo "Finder did not lay out the window (not running, or this terminal is not allowed under Privacy & Security > Automation), so the beta's disk image keeps the plain layout (the app and the Applications shortcut)"
+    else
+        fail "Finder did not lay out the disk image's window (see $build/layout.log), and a release candidate or a release ships only with its layout; let this terminal control Finder (Privacy & Security > Automation), then carry on with --resume $OUT"
     fi
     sync
     detach_image
@@ -1081,6 +1108,8 @@ mkdir -p "$OUT/check/mount"
 attach_image "$CHECK_DMG" -readonly -nobrowse -mountroot "$OUT/check/mount"
 [ "$(readlink "$MOUNTED/Applications")" = /Applications ] ||
     fail "the disk image has no shortcut to /Applications"
+[ "$CHANNEL" = beta ] || has_layout "$MOUNTED" "$APP_NAME.app" ||
+    fail "the disk image's window has lost its Finder layout (.DS_Store with the window's size, its icon view and the icons' positions)"
 check_app "$MOUNTED/$APP_NAME.app"
 detach_image
 
