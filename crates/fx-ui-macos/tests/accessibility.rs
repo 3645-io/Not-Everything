@@ -225,6 +225,7 @@ fn each_hint_reads_its_action_then_its_keys() {
         [
             "Open, Return",
             "Reveal in Finder, Command Return",
+            "Copy, Command C",
             "Copy path, Option Command C",
         ]
     );

@@ -293,7 +293,9 @@ Keys and actions (all read-only):
 | --- | --- |
 | Return / Enter in the results, double-click | Open the selection with its default app (at most 20 items) |
 | Cmd+Return / Cmd+Enter | Reveal the selection in Finder |
-| Option+Cmd+C | Copy the selection's full paths, one per line. Cmd+C and Edit > Copy do nothing in the results; Cmd+C will copy the files themselves, as in Finder, in a later version |
+| Cmd+C or Edit > Copy in the results | Copy the selected files themselves, as Finder's Copy does (file URLs; pasting in Finder makes copies, the originals stay), at most 100,000 |
+| Option+Cmd+C | Copy the selection's full paths, one per line, at most 100,000 |
+| Right-click (or Control-click) a result | The right-click menu, for the clicked row, or for the whole selection when the click is inside it (see below) |
 | Space in the results | Show the selection in the system Quick Look panel (at most 1,000 files); Space again closes it |
 | Escape with Quick Look open | Close the Quick Look panel (nothing else) |
 | Return / Enter or Down arrow in the search field | Move into the results, selecting the first row (nothing happens with no results) |
@@ -305,6 +307,25 @@ Return in the search field moves into the results and never opens a file
 (`actions::search_field_key`); the arrow keys then pick the file and Return
 opens it. Cmd+Return in the search field reveals the selection, or the
 first row, in Finder. Space in the search field types a space.
+
+The right-click menu (`context_menu`, `appkit::window::context_menu`) is
+a native menu with the mockups' items in Finder's order: Open ↩, Open
+With ▸ (files only), Reveal in Finder ⌘↩, Quick Look Space, Copy ⌘C, Copy
+Full Path ⌥⌘C, Share… and New Terminal at Folder (folders only). A package
+(an `.rtfd`) counts as a file, an app gets neither Open With nor New
+Terminal, and a mixed selection, or one of more than 1,000 items, neither;
+items that don't apply are left out. Open With lists the apps that can
+open every target, the default first ("Preview (default)"), then App
+Store… (opens the Mac App Store) and Other… (choose an app in
+/Applications; it opens the files once and changes no setting). Open,
+Open With, Reveal and New Terminal act on at most 20 items, Share… and
+Quick Look on 1,000. A right-click outside the selection leaves it as it
+is and gives the clicked row the hover look while the menu is open; Quick
+Look from the menu selects that row first. Empty space has no menu. The
+keyboard's context-menu key and VoiceOver's Show Menu open it for the
+selection. macOS draws the menu itself, so the mockups' panel styling
+doesn't apply; each item shows the SF Symbol closest to the mockups'
+glyph (macOS 27 hides menu images unless an item asks for them).
 
 Quick Look works as in Finder (`quick_look`, `appkit::window::quick_look`):
 Space in the results opens macOS's own Quick Look panel (`QLPreviewPanel`)
@@ -666,9 +687,12 @@ result within about 2 ms of the budget as borderline.
 
 The shell never changes files. The spike has no file actions at all: no open,
 reveal, copy, drag, delete, rename, move or trash, and its cells are
-non-editable labels. The app's actions are limited to opening a result,
-revealing it in Finder, copying its full path and showing it in Quick Look
-(macOS's preview panel, which only reads the file). There is no delete,
+non-editable labels. The app's actions are limited to opening a result
+(with its default app, or once with another from Open With), revealing it
+in Finder, copying it (the file, as Finder's Copy, which pasting copies)
+or its full path, sharing it with the system's share picker, opening a
+Terminal window at a folder and showing it in Quick Look (macOS's preview
+panel, which only reads the file). There is no delete,
 rename, move or trash menu item, action, key
 binding or command-line option; the delete keys do nothing. Dragging a
 result out offers copy and link only (`NSDragOperationCopy |
@@ -676,5 +700,5 @@ NSDragOperationLink`, for drags to other apps and within the app), never
 move, generic or delete, so dropping it on the Trash or a Finder folder
 cannot remove or move the file. The Edit menu's Undo, Redo, Cut and Paste
 edit the search field's text only; Copy copies it or, with the table
-focused, the selection's paths; Select All selects its text or, with the
+focused, the selected files; Select All selects its text or, with the
 table focused, every row.
