@@ -390,6 +390,7 @@
 | 2.25 | A lower first-scan memory peak | Not started | Added 2026-11-14 (owner) |
 | 2.26 | A smaller index file (45 bytes per file) | Later, not scheduled | Added 2026-11-14 (owner) |
 | 2.27 | A faster engine search (S1 on an M1) | Not started | Added 2026-11-14 (owner) |
+| 2.28 | The size example says what it matches (`size:>=10mb`) | Not started | Added 2026-11-15 (owner) |
 | 3.1 | `fx-fs-windows` enumerator (`FSCTL_ENUM_USN_DATA`) | Not started | |
 | 3.2 | USN journal change source and resume cursor | Not started | |
 | 3.3 | Windows service, named-pipe `fx-ipc`, client signature check | Not started | |
